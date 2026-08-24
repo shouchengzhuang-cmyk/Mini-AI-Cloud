@@ -2,6 +2,19 @@ from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, gene
 
 REGISTRY = CollectorRegistry()
 
+API_REQUESTS = Counter(
+    "api_requests_total",
+    "HTTP requests by route template and status",
+    ("method", "route", "status"),
+    registry=REGISTRY,
+)
+API_REQUEST_DURATION = Histogram(
+    "api_request_duration_seconds",
+    "HTTP request latency by route template",
+    ("method", "route"),
+    registry=REGISTRY,
+)
+
 TASKS_CREATED = Counter(
     "tasks_created_total", "Number of tasks accepted by the API", registry=REGISTRY
 )
@@ -25,6 +38,119 @@ TASK_QUEUE_WAIT = Histogram(
     "task_queue_wait_seconds",
     "Time from enqueue to assignment",
     buckets=(0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 30, 60, 300),
+    registry=REGISTRY,
+)
+SCHEDULING_ATTEMPTS = Counter(
+    "scheduling_attempts_total",
+    "Scheduler placement outcomes by bounded reason",
+    ("outcome", "reason"),
+    registry=REGISTRY,
+)
+SCHEDULER_ATTEMPTS = Counter(
+    "scheduler_attempts_total",
+    "Global scheduler placement outcomes by bounded reason",
+    ("outcome", "reason"),
+    registry=REGISTRY,
+)
+SCHEDULER_FAILURES = Counter(
+    "scheduler_failures_total",
+    "Unexpected global scheduler control-loop failures",
+    registry=REGISTRY,
+)
+SCHEDULER_LATENCY = Histogram(
+    "scheduler_latency_seconds",
+    "Global scheduler control-loop latency",
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5),
+    registry=REGISTRY,
+)
+TASK_PREEMPTIONS = Counter(
+    "task_preemptions_total",
+    "Durable task preemption requests dispatched",
+    registry=REGISTRY,
+)
+OUTBOX_PENDING = Gauge(
+    "outbox_pending", "Unprocessed transactional outbox events", registry=REGISTRY
+)
+OUTBOX_OLDEST_AGE = Gauge(
+    "outbox_oldest_age_seconds", "Age of the oldest available outbox event", registry=REGISTRY
+)
+WORKER_ALLOCATED = Gauge(
+    "worker_allocated_resources",
+    "Cluster-wide allocated resources",
+    ("resource",),
+    registry=REGISTRY,
+)
+WORKER_CAPACITY_CPU = Gauge(
+    "worker_capacity_cpu",
+    "Schedulable worker CPU capacity in millicores",
+    registry=REGISTRY,
+)
+WORKER_CAPACITY_MEMORY = Gauge(
+    "worker_capacity_memory",
+    "Schedulable worker memory capacity in MiB",
+    registry=REGISTRY,
+)
+WORKER_CAPACITY_GPU = Gauge(
+    "worker_capacity_gpu",
+    "Schedulable worker GPU device capacity",
+    registry=REGISTRY,
+)
+WORKER_ALLOCATED_CPU = Gauge(
+    "worker_allocated_cpu",
+    "Cluster CPU reservations in millicores",
+    registry=REGISTRY,
+)
+WORKER_ALLOCATED_MEMORY = Gauge(
+    "worker_allocated_memory",
+    "Cluster memory reservations in MiB",
+    registry=REGISTRY,
+)
+WORKER_ALLOCATED_GPU = Gauge(
+    "worker_allocated_gpu",
+    "Cluster GPU device reservations",
+    registry=REGISTRY,
+)
+SERVICE_REPLICAS = Gauge(
+    "service_replicas",
+    "Aggregate model service replicas",
+    ("state",),
+    registry=REGISTRY,
+)
+SERVICES_READY = Gauge(
+    "services_ready",
+    "Model services with a running aggregate state",
+    registry=REGISTRY,
+)
+GATEWAY_REQUESTS = Counter(
+    "gateway_requests_total",
+    "OpenAI-compatible gateway outcomes",
+    ("status",),
+    registry=REGISTRY,
+)
+GATEWAY_DURATION = Histogram(
+    "gateway_request_duration_seconds",
+    "OpenAI-compatible gateway upstream latency",
+    registry=REGISTRY,
+)
+SERVICE_REQUESTS = Counter(
+    "service_requests_total",
+    "OpenAI-compatible service proxy outcomes",
+    ("status",),
+    registry=REGISTRY,
+)
+SERVICE_REQUEST_DURATION = Histogram(
+    "service_request_duration_seconds",
+    "OpenAI-compatible service proxy upstream latency",
+    registry=REGISTRY,
+)
+PROJECT_CPU_SECONDS = Counter(
+    "project_cpu_seconds_total",
+    "Settled CPU seconds across all projects",
+    registry=REGISTRY,
+)
+PROJECT_GPU_SECONDS = Counter(
+    "project_gpu_seconds_total",
+    "Settled GPU seconds across all projects",
     registry=REGISTRY,
 )
 

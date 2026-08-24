@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime
 
 from pydantic import Field, computed_field
@@ -21,7 +22,10 @@ class WorkerCapacity(ResponseModel):
 
 class WorkerResponse(ResponseModel):
     id: str
+    worker_session_id: uuid.UUID
     hostname: str
+    node_name: str | None
+    runtime_types: list[str]
     status: WorkerStatus
     started_at: datetime
     last_heartbeat_at: datetime
@@ -31,12 +35,20 @@ class WorkerResponse(ResponseModel):
     reserved_memory_mb: int = Field(ge=0)
     reserved_gpus: int = Field(ge=0)
     cpu_count: int = Field(ge=1)
+    cpu_total_millicores: int = Field(ge=1)
+    cpu_allocatable_millicores: int = Field(ge=1)
     memory_total_mb: int = Field(ge=0)
+    memory_allocatable_mb: int = Field(ge=0)
     docker_version: str | None
     labels: dict[str, str]
+    taints: list[dict[str, str]]
     gpu_count: int = Field(ge=0)
     gpu_model: str | None
     gpu_memory_mb: int = Field(ge=0)
+    inventory_generation: int = Field(ge=1)
+    inventory_updated_at: datetime
+    overcommitted: bool
+    drain_reason: str | None
     version: int = Field(ge=1)
 
     @computed_field  # type: ignore[prop-decorator]

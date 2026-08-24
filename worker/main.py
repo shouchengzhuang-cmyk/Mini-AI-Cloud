@@ -2,9 +2,11 @@ import asyncio
 import signal
 import time
 import uuid
+from dataclasses import replace
 
 from redis.exceptions import RedisError
 
+from core.artifacts import build_artifact_store
 from core.config import Settings, get_settings
 from core.database import Database
 from core.enums import ACTIVE_TASK_STATUSES, WorkerStatus
@@ -13,10 +15,16 @@ from core.redis import RedisQueue
 from repositories.tasks import TaskRepository
 from repositories.workers import WorkerRepository
 from scheduler import Scheduler, TaskAssignment
-from worker.capabilities import WorkerCapabilities, detect_capabilities
+from worker.artifact_workspace import ArtifactWorkspaceManager
+from worker.capabilities import detect_capabilities, detect_gpu_devices
 from worker.docker_runtime import DockerRuntime
 from worker.executor import TaskExecutor
+from worker.fake_runtime import FakeComputeRuntime
+from worker.gpu_inventory import NoGPUInventoryProvider, build_gpu_inventory_provider
 from worker.heartbeat import ActiveExecution, Heartbeat
+from worker.kubernetes_runtime import KubernetesRuntime
+from worker.runtime import ComputeRuntime
+from worker.runtime_registry import RuntimeRegistry
 
 
 class WorkerService:
@@ -30,21 +38,62 @@ class WorkerService:
             ready_stream_maxlen=settings.ready_stream_maxlen,
             socket_timeout=settings.redis_socket_timeout,
         )
-        self.runtime = DockerRuntime(
-            pids_limit=settings.docker_pids_limit,
-            tmpfs_size_mb=settings.docker_tmpfs_size_mb,
-            stop_timeout=settings.docker_stop_timeout,
-            always_pull=settings.docker_always_pull,
-            cluster_id=settings.cluster_id,
-        )
-        self.capabilities: WorkerCapabilities = detect_capabilities()
+        self.capabilities = detect_capabilities(NoGPUInventoryProvider())
         self.worker_id = settings.worker_id or (
             f"{self.capabilities.hostname}-{uuid.uuid4().hex[:12]}"
+        )
+        self.worker_session_id = uuid.uuid4()
+        self.gpu_devices = detect_gpu_devices(
+            build_gpu_inventory_provider(settings, worker_id=self.worker_id)
+        )
+        self.capabilities = replace(
+            self.capabilities,
+            gpu_count=len(self.gpu_devices),
+            gpu_model=", ".join(dict.fromkeys(item.model for item in self.gpu_devices)) or None,
+            gpu_memory_mb=sum(item.memory_total_mb for item in self.gpu_devices),
+        )
+        runtime_types = tuple(
+            item.strip() for item in settings.worker_runtime_types.split(",") if item.strip()
+        )
+        if settings.fake_gpu_count and "fake" not in runtime_types:
+            raise ValueError("fake GPU inventory requires the fake compute runtime")
+        runtimes: dict[str, ComputeRuntime] = {}
+        self.docker_runtime: DockerRuntime | None = None
+        if "docker" in runtime_types:
+            self.docker_runtime = DockerRuntime(
+                pids_limit=settings.docker_pids_limit,
+                tmpfs_size_mb=settings.docker_tmpfs_size_mb,
+                stop_timeout=settings.docker_stop_timeout,
+                always_pull=settings.docker_always_pull,
+                cluster_id=settings.cluster_id,
+            )
+            runtimes["docker"] = self.docker_runtime
+        if "kubernetes" in runtime_types:
+            runtimes["kubernetes"] = KubernetesRuntime(
+                namespace=settings.kubernetes_namespace,
+                node_name=settings.worker_node_name or self.capabilities.hostname,
+                cleanup_grace_seconds=settings.kubernetes_cleanup_grace_seconds,
+                kubeconfig=settings.kubernetes_kubeconfig,
+                in_cluster=settings.kubernetes_in_cluster,
+            )
+        if "fake" in runtime_types:
+            runtimes["fake"] = FakeComputeRuntime()
+        self.runtime = RuntimeRegistry(runtimes)
+        self.artifact_store = build_artifact_store(settings)
+        self.artifact_workspace = ArtifactWorkspaceManager(
+            self.database,
+            settings,
+            self.artifact_store,
         )
         self.scheduler = Scheduler(
             self.database.session,
             lease_seconds=settings.task_lease_seconds,
             fallback_limit=settings.batch_size,
+            mode=settings.scheduler_mode,
+            worker_session_id=self.worker_session_id,
+            cpu_price_per_hour=settings.cpu_price_per_hour,
+            memory_price_per_gb_hour=settings.memory_price_per_gb_hour,
+            gpu_price_per_hour=settings.gpu_price_per_hour,
         )
         self.executor = TaskExecutor(
             self.database,
@@ -52,6 +101,8 @@ class WorkerService:
             self.runtime,
             worker_id=self.worker_id,
             settings=settings,
+            artifact_workspace=self.artifact_workspace,
+            worker_session_id=self.worker_session_id,
         )
         self.active: dict[uuid.UUID, ActiveExecution] = {}
         self.inflight: set[asyncio.Task[None]] = set()
@@ -61,7 +112,9 @@ class WorkerService:
         self.logger = get_logger("worker")
 
     async def run(self) -> None:
-        docker_version = await self.runtime.version()
+        docker_version = (
+            await self.docker_runtime.version() if self.docker_runtime is not None else None
+        )
         await self._register(docker_version)
         try:
             await self.queue.ensure_ready_group()
@@ -77,6 +130,7 @@ class WorkerService:
             worker_id=self.worker_id,
             active=self.active,
             settings=self.settings,
+            worker_session_id=self.worker_session_id,
         )
         heartbeat_task = asyncio.create_task(heartbeat.run(self.heartbeat_stop))
         self.logger.info(
@@ -216,9 +270,9 @@ class WorkerService:
             return
         await asyncio.wait(self.inflight, timeout=0.5, return_when=asyncio.FIRST_COMPLETED)
 
-    async def _register(self, docker_version: str) -> None:
+    async def _register(self, docker_version: str | None) -> None:
         async with self.database.session() as session, session.begin():
-            await WorkerRepository.register(
+            worker = await WorkerRepository.register(
                 session,
                 worker_id=self.worker_id,
                 hostname=self.capabilities.hostname,
@@ -230,13 +284,36 @@ class WorkerService:
                 gpu_count=self.capabilities.gpu_count,
                 gpu_model=self.capabilities.gpu_model,
                 gpu_memory_mb=self.capabilities.gpu_memory_mb,
+                worker_session_id=self.worker_session_id,
+                node_name=self.settings.worker_node_name or self.capabilities.hostname,
+                runtime_types=list(self.runtime.runtime_types),
+            )
+            await WorkerRepository.replace_gpu_inventory(
+                session,
+                worker_id=self.worker_id,
+                worker_session_id=worker.worker_session_id,
+                devices=[
+                    {
+                        "uuid": item.uuid,
+                        "index": item.index,
+                        "vendor": item.vendor,
+                        "model": item.model,
+                        "memory_total_mb": item.memory_total_mb,
+                        "memory_free_mb": item.memory_free_mb,
+                        "compute_capability": item.compute_capability,
+                        "fake": item.fake,
+                    }
+                    for item in self.gpu_devices
+                ],
             )
 
     async def _maybe_reconcile_orphans(self) -> None:
+        if self.docker_runtime is None:
+            return
         now = time.monotonic()
         if now < self.next_orphan_reconcile:
             return
-        containers = await self.runtime.list_worker_managed_containers()
+        containers = await self.docker_runtime.list_worker_managed_containers()
         cleanup_failures: list[str] = []
         for container in containers:
             labels = container.labels or {}
@@ -268,8 +345,8 @@ class WorkerService:
                 continue
             try:
                 if container.status in {"running", "restarting", "paused"}:
-                    await self.runtime.stop_container(container)
-                await self.runtime.remove_container(container)
+                    await self.docker_runtime.stop_container(container)
+                await self.docker_runtime.remove_container(container)
                 self.logger.warning(
                     "stale managed container removed",
                     container_id=container.id,
@@ -311,7 +388,7 @@ class WorkerService:
         await asyncio.gather(heartbeat_task, return_exceptions=True)
         await self._best_effort_worker_status(WorkerStatus.OFFLINE)
         for name, close in (
-            ("docker", self.runtime.close),
+            ("runtimes", self.runtime.close),
             ("redis", self.queue.close),
             ("database", self.database.dispose),
         ):
@@ -329,7 +406,12 @@ class WorkerService:
     async def _best_effort_worker_status(self, status: WorkerStatus) -> None:
         try:
             async with self.database.session() as session, session.begin():
-                await WorkerRepository.set_status(session, self.worker_id, status)
+                await WorkerRepository.set_status(
+                    session,
+                    self.worker_id,
+                    status,
+                    worker_session_id=self.worker_session_id,
+                )
         except Exception as exc:
             self.logger.error(
                 "worker status update failed",

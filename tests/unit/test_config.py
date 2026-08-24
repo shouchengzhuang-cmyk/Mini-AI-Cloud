@@ -49,3 +49,79 @@ def test_distributed_timeout_relationships_are_validated(
 ) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **overrides)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_name"),
+    [
+        (
+            {
+                "api_key_pepper": "p" * 32,
+                "worker_auth_token": "local-development-worker-token",
+            },
+            "WORKER_AUTH_TOKEN",
+        ),
+        (
+            {
+                "api_key_pepper": "local-development-api-key-pepper-change-me",
+                "worker_auth_token": "w" * 32,
+            },
+            "API_KEY_PEPPER",
+        ),
+        (
+            {
+                "api_key_pepper": "p" * 32,
+                "worker_auth_token": "w" * 32,
+                "bootstrap_enabled": True,
+                "bootstrap_token": "too-short",
+            },
+            "BOOTSTRAP_TOKEN",
+        ),
+    ],
+)
+def test_production_rejects_development_or_weak_credentials(
+    overrides: dict[str, Any],
+    expected_name: str,
+) -> None:
+    values: dict[str, Any] = {
+        "app_env": "production",
+        "legacy_anonymous_enabled": False,
+        "bootstrap_enabled": False,
+        **overrides,
+    }
+    with pytest.raises(ValidationError, match=expected_name):
+        Settings(_env_file=None, **values)
+
+
+def test_production_accepts_explicit_strong_credentials() -> None:
+    settings = Settings(
+        _env_file=None,
+        app_env="production",
+        legacy_anonymous_enabled=False,
+        bootstrap_enabled=True,
+        bootstrap_token="b" * 32,
+        api_key_pepper="p" * 32,
+        worker_auth_token="w" * 32,
+    )
+
+    assert settings.app_env == "production"
+
+
+def test_gateway_buffer_limit_has_safe_default_and_environment_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert Settings(_env_file=None).service_proxy_max_response_bytes == 16 * 1024 * 1024
+
+    monkeypatch.setenv("SERVICE_PROXY_MAX_RESPONSE_BYTES", "2048")
+    assert Settings(_env_file=None).service_proxy_max_response_bytes == 2048
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, service_proxy_max_response_bytes=1023)
+
+
+def test_optional_vllm_worker_id_accepts_compose_empty_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SERVICE_VLLM_WORKER_ID", "")
+
+    assert Settings(_env_file=None).service_vllm_worker_id is None

@@ -17,6 +17,7 @@ TaskIdInput = uuid.UUID | str | bytes | None
 class AssignmentSource(StrEnum):
     MESSAGE = "message"
     DATABASE_FALLBACK = "database_fallback"
+    GLOBAL_PLACEMENT = "global_placement"
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +39,9 @@ class TaskAssignment:
     labels: dict[str, str]
     retry_count: int
     max_retries: int
+    project_id: uuid.UUID
+    runtime_type: str
+    gpu_device_ids: tuple[str, ...]
 
     @classmethod
     def from_task(
@@ -65,6 +69,9 @@ class TaskAssignment:
             labels=dict(task.labels),
             retry_count=task.retry_count,
             max_retries=task.max_retries,
+            project_id=task.project_id,
+            runtime_type=task.runtime_type.value,
+            gpu_device_ids=tuple(task.gpu_device_ids),
         )
 
 
@@ -84,14 +91,28 @@ class Scheduler:
         *,
         lease_seconds: float,
         fallback_limit: int = 100,
+        mode: str = "pull",
+        worker_session_id: uuid.UUID | None = None,
+        cpu_price_per_hour: float = 0.05,
+        memory_price_per_gb_hour: float = 0.005,
+        gpu_price_per_hour: float = 1.0,
     ) -> None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be greater than zero")
         if fallback_limit < 1:
             raise ValueError("fallback_limit must be at least one")
+        if mode not in {"pull", "global"}:
+            raise ValueError("mode must be 'pull' or 'global'")
+        if mode == "global" and worker_session_id is None:
+            raise ValueError("global mode requires worker_session_id")
         self._session_factory = session_factory
         self._lease_seconds = lease_seconds
         self._fallback_limit = fallback_limit
+        self._mode = mode
+        self._worker_session_id = worker_session_id
+        self._cpu_price_per_hour = cpu_price_per_hour
+        self._memory_price_per_gb_hour = memory_price_per_gb_hour
+        self._gpu_price_per_hour = gpu_price_per_hour
         self._fallback_offsets: dict[str, int] = {}
 
     async def claim_for_worker(
@@ -107,6 +128,23 @@ class Scheduler:
         remains the Worker's responsibility and must happen only after this method
         returns an assignment (or confirms the message cannot currently be claimed).
         """
+
+        if self._mode == "global":
+            assert self._worker_session_id is not None
+            async with self._session_factory() as session, session.begin():
+                task = await TaskRepository.take_global_assignment(
+                    session,
+                    worker_id=worker_id,
+                    worker_session_id=self._worker_session_id,
+                    lease_seconds=self._lease_seconds,
+                )
+                if task is None or task.execution_id is None:
+                    return None
+                return TaskAssignment.from_task(
+                    task,
+                    execution_id=task.execution_id,
+                    source=AssignmentSource.GLOBAL_PLACEMENT,
+                )
 
         preferred_id = _parse_task_id(message_task_id)
         if preferred_id is not None:
@@ -139,6 +177,11 @@ class Scheduler:
         async with self._session_factory() as session:
             worker = await WorkerRepository.get(session, worker_id)
             if not worker_accepts_new_tasks(worker) or worker is None:
+                return []
+            if (
+                self._worker_session_id is not None
+                and worker.worker_session_id != self._worker_session_id
+            ):
                 return []
 
             offset = self._fallback_offsets.get(worker_id, 0)
@@ -186,6 +229,12 @@ class Scheduler:
                         worker_available=False,
                         rejection_reason=decision.reason,
                     )
+                if (
+                    self._worker_session_id is not None
+                    and worker is not None
+                    and worker.worker_session_id != self._worker_session_id
+                ):
+                    return _ClaimAttempt(assignment=None, worker_available=False)
 
                 task = await TaskRepository.get(session, task_id)
                 decision = evaluate(worker, task)
@@ -201,6 +250,10 @@ class Scheduler:
                     task_id=task_id,
                     worker_id=worker_id,
                     lease_seconds=self._lease_seconds,
+                    worker_session_id=self._worker_session_id,
+                    cpu_price_per_hour=self._cpu_price_per_hour,
+                    memory_price_per_gb_hour=self._memory_price_per_gb_hour,
+                    gpu_price_per_hour=self._gpu_price_per_hour,
                 )
                 assignment = TaskAssignment.from_task(
                     claimed_task,

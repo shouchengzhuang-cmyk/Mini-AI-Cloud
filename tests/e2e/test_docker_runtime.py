@@ -2,7 +2,8 @@ import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import pytest_asyncio
@@ -10,6 +11,7 @@ from docker.models.containers import Container
 
 from models.task import Task
 from worker.docker_runtime import DockerRuntime, DockerRuntimeError, RuntimeLog
+from worker.runtime import ExecutionSpec, RuntimeMount
 
 pytestmark = [pytest.mark.e2e, pytest.mark.docker]
 
@@ -196,6 +198,108 @@ async def test_container_security_and_resource_configuration(
     assert security_options & {"no-new-privileges:true", "no-new-privileges=true"}
     assert config["Labels"]["mini-docker-cloud.managed"] == "true"
     assert config["Labels"]["mini-docker-cloud.task_id"] == str(task.id)
+
+
+async def test_named_volume_subpaths_isolate_task_artifact_files(
+    docker_harness: DockerHarness,
+    tmp_path: Path,
+) -> None:
+    volume_name = f"mini-ai-artifact-e2e-{uuid.uuid4().hex}"
+    volume = await asyncio.to_thread(
+        docker_harness.runtime.client.volumes.create,
+        name=volume_name,
+        labels={"mini-docker-cloud.e2e": "true"},
+    )
+    handle = None
+    input_probe = tmp_path / "input.bin"
+    output_probe = tmp_path / "output.bin"
+    input_probe.write_bytes(b"volume-input")
+    output_probe.touch()
+    task = _task(
+        [
+            "sh",
+            "-c",
+            "cat /workspace/inputs/input.bin; printf volume-output > /output/result.bin",
+        ]
+    )
+    spec = ExecutionSpec(
+        task_id=task.id,
+        execution_id=uuid.uuid4(),
+        worker_id="e2e-volume-subpath",
+        image=task.image,
+        command=tuple(task.command),
+        environment={},
+        timeout_seconds=30,
+        cpu_limit=task.cpu_limit,
+        memory_limit_mb=task.memory_limit_mb,
+        gpu_count=0,
+        network_enabled=False,
+        labels={},
+        mounts=(
+            RuntimeMount(
+                str(input_probe),
+                "/workspace/inputs/input.bin",
+                True,
+                volume_name=volume_name,
+                volume_subpath="task/inputs/input.bin",
+            ),
+            RuntimeMount(
+                str(output_probe),
+                "/output/result.bin",
+                False,
+                volume_name=volume_name,
+                volume_subpath="task/outputs/result.bin",
+            ),
+        ),
+    )
+    try:
+        await asyncio.to_thread(
+            docker_harness.runtime.client.containers.run,
+            IMAGE,
+            [
+                "sh",
+                "-c",
+                (
+                    "mkdir -p /data/task/inputs /data/task/outputs; "
+                    "printf volume-input > /data/task/inputs/input.bin; "
+                    ": > /data/task/outputs/result.bin; "
+                    "chmod 0444 /data/task/inputs/input.bin; "
+                    "chmod 0666 /data/task/outputs/result.bin"
+                ),
+            ],
+            volumes={volume_name: {"bind": "/data", "mode": "rw"}},
+            network_disabled=True,
+            remove=True,
+        )
+        handle = await docker_harness.runtime.prepare(spec)
+        ready = asyncio.Event()
+        log_task = asyncio.create_task(
+            _collect_logs(
+                docker_harness.runtime,
+                cast(Container, handle.native),
+                ready=ready,
+            )
+        )
+        await asyncio.wait_for(ready.wait(), timeout=10)
+        await docker_harness.runtime.start(handle)
+        exit_code = await asyncio.wait_for(docker_harness.runtime.wait(handle), timeout=20)
+        logs = await asyncio.wait_for(log_task, timeout=10)
+        stored_output = await asyncio.to_thread(
+            docker_harness.runtime.client.containers.run,
+            IMAGE,
+            ["cat", "/data/task/outputs/result.bin"],
+            volumes={volume_name: {"bind": "/data", "mode": "ro"}},
+            network_disabled=True,
+            remove=True,
+        )
+
+        assert exit_code == 0
+        assert b"volume-input" in b"".join(item.content for item in logs)
+        assert stored_output == b"volume-output"
+    finally:
+        if handle is not None:
+            await docker_harness.runtime.cleanup(handle)
+        await asyncio.to_thread(volume.remove, force=True)
 
 
 async def test_timeout_stops_running_container(docker_harness: DockerHarness) -> None:

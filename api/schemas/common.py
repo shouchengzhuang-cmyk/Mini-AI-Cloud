@@ -34,6 +34,7 @@ class PaginationMeta(ResponseModel):
     total: int = Field(ge=0)
     limit: int = Field(ge=1)
     offset: int = Field(ge=0)
+    next_cursor: str | None = None
 
 
 class ValidationIssue(ResponseModel):

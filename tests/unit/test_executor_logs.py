@@ -4,28 +4,27 @@ from collections.abc import AsyncIterator
 from typing import cast
 
 import pytest
-from docker.models.containers import Container
 
 from core.config import Settings
 from core.database import Database
 from core.enums import LogStream
 from core.redis import RedisQueue
-from worker.docker_runtime import DockerRuntime, RuntimeLog
 from worker.executor import TaskExecutor
 from worker.heartbeat import ActiveExecution
+from worker.runtime import ComputeRuntime, RuntimeHandle, RuntimeLog
 
 
 class _RuntimeStub:
     def __init__(self, items: list[RuntimeLog]) -> None:
         self.items = items
 
-    async def stream_logs(
+    async def logs(
         self,
-        container: Container,
+        handle: RuntimeHandle,
         *,
         ready: asyncio.Event | None = None,
     ) -> AsyncIterator[RuntimeLog]:
-        del container
+        del handle
         if ready is not None:
             ready.set()
         for item in self.items:
@@ -36,13 +35,13 @@ class _BlockingRuntime:
     def __init__(self) -> None:
         self.fragment_consumed = asyncio.Event()
 
-    async def stream_logs(
+    async def logs(
         self,
-        container: Container,
+        handle: RuntimeHandle,
         *,
         ready: asyncio.Event | None = None,
     ) -> AsyncIterator[RuntimeLog]:
-        del container
+        del handle
         if ready is not None:
             ready.set()
         yield RuntimeLog("stdout", b"tail-before-cancel")
@@ -59,7 +58,7 @@ def _executor(
     return TaskExecutor(
         cast(Database, object()),
         cast(RedisQueue, object()),
-        cast(DockerRuntime, runtime),
+        cast(ComputeRuntime, runtime),
         worker_id="worker-test",
         settings=Settings(
             control_plane_enabled=False,
@@ -71,6 +70,15 @@ def _executor(
 
 def _execution() -> ActiveExecution:
     return ActiveExecution(task_id=uuid.uuid4(), execution_id=uuid.uuid4())
+
+
+def _handle() -> RuntimeHandle:
+    return RuntimeHandle(
+        runtime_type="test",
+        resource_kind="test-object",
+        object_id="test-object-id",
+        display_id="test-object",
+    )
 
 
 def _capture_persisted(
@@ -100,7 +108,7 @@ async def test_collect_logs_coalesces_one_byte_fragments(
     records = _capture_persisted(executor, monkeypatch)
 
     await executor._collect_logs(
-        cast(Container, object()),
+        _handle(),
         execution,
         ready=asyncio.Event(),
     )
@@ -126,7 +134,7 @@ async def test_collect_logs_keeps_interleaved_streams_separate(
     records = _capture_persisted(executor, monkeypatch)
 
     await executor._collect_logs(
-        cast(Container, object()),
+        _handle(),
         _execution(),
         ready=asyncio.Event(),
     )
@@ -144,7 +152,7 @@ async def test_collect_logs_flushes_tail_when_stream_ends(
     records = _capture_persisted(executor, monkeypatch)
 
     await executor._collect_logs(
-        cast(Container, object()),
+        _handle(),
         _execution(),
         ready=asyncio.Event(),
     )
@@ -172,7 +180,7 @@ async def test_collect_logs_flushes_small_fragment_while_stream_is_open(
     monkeypatch.setattr(executor, "_persist_log", persist)
     task = asyncio.create_task(
         executor._collect_logs(
-            cast(Container, object()),
+            _handle(),
             _execution(),
             ready=asyncio.Event(),
         )
@@ -196,7 +204,7 @@ async def test_collect_logs_flushes_tail_when_cancelled(
     records = _capture_persisted(executor, monkeypatch)
     task = asyncio.create_task(
         executor._collect_logs(
-            cast(Container, object()),
+            _handle(),
             _execution(),
             ready=asyncio.Event(),
         )
@@ -229,7 +237,7 @@ async def test_collect_logs_enforces_exact_total_byte_cap(
     records = _capture_persisted(executor, monkeypatch)
 
     await executor._collect_logs(
-        cast(Container, object()),
+        _handle(),
         execution,
         ready=asyncio.Event(),
     )
@@ -245,3 +253,33 @@ async def test_collect_logs_enforces_exact_total_byte_cap(
         "task log limit reached; stopping container to protect the control plane",
     )
     assert execution.log_limit_exceeded.is_set()
+
+
+async def test_collect_logs_redacts_secret_split_across_runtime_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "ABC123XYZ"
+    runtime = _RuntimeStub(
+        [
+            RuntimeLog("stdout", b"prefix ABC"),
+            RuntimeLog("stdout", b"123"),
+            RuntimeLog("stdout", b"XYZ suffix"),
+            RuntimeLog("stderr", secret.encode()),
+        ]
+    )
+    executor = _executor(runtime)
+    records = _capture_persisted(executor, monkeypatch)
+
+    await executor._collect_logs(
+        _handle(),
+        _execution(),
+        ready=asyncio.Event(),
+        secret_values=(secret,),
+    )
+
+    combined = "".join(content for _stream, content in records)
+    assert secret not in combined
+    assert records == [
+        (LogStream.STDOUT, "prefix ***REDACTED*** suffix"),
+        (LogStream.STDERR, "***REDACTED***"),
+    ]

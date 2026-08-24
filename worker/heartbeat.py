@@ -25,11 +25,13 @@ class Heartbeat:
         worker_id: str,
         active: dict[uuid.UUID, ActiveExecution],
         settings: Settings,
+        worker_session_id: uuid.UUID | None = None,
     ) -> None:
         self.database = database
         self.worker_id = worker_id
         self.active = active
         self.settings = settings
+        self.worker_session_id = worker_session_id
         self.logger = get_logger("worker_heartbeat")
 
     async def run(self, stop: asyncio.Event) -> None:
@@ -60,6 +62,7 @@ class Heartbeat:
                     worker_id=self.worker_id,
                     execution_id=execution.execution_id,
                     lease_seconds=self.settings.task_lease_seconds,
+                    worker_session_id=self.worker_session_id,
                 )
             if not renewed:
                 execution.ownership_lost.set()
@@ -72,7 +75,10 @@ class Heartbeat:
 
         async with self.database.session() as session, session.begin():
             worker = await WorkerRepository.heartbeat(
-                session, self.worker_id, running_tasks=len(executions)
+                session,
+                self.worker_id,
+                running_tasks=len(executions),
+                worker_session_id=self.worker_session_id,
             )
         if worker is None:
             self.logger.error("worker registration disappeared", worker_id=self.worker_id)

@@ -1,3 +1,4 @@
+import uuid
 from collections.abc import AsyncIterator
 from typing import Any, cast
 
@@ -9,8 +10,10 @@ from sqlalchemy import event
 
 from core.config import Settings
 from core.database import Database
+from core.rbac import ProjectStatus
 from core.redis import RedisQueue
 from models import Base
+from models.identity import Project
 
 
 @pytest_asyncio.fixture
@@ -27,6 +30,15 @@ async def database(tmp_path: Any) -> AsyncIterator[Database]:
 
     async with database.engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+    async with database.session() as session, session.begin():
+        session.add(
+            Project(
+                id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
+                name="Legacy local project",
+                slug="legacy-local",
+                status=ProjectStatus.ACTIVE,
+            )
+        )
 
     try:
         yield database
@@ -47,13 +59,16 @@ async def redis_queue() -> AsyncIterator[RedisQueue]:
 
 
 @pytest_asyncio.fixture
-async def api_client(database: Database, redis_queue: RedisQueue) -> AsyncIterator[AsyncClient]:
+async def api_client(
+    database: Database, redis_queue: RedisQueue, tmp_path: Any
+) -> AsyncIterator[AsyncClient]:
     from api.main import create_app
 
     settings = Settings(
         database_url=str(database.engine.url),
         redis_url="redis://unused.invalid/0",
         control_plane_enabled=False,
+        artifact_local_root=str(tmp_path / "artifacts"),
     )
     app = create_app(
         settings=settings,

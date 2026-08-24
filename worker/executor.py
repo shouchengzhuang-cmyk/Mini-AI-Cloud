@@ -1,20 +1,34 @@
 import asyncio
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TypeVar
 
-from docker.models.containers import Container
-
 from core.config import Settings
 from core.database import Database
-from core.enums import LogStream, TaskStatus
+from core.enums import ErrorCategory, ErrorCode, LogStream, TaskStatus
 from core.logging import get_logger
 from core.redis import RedisQueue
+from core.secrets import SecretCipher
 from models.task import Task
+from repositories.secrets import (
+    ResolvedTaskSecrets,
+    SecretResolutionError,
+    TaskSecretBindingRepository,
+)
 from repositories.tasks import ExecutionResult, StaleExecutionError, TaskRepository
-from worker.docker_runtime import DockerRuntime, RuntimeLog
+from worker.artifact_workspace import ArtifactWorkspaceManager, PreparedArtifactWorkspace
 from worker.heartbeat import ActiveExecution
+from worker.redaction import StreamingSecretRedactor, redact_text
+from worker.runtime import (
+    ComputeRuntime,
+    ExecutionSpec,
+    RuntimeFailure,
+    RuntimeHandle,
+    RuntimeLog,
+    RuntimeMount,
+)
 
 
 class ExecutionTimedOut(TimeoutError):
@@ -101,56 +115,115 @@ class TaskExecutor:
         self,
         database: Database,
         queue: RedisQueue,
-        runtime: DockerRuntime,
+        runtime: ComputeRuntime,
         *,
         worker_id: str,
         settings: Settings,
+        artifact_workspace: ArtifactWorkspaceManager | None = None,
+        worker_session_id: uuid.UUID | None = None,
     ) -> None:
         self.database = database
         self.queue = queue
         self.runtime = runtime
         self.worker_id = worker_id
         self.settings = settings
+        self.artifact_workspace = artifact_workspace
+        self.worker_session_id = worker_session_id
         self.logger = get_logger("task_executor")
 
     async def execute(self, execution: ActiveExecution) -> ExecutionResult:
-        container: Container | None = None
+        handle: RuntimeHandle | None = None
         log_task: asyncio.Task[None] | None = None
+        resolved_secrets = ResolvedTaskSecrets({})
+        secret_values: tuple[str, ...] = ()
+        runtime_environment: dict[str, str] = {}
+        prepared_artifacts: PreparedArtifactWorkspace | None = None
         deadline = 0.0
         try:
             task = await self._mark_pulling(execution)
+            resolved_secrets = await self._resolve_secrets(task, execution)
+            secret_values = resolved_secrets.values
+            collisions = set(task.environment).intersection(resolved_secrets.environment)
+            if collisions:
+                raise SecretResolutionError(
+                    "task secret environment conflicts with task environment"
+                )
+            runtime_environment.update(task.environment)
+            runtime_environment.update(resolved_secrets.environment)
             deadline = time.monotonic() + task.timeout_seconds
+            if self.artifact_workspace is not None and task.project_id is not None:
+                prepared_artifacts = await self._before_deadline(
+                    self.artifact_workspace.prepare(
+                        task_id=task.id,
+                        project_id=task.project_id,
+                        worker_id=self.worker_id,
+                        execution_id=execution.execution_id,
+                        worker_session_id=self.worker_session_id,
+                    ),
+                    deadline,
+                )
             await self._system_log(execution, f"pulling image {task.image}")
-            await self._before_deadline(self.runtime.pull_image(task.image), deadline)
-            await self._raise_if_cancelled(execution)
-            container = await self._before_deadline(
-                self.runtime.create_container(
-                    task,
-                    execution_id=execution.execution_id,
-                    worker_id=self.worker_id,
+            handle = await self._before_deadline(
+                self.runtime.prepare(
+                    self._execution_spec(
+                        task,
+                        execution,
+                        environment=runtime_environment,
+                        mounts=(
+                            tuple(
+                                RuntimeMount(
+                                    host_path=str(mount.host_path),
+                                    container_path=mount.container_path,
+                                    read_only=mount.read_only,
+                                    volume_name=mount.volume_name,
+                                    volume_subpath=mount.volume_subpath,
+                                )
+                                for mount in prepared_artifacts.mounts
+                            )
+                            if prepared_artifacts is not None
+                            else ()
+                        ),
+                    )
                 ),
                 deadline,
             )
-            assert container is not None
-            await self._raise_if_cancelled(execution)
-            await self._mark_running(execution)
+            assert handle is not None
+            pre_start_stop = await self._pre_start_stop_reason(execution)
+            if pre_start_stop == "ownership_lost":
+                return ExecutionResult(accepted=False, status=None)
+            if pre_start_stop == "cancelled":
+                await self._best_effort_stop(handle, secret_values=secret_values)
+                return await self._finish(
+                    execution,
+                    target=TaskStatus.CANCELLED,
+                    exit_code=None,
+                    error_message="task was stopped before runtime start",
+                    error_category=ErrorCategory.CANCELLED,
+                )
+            await self._mark_starting(execution)
             log_ready = asyncio.Event()
             log_task = asyncio.create_task(
-                self._collect_logs(container, execution, ready=log_ready)
+                self._collect_logs(
+                    handle,
+                    execution,
+                    ready=log_ready,
+                    secret_values=secret_values,
+                )
             )
             await self._before_deadline(log_ready.wait(), deadline)
             if log_task.done():
                 await log_task
-            await self._before_deadline(self.runtime.start_container(container), deadline)
-            await self._system_log(execution, f"container {container.short_id} started")
-            outcome = await self._wait_for_outcome(container, execution, deadline)
+            await self._before_deadline(self.runtime.start(handle), deadline)
+            await self._mark_running(execution)
+            await self._system_log(execution, f"{handle.resource_kind} {handle.display_id} started")
+            outcome = await self._wait_for_outcome(handle, execution, deadline)
             if outcome.reason in {
                 "cancelled",
                 "timed_out",
                 "ownership_lost",
                 "log_limit_exceeded",
             }:
-                await self.runtime.stop_container(container)
+                await self.runtime.stop(handle)
             if outcome.reason == "ownership_lost":
                 self.logger.warning(
                     "container stopped after fencing token was revoked",
@@ -165,27 +238,57 @@ class TaskExecutor:
             if outcome.reason == "cancelled":
                 target = TaskStatus.CANCELLED
                 error = "task was cancelled by user request"
+                error_category = ErrorCategory.CANCELLED
+                error_code = None
             elif outcome.reason == "timed_out":
                 target = TaskStatus.TIMED_OUT
                 error = f"task exceeded timeout of {task.timeout_seconds} seconds"
+                error_category = ErrorCategory.TIMEOUT
+                error_code = None
             elif outcome.reason == "log_limit_exceeded":
                 target = TaskStatus.FAILED
                 error = (
                     "task log output exceeded the configured limit of "
                     f"{self.settings.max_task_log_bytes} bytes"
                 )
+                error_category = ErrorCategory.USER_ERROR
+                error_code = None
             elif outcome.exit_code == 0:
+                if self.artifact_workspace is not None and prepared_artifacts is not None:
+                    published = await self._before_deadline(
+                        self.artifact_workspace.publish_outputs(prepared_artifacts),
+                        deadline,
+                    )
+                    if published:
+                        await self._system_log(
+                            execution,
+                            f"published {len(published)} task artifact output(s)",
+                        )
                 target = TaskStatus.SUCCEEDED
                 error = None
+                error_category = None
+                error_code = None
+            elif outcome.exit_code == 137:
+                target = TaskStatus.FAILED
+                error = "container was terminated by the out-of-memory killer"
+                error_category = ErrorCategory.RESOURCE_ERROR
+                error_code = ErrorCode.OOM_KILLED
             else:
                 target = TaskStatus.FAILED
                 error = f"container exited with code {outcome.exit_code}"
+                error_category = ErrorCategory.USER_ERROR
+                error_code = None
             await self._system_log(
                 execution,
                 f"container exited: status={target.value} exit_code={outcome.exit_code}",
             )
             return await self._finish(
-                execution, target=target, exit_code=outcome.exit_code, error_message=error
+                execution,
+                target=target,
+                exit_code=outcome.exit_code,
+                error_message=error,
+                error_category=error_category,
+                error_code=error_code,
             )
         except StaleExecutionError as exc:
             self.logger.warning(
@@ -196,48 +299,90 @@ class TaskExecutor:
                 error=str(exc),
             )
             return ExecutionResult(accepted=False, status=None)
+        except RuntimeFailure as exc:
+            if handle is not None:
+                await self._best_effort_stop(handle, secret_values=secret_values)
+            safe_error = redact_text(str(exc), secret_values)
+            await self._best_effort_log(execution, f"runtime failed: {safe_error}")
+            self.logger.error(
+                "classified runtime failure",
+                task_id=str(execution.task_id),
+                worker_id=self.worker_id,
+                execution_id=str(execution.execution_id),
+                error_category=exc.error_category.value,
+                error_code=exc.error_code.value if exc.error_code is not None else None,
+                error=safe_error,
+            )
+            return await self._finish(
+                execution,
+                target=TaskStatus.FAILED,
+                exit_code=exc.exit_code,
+                error_message=safe_error,
+                error_category=exc.error_category,
+                error_code=exc.error_code,
+            )
         except (ExecutionTimedOut, TimeoutError):
-            if container is not None:
-                await self._best_effort_stop(container)
+            if handle is not None:
+                await self._best_effort_stop(handle, secret_values=secret_values)
             await self._best_effort_log(execution, "task timed out")
             return await self._finish(
                 execution,
                 target=TaskStatus.TIMED_OUT,
                 exit_code=None,
-                error_message="task timed out during Docker setup or execution",
+                error_message="task timed out during runtime setup or execution",
+                error_category=ErrorCategory.TIMEOUT,
             )
         except Exception as exc:
-            if container is not None:
-                await self._best_effort_stop(container)
-            await self._best_effort_log(execution, f"execution failed: {exc}")
-            self.logger.exception(
+            if handle is not None:
+                await self._best_effort_stop(handle, secret_values=secret_values)
+            safe_error = redact_text(str(exc), secret_values)
+            await self._best_effort_log(execution, f"execution failed: {safe_error}")
+            # Tracebacks can render arbitrary exception arguments. Avoid attaching
+            # one after secrets have been resolved; the sanitized error remains
+            # correlated by task and fencing identifiers.
+            self.logger.error(
                 "task execution failed",
                 task_id=str(execution.task_id),
                 worker_id=self.worker_id,
                 execution_id=str(execution.execution_id),
-                error=str(exc),
+                error=safe_error,
             )
             return await self._finish(
                 execution,
                 target=TaskStatus.FAILED,
                 exit_code=None,
-                error_message=str(exc),
+                error_message=safe_error,
+                error_category=ErrorCategory.INTERNAL_ERROR,
             )
         finally:
             if log_task is not None:
                 if not log_task.done():
                     log_task.cancel()
                 await asyncio.gather(log_task, return_exceptions=True)
-            if container is not None:
+            if handle is not None:
                 try:
-                    await self.runtime.remove_container(container)
+                    await self.runtime.cleanup(handle)
                 except Exception as exc:
                     self.logger.error(
-                        "container cleanup failed",
+                        "runtime cleanup failed",
                         task_id=str(execution.task_id),
-                        container_id=container.id,
-                        error=str(exc),
+                        runtime_type=handle.runtime_type,
+                        runtime_object_id=handle.object_id,
+                        error=redact_text(str(exc), secret_values),
                     )
+            if self.artifact_workspace is not None and prepared_artifacts is not None:
+                try:
+                    await self.artifact_workspace.cleanup(prepared_artifacts)
+                except Exception as exc:
+                    self.logger.error(
+                        "artifact workspace cleanup failed",
+                        task_id=str(execution.task_id),
+                        execution_id=str(execution.execution_id),
+                        error=redact_text(str(exc), secret_values),
+                    )
+            resolved_secrets.clear()
+            runtime_environment.clear()
+            secret_values = ()
 
     async def _mark_pulling(self, execution: ActiveExecution) -> Task:
         async with self.database.session() as session, session.begin():
@@ -247,6 +392,24 @@ class TaskExecutor:
                 worker_id=self.worker_id,
                 execution_id=execution.execution_id,
                 lease_seconds=self.settings.task_lease_seconds,
+                worker_session_id=self.worker_session_id,
+            )
+
+    async def _resolve_secrets(self, task: Task, execution: ActiveExecution) -> ResolvedTaskSecrets:
+        cipher = (
+            SecretCipher.from_settings(self.settings)
+            if self.settings.secret_master_key.strip()
+            else None
+        )
+        async with self.database.session() as session, session.begin():
+            return await TaskSecretBindingRepository.resolve_for_execution(
+                session,
+                task_id=task.id,
+                project_id=task.project_id,
+                worker_id=self.worker_id,
+                execution_id=execution.execution_id,
+                cipher=cipher,
+                worker_session_id=self.worker_session_id,
             )
 
     async def _mark_running(self, execution: ActiveExecution) -> None:
@@ -257,12 +420,24 @@ class TaskExecutor:
                 worker_id=self.worker_id,
                 execution_id=execution.execution_id,
                 lease_seconds=self.settings.task_lease_seconds,
+                worker_session_id=self.worker_session_id,
+            )
+
+    async def _mark_starting(self, execution: ActiveExecution) -> None:
+        async with self.database.session() as session, session.begin():
+            await TaskRepository.mark_starting(
+                session,
+                task_id=execution.task_id,
+                worker_id=self.worker_id,
+                execution_id=execution.execution_id,
+                lease_seconds=self.settings.task_lease_seconds,
+                worker_session_id=self.worker_session_id,
             )
 
     async def _wait_for_outcome(
-        self, container: Container, execution: ActiveExecution, deadline: float
+        self, handle: RuntimeHandle, execution: ActiveExecution, deadline: float
     ) -> WaitOutcome:
-        wait_task = asyncio.create_task(self.runtime.wait_container(container))
+        wait_task = asyncio.create_task(self.runtime.wait(handle))
         stop_task = asyncio.create_task(self._watch_for_stop(execution))
         remaining = max(0.0, deadline - time.monotonic())
         try:
@@ -278,7 +453,7 @@ class TaskExecutor:
             if not stop_task.done():
                 stop_task.cancel()
             if not wait_task.done():
-                # The Docker wait thread exits after stop_container runs in the caller.
+                # A blocking runtime wait exits after stop() runs in the caller.
                 wait_task.cancel()
             await asyncio.gather(stop_task, wait_task, return_exceptions=True)
 
@@ -294,28 +469,35 @@ class TaskExecutor:
                     task_id=execution.task_id,
                     worker_id=self.worker_id,
                     execution_id=execution.execution_id,
+                    worker_session_id=self.worker_session_id,
                 ):
                     return "cancelled"
             await asyncio.sleep(0.25)
 
-    async def _raise_if_cancelled(self, execution: ActiveExecution) -> None:
+    async def _pre_start_stop_reason(self, execution: ActiveExecution) -> str | None:
         if execution.ownership_lost.is_set():
-            raise StaleExecutionError("task ownership was revoked")
+            return "ownership_lost"
         async with self.database.session() as session:
-            if await TaskRepository.cancellation_requested(
-                session,
-                task_id=execution.task_id,
-                worker_id=self.worker_id,
-                execution_id=execution.execution_id,
-            ):
-                raise StaleExecutionError("task was cancelled before container start")
+            try:
+                if await TaskRepository.cancellation_requested(
+                    session,
+                    task_id=execution.task_id,
+                    worker_id=self.worker_id,
+                    execution_id=execution.execution_id,
+                    worker_session_id=self.worker_session_id,
+                ):
+                    return "cancelled"
+            except StaleExecutionError:
+                return "ownership_lost"
+        return None
 
     async def _collect_logs(
         self,
-        container: Container,
+        handle: RuntimeHandle,
         execution: ActiveExecution,
         *,
         ready: asyncio.Event,
+        secret_values: tuple[str, ...] = (),
     ) -> None:
         async def persist(stream: LogStream, content: str) -> None:
             await self._persist_log(execution, stream, content)
@@ -324,8 +506,19 @@ class TaskExecutor:
             max_record_bytes=self.settings.max_log_chunk_bytes,
             persist=persist,
         )
+        redactors = {
+            LogStream.STDOUT: StreamingSecretRedactor(secret_values),
+            LogStream.STDERR: StreamingSecretRedactor(secret_values),
+        }
+
+        async def finish_redactors() -> None:
+            for stream in (LogStream.STDOUT, LogStream.STDERR):
+                tail = redactors[stream].finish()
+                if tail:
+                    await coalescer.add(stream, tail)
+
         total = 0
-        logs = self.runtime.stream_logs(container, ready=ready).__aiter__()
+        logs = self.runtime.logs(handle, ready=ready).__aiter__()
 
         async def next_log() -> RuntimeLog:
             return await anext(logs)
@@ -357,13 +550,16 @@ class TaskExecutor:
                 remaining = self.settings.max_task_log_bytes - total
                 accepted = item.content[:remaining]
                 if accepted:
-                    await coalescer.add(stream, accepted)
+                    redacted = redactors[stream].feed(accepted)
+                    if redacted:
+                        await coalescer.add(stream, redacted)
                     total += len(accepted)
                     if coalescer.has_pending and flush_deadline is None:
                         flush_deadline = time.monotonic() + _LOG_COALESCE_FLUSH_INTERVAL_SECONDS
                     elif not coalescer.has_pending:
                         flush_deadline = None
                 if len(accepted) < len(item.content) or total >= self.settings.max_task_log_bytes:
+                    await finish_redactors()
                     await coalescer.flush_all()
                     await self._system_log(
                         execution,
@@ -381,6 +577,7 @@ class TaskExecutor:
                 await close()
             # Async-generator completion, executor cancellation, and drain timeout
             # all pass through here, so a sub-threshold tail is still durable.
+            await finish_redactors()
             await coalescer.flush_all()
 
     async def _drain_log_task(
@@ -412,6 +609,8 @@ class TaskExecutor:
                 execution_id=execution.execution_id,
                 stream=stream,
                 content=content,
+                worker_id=self.worker_id,
+                worker_session_id=self.worker_session_id,
             )
         try:
             await self.queue.publish_log(
@@ -431,11 +630,45 @@ class TaskExecutor:
         except (StaleExecutionError, LookupError):
             return
 
-    async def _best_effort_stop(self, container: Container) -> None:
+    async def _best_effort_stop(
+        self, handle: RuntimeHandle, *, secret_values: tuple[str, ...] = ()
+    ) -> None:
         try:
-            await self.runtime.stop_container(container)
+            await self.runtime.stop(handle)
         except Exception as exc:
-            self.logger.error("failed to stop container", container_id=container.id, error=str(exc))
+            self.logger.error(
+                "failed to stop runtime object",
+                runtime_type=handle.runtime_type,
+                runtime_object_id=handle.object_id,
+                error=redact_text(str(exc), secret_values),
+            )
+
+    def _execution_spec(
+        self,
+        task: Task,
+        execution: ActiveExecution,
+        *,
+        environment: dict[str, str] | None = None,
+        mounts: tuple[RuntimeMount, ...] = (),
+    ) -> ExecutionSpec:
+        return ExecutionSpec(
+            task_id=task.id,
+            execution_id=execution.execution_id,
+            worker_id=self.worker_id,
+            image=task.image,
+            command=tuple(task.command),
+            environment=dict(task.environment) if environment is None else environment,
+            timeout_seconds=task.timeout_seconds,
+            cpu_limit=task.cpu_limit,
+            memory_limit_mb=task.memory_limit_mb,
+            gpu_count=task.gpu_count,
+            network_enabled=task.network_enabled,
+            labels=dict(task.labels),
+            project_id=getattr(task, "project_id", None),
+            gpu_device_ids=tuple(getattr(task, "gpu_device_ids", None) or ()),
+            runtime_type=task.runtime_type.value,
+            mounts=mounts,
+        )
 
     async def _finish(
         self,
@@ -444,6 +677,8 @@ class TaskExecutor:
         target: TaskStatus,
         exit_code: int | None,
         error_message: str | None,
+        error_category: ErrorCategory | None = None,
+        error_code: ErrorCode | None = None,
     ) -> ExecutionResult:
         async with self.database.session() as session, session.begin():
             result = await TaskRepository.finish_execution(
@@ -454,9 +689,13 @@ class TaskExecutor:
                 target=target,
                 exit_code=exit_code,
                 error_message=error_message,
+                error_category=error_category,
+                error_code=error_code,
                 retry_max_backoff_seconds=self.settings.retry_max_backoff_seconds,
                 cpu_price_per_hour=self.settings.cpu_price_per_hour,
                 gpu_price_per_hour=self.settings.gpu_price_per_hour,
+                memory_price_per_gb_hour=self.settings.memory_price_per_gb_hour,
+                worker_session_id=self.worker_session_id,
             )
         if result.accepted:
             try:

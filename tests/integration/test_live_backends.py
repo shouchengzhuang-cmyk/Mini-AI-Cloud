@@ -13,7 +13,9 @@ from core.database import Database
 from core.enums import TaskStatus
 from models.outbox import OutboxEvent
 from models.task import Task, TaskLog
+from models.usage import UsageLedger
 from models.worker import Worker
+from repositories.scheduling import SchedulingRepository
 from repositories.tasks import ClaimRejected, TaskRepository
 from repositories.workers import WorkerRepository
 
@@ -87,6 +89,7 @@ async def _cleanup_live_database_rows(
     async with database.session() as session, session.begin():
         await session.execute(delete(OutboxEvent).where(OutboxEvent.aggregate_id == task_id))
         await session.execute(delete(TaskLog).where(TaskLog.task_id == task_id))
+        await session.execute(delete(UsageLedger).where(UsageLedger.task_id == task_id))
         await session.execute(delete(Task).where(Task.id == task_id))
         await session.execute(delete(Worker).where(Worker.id.in_(worker_ids)))
 
@@ -101,26 +104,23 @@ async def test_live_postgresql_atomic_claim_has_one_winner(live_database: Databa
         for worker_id in worker_ids:
             await _register_live_worker(live_database, worker_id, labels)
 
-        now = datetime.now(UTC)
         async with live_database.session() as session, session.begin():
-            session.add(
-                Task(
-                    id=task_id,
-                    image="alpine:3.21",
-                    command=["true"],
-                    environment={},
-                    status=TaskStatus.QUEUED,
-                    created_at=now,
-                    queued_at=now,
-                    timeout_seconds=30,
-                    max_retries=0,
-                    cpu_limit=0.25,
-                    memory_limit_mb=64,
-                    gpu_count=0,
-                    network_enabled=False,
-                    labels=labels,
-                )
+            task = await TaskRepository.create_queued(
+                session,
+                image="alpine:3.21",
+                command=["true"],
+                environment={},
+                timeout_seconds=30,
+                max_retries=0,
+                cpu_limit=0.25,
+                memory_limit_mb=64,
+                labels=labels,
+                network_enabled=False,
+                gpu_count=0,
+                idempotency_key=None,
+                request_hash=None,
             )
+            task_id = task.id
 
         start = asyncio.Event()
 
@@ -151,17 +151,45 @@ async def test_live_postgresql_atomic_claim_has_one_winner(live_database: Databa
         assert len(winners) == 1
         winner_id, execution_id = winners[0]
         async with live_database.session() as session:
-            task = await session.scalar(select(Task).where(Task.id == task_id))
+            persisted_task = await session.scalar(select(Task).where(Task.id == task_id))
             workers = list(await session.scalars(select(Worker).where(Worker.id.in_(worker_ids))))
 
-        assert task is not None
-        assert task.status == TaskStatus.ASSIGNED
-        assert task.worker_id == winner_id
-        assert task.execution_id == execution_id
+        assert persisted_task is not None
+        assert persisted_task.status == TaskStatus.ASSIGNED
+        assert persisted_task.worker_id == winner_id
+        assert persisted_task.execution_id == execution_id
         assert sum(worker.running_tasks for worker in workers) == 1
         assert sum(worker.reserved_cpu for worker in workers) == pytest.approx(0.25)
+        async with live_database.session() as session, session.begin():
+            result = await TaskRepository.finish_execution(
+                session,
+                task_id=task_id,
+                worker_id=winner_id,
+                execution_id=execution_id,
+                target=TaskStatus.CANCELLED,
+                exit_code=None,
+                error_message="live test cleanup",
+                retry_max_backoff_seconds=60,
+                cpu_price_per_hour=0.05,
+                memory_price_per_gb_hour=0.005,
+                gpu_price_per_hour=1.0,
+            )
+        assert result.accepted
     finally:
         await _cleanup_live_database_rows(live_database, task_id=task_id, worker_ids=worker_ids)
+
+
+async def test_live_postgresql_global_candidate_lanes_compile_and_execute(
+    live_database: Database,
+) -> None:
+    async with live_database.session() as session, session.begin():
+        candidates = await SchedulingRepository.choose_candidates(
+            session,
+            aging_interval_seconds=60,
+            scan_limit=1,
+        )
+
+    assert len(candidates) <= 3
 
 
 async def test_live_redis_consumer_group_reclaim_ack_and_delete(live_redis: Redis) -> None:

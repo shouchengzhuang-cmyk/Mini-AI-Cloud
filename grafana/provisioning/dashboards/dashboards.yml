@@ -1,0 +1,12 @@
+apiVersion: 1
+
+providers:
+  - name: Mini AI Cloud
+    orgId: 1
+    folder: Mini AI Cloud
+    type: file
+    disableDeletion: true
+    editable: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards

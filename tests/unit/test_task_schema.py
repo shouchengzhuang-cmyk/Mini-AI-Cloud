@@ -1,3 +1,4 @@
+import uuid
 from typing import Any
 
 import pytest
@@ -70,3 +71,95 @@ def test_task_create_rejects_invalid_environment(environment: dict[str, str]) ->
 def test_task_create_rejects_image_with_whitespace() -> None:
     with pytest.raises(ValidationError, match="must not contain whitespace"):
         TaskCreate.model_validate(_payload(image="python :3.12-slim"))
+
+
+def test_task_create_accepts_only_pinned_secret_references() -> None:
+    secret_id = uuid.uuid4()
+
+    request = TaskCreate.model_validate(
+        _payload(
+            secret_bindings=[
+                {"secret_id": str(secret_id), "version": 2, "env_name": "DATABASE_PASSWORD"}
+            ]
+        )
+    )
+
+    assert request.secret_bindings[0].secret_id == secret_id
+    assert request.secret_bindings[0].version == 2
+    dumped = request.model_dump(mode="json")
+    assert dumped["secret_bindings"] == [
+        {"secret_id": str(secret_id), "version": 2, "env_name": "DATABASE_PASSWORD"}
+    ]
+
+
+def test_task_create_accepts_structured_retry_policy_and_maps_total_attempts() -> None:
+    request = TaskCreate.model_validate(
+        _payload(
+            max_retries=0,
+            retry_policy={
+                "max_attempts": 4,
+                "backoff": "exponential",
+                "base_seconds": 2,
+                "max_seconds": 60,
+                "retry_on_exit_codes": [1, 137],
+            },
+        )
+    )
+
+    assert request.effective_retry_policy.max_attempts == 4
+    assert request.effective_retry_policy.retry_on_exit_codes == [1, 137]
+
+
+def test_task_create_maps_legacy_max_retries_to_total_attempts() -> None:
+    request = TaskCreate.model_validate(_payload(max_retries=3))
+
+    assert request.retry_policy is None
+    assert request.effective_retry_policy.max_attempts == 4
+
+
+@pytest.mark.parametrize(
+    "retry_policy",
+    [
+        {"max_attempts": 0},
+        {"max_attempts": 2, "base_seconds": 5.0, "max_seconds": 4.0},
+        {"max_attempts": 2, "retry_on_exit_codes": [1, 1]},
+        {"max_attempts": 2, "retry_on_exit_codes": [256]},
+        {"max_attempts": 2, "backoff": "random"},
+    ],
+)
+def test_task_create_rejects_invalid_retry_policy(retry_policy: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        TaskCreate.model_validate(_payload(max_retries=0, retry_policy=retry_policy))
+
+
+def test_task_create_rejects_conflicting_legacy_and_structured_retry_limits() -> None:
+    with pytest.raises(ValidationError, match="max_retries conflicts"):
+        TaskCreate.model_validate(_payload(max_retries=2, retry_policy={"max_attempts": 4}))
+
+
+@pytest.mark.parametrize(
+    "secret_bindings",
+    [
+        [{"secret_id": str(uuid.uuid4()), "version": 0, "env_name": "TOKEN"}],
+        [{"secret_id": str(uuid.uuid4()), "version": 1, "env_name": "bad-name"}],
+        [
+            {"secret_id": str(uuid.uuid4()), "version": 1, "env_name": "TOKEN"},
+            {"secret_id": str(uuid.uuid4()), "version": 1, "env_name": "TOKEN"},
+        ],
+    ],
+)
+def test_task_create_rejects_invalid_secret_references(
+    secret_bindings: list[dict[str, object]],
+) -> None:
+    with pytest.raises(ValidationError):
+        TaskCreate.model_validate(_payload(secret_bindings=secret_bindings))
+
+    with pytest.raises(ValidationError, match="must not overlap"):
+        TaskCreate.model_validate(
+            _payload(
+                environment={"TOKEN": "public"},
+                secret_bindings=[
+                    {"secret_id": str(uuid.uuid4()), "version": 1, "env_name": "TOKEN"}
+                ],
+            )
+        )

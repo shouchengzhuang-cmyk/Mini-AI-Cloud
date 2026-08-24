@@ -9,6 +9,7 @@ from redis.exceptions import ResponseError
 READY_STREAM = "tasks:ready"
 READY_GROUP = "task-workers"
 EVENT_STREAM = "tasks:events"
+READINESS_WRITE_KEY = "system:rate-limit-readiness"
 
 
 class RedisQueue:
@@ -35,6 +36,15 @@ class RedisQueue:
 
     async def ping(self) -> bool:
         return bool(await self.client.ping())
+
+    async def rate_limit_backend_ready(self) -> bool:
+        """Exercise the write transaction required by fail-closed API-key auth."""
+
+        async with self.client.pipeline(transaction=True) as pipeline:
+            pipeline.incr(READINESS_WRITE_KEY)
+            pipeline.expire(READINESS_WRITE_KEY, 30)
+            results = await pipeline.execute()
+        return int(results[0]) >= 1 and bool(results[1])
 
     async def close(self) -> None:
         await self.client.aclose()

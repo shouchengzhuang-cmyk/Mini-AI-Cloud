@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 import psutil
 
+from worker.gpu_inventory import GPUDevice, GPUInventoryProvider, NvidiaSMIInventoryProvider
+
 
 @dataclass(frozen=True, slots=True)
 class WorkerCapabilities:
@@ -16,8 +18,10 @@ class WorkerCapabilities:
     gpu_memory_mb: int
 
 
-def detect_capabilities() -> WorkerCapabilities:
-    gpu_count, gpu_model, gpu_memory_mb = detect_gpus()
+def detect_capabilities(
+    gpu_provider: GPUInventoryProvider | None = None,
+) -> WorkerCapabilities:
+    gpu_count, gpu_model, gpu_memory_mb = detect_gpus(gpu_provider)
     return WorkerCapabilities(
         hostname=socket.gethostname(),
         cpu_count=os.cpu_count() or 1,
@@ -28,34 +32,19 @@ def detect_capabilities() -> WorkerCapabilities:
     )
 
 
-def detect_gpus() -> tuple[int, str | None, int]:
-    try:
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=name,memory.total",
-                "--format=csv,noheader,nounits",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
-        return 0, None, 0
+def detect_gpu_devices(
+    provider: GPUInventoryProvider | None = None,
+) -> tuple[GPUDevice, ...]:
+    resolved = provider or NvidiaSMIInventoryProvider(runner=subprocess.run)
+    return resolved.list_devices()
 
-    rows = [row.strip() for row in result.stdout.splitlines() if row.strip()]
-    models: list[str] = []
-    total_memory = 0
-    for row in rows:
-        model, separator, memory = row.rpartition(",")
-        if not separator:
-            continue
-        models.append(model.strip())
-        try:
-            total_memory += int(memory.strip())
-        except ValueError:
-            continue
-    if not models:
+
+def detect_gpus(
+    provider: GPUInventoryProvider | None = None,
+) -> tuple[int, str | None, int]:
+    devices = detect_gpu_devices(provider)
+    if not devices:
         return 0, None, 0
-    return len(models), ", ".join(dict.fromkeys(models)), total_memory
+    models = ", ".join(dict.fromkeys(device.model for device in devices))
+    total_memory = sum(device.memory_total_mb for device in devices)
+    return len(devices), models, total_memory

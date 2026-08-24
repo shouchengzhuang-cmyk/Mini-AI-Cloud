@@ -8,23 +8,37 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Header, Query, Request, status
 from fastapi.responses import StreamingResponse
 from redis.exceptions import RedisError
+from sqlalchemy import distinct, func, select
 
-from api.dependencies import get_app_settings, get_database, get_queue
+from api.dependencies import (
+    get_app_settings,
+    get_database,
+    get_principal,
+    get_queue,
+    require_api_permission,
+)
 from api.errors import ConflictError, NotFoundError
+from api.pagination import encode_cursor
+from api.routes._pagination import parse_list_cursor
 from api.schemas.common import PaginationMeta
 from api.schemas.tasks import (
     TaskCreate,
     TaskCreated,
+    TaskEventResponse,
     TaskListResponse,
     TaskLogResponse,
     TaskLogsResponse,
     TaskResponse,
+    TaskSchedulingResponse,
+    TaskTimelineResponse,
 )
 from api.services.tasks import TaskService
 from core.config import Settings
 from core.database import Database
 from core.enums import FINAL_TASK_STATUSES, TaskStatus
+from core.rbac import Permission, Principal
 from core.redis import RedisQueue
+from models.scheduling import PlacementAttempt
 from repositories.tasks import TaskRepository
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
@@ -35,9 +49,12 @@ async def create_task(
     payload: TaskCreate,
     database: Annotated[Database, Depends(get_database)],
     settings: Annotated[Settings, Depends(get_app_settings)],
+    principal: Annotated[Principal, Depends(require_api_permission(Permission.TASK_CREATE))],
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key", max_length=255)] = None,
 ) -> TaskCreated:
-    result = await TaskService(database, settings).create(payload, idempotency_key=idempotency_key)
+    result = await TaskService(database, settings).create(
+        payload, idempotency_key=idempotency_key, principal=principal
+    )
     return TaskCreated(id=result.task.id, status=result.task.status)
 
 
@@ -45,20 +62,33 @@ async def create_task(
 async def list_tasks(
     database: Annotated[Database, Depends(get_database)],
     settings: Annotated[Settings, Depends(get_app_settings)],
+    principal: Annotated[Principal, Depends(require_api_permission(Permission.TASK_READ))],
     task_status: Annotated[TaskStatus | None, Query(alias="status")] = None,
     worker_id: Annotated[str | None, Query(min_length=1, max_length=255)] = None,
     limit: Annotated[int, Query(ge=1, le=1000)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
+    cursor: Annotated[str | None, Query(max_length=512)] = None,
 ) -> TaskListResponse:
-    items, total = await TaskService(database, settings).list_tasks(
+    after = parse_list_cursor(cursor=cursor, offset=offset)
+    rows, total = await TaskService(database, settings).list_tasks(
         status=task_status,
         worker_id=worker_id,
-        limit=limit,
+        limit=limit + 1,
         offset=offset,
+        after=after,
+        principal=principal,
     )
+    has_more = len(rows) > limit
+    items = rows[:limit]
+    next_cursor = encode_cursor(items[-1].created_at, items[-1].id) if has_more and items else None
     return TaskListResponse(
         items=[TaskResponse.model_validate(item) for item in items],
-        pagination=PaginationMeta(total=total, limit=limit, offset=offset),
+        pagination=PaginationMeta(
+            total=total,
+            limit=limit,
+            offset=offset if cursor is None else 0,
+            next_cursor=next_cursor,
+        ),
     )
 
 
@@ -67,8 +97,9 @@ async def get_task(
     task_id: uuid.UUID,
     database: Annotated[Database, Depends(get_database)],
     settings: Annotated[Settings, Depends(get_app_settings)],
+    principal: Annotated[Principal, Depends(require_api_permission(Permission.TASK_READ))],
 ) -> TaskResponse:
-    task = await TaskService(database, settings).get(task_id)
+    task = await TaskService(database, settings).get(task_id, principal=principal)
     if task is None:
         raise NotFoundError("TASK_NOT_FOUND", "Task not found")
     return TaskResponse.model_validate(task)
@@ -79,8 +110,9 @@ async def cancel_task(
     task_id: uuid.UUID,
     database: Annotated[Database, Depends(get_database)],
     settings: Annotated[Settings, Depends(get_app_settings)],
+    principal: Annotated[Principal, Depends(get_principal)],
 ) -> TaskResponse:
-    task = await TaskService(database, settings).cancel(task_id)
+    task = await TaskService(database, settings).cancel(task_id, principal=principal)
     if task is None:
         raise NotFoundError("TASK_NOT_FOUND", "Task not found")
     if task.status == TaskStatus.SUCCEEDED:
@@ -88,15 +120,117 @@ async def cancel_task(
     return TaskResponse.model_validate(task)
 
 
+@router.get("/{task_id}/timeline", response_model=TaskTimelineResponse)
+async def get_task_timeline(
+    task_id: uuid.UUID,
+    database: Annotated[Database, Depends(get_database)],
+    principal: Annotated[Principal, Depends(require_api_permission(Permission.TASK_READ))],
+) -> TaskTimelineResponse:
+    if principal.project_id is None:
+        raise NotFoundError("TASK_NOT_FOUND", "Task not found")
+    async with database.session() as session:
+        task = await TaskRepository.get_for_project(
+            session,
+            project_id=principal.project_id,
+            task_id=task_id,
+        )
+        if task is None:
+            raise NotFoundError("TASK_NOT_FOUND", "Task not found")
+        events = await TaskRepository.list_events_for_project(
+            session,
+            project_id=principal.project_id,
+            task_id=task_id,
+        )
+    return TaskTimelineResponse(
+        task_id=task_id,
+        events=[TaskEventResponse.model_validate(item) for item in events],
+    )
+
+
+@router.get(
+    "/{task_id}/scheduling",
+    response_model=TaskSchedulingResponse,
+    summary="Explain recorded scheduler decisions without exposing worker details",
+)
+async def get_task_scheduling(
+    task_id: uuid.UUID,
+    database: Annotated[Database, Depends(get_database)],
+    principal: Annotated[Principal, Depends(require_api_permission(Permission.TASK_READ))],
+) -> TaskSchedulingResponse:
+    if principal.project_id is None:
+        raise NotFoundError("TASK_NOT_FOUND", "Task not found")
+    async with database.session() as session:
+        task = await TaskRepository.get_for_project(
+            session,
+            project_id=principal.project_id,
+            task_id=task_id,
+        )
+        if task is None:
+            raise NotFoundError("TASK_NOT_FOUND", "Task not found")
+
+        attempts_total = int(
+            await session.scalar(
+                select(func.count(PlacementAttempt.id)).where(PlacementAttempt.task_id == task_id)
+            )
+            or 0
+        )
+        considered_workers = int(
+            await session.scalar(
+                select(func.count(distinct(PlacementAttempt.worker_id))).where(
+                    PlacementAttempt.task_id == task_id,
+                    PlacementAttempt.worker_id.is_not(None),
+                )
+            )
+            or 0
+        )
+        grouped = list(
+            await session.execute(
+                select(
+                    PlacementAttempt.outcome,
+                    PlacementAttempt.reason,
+                    func.count(PlacementAttempt.id),
+                )
+                .where(PlacementAttempt.task_id == task_id)
+                .group_by(PlacementAttempt.outcome, PlacementAttempt.reason)
+            )
+        )
+        latest_attempt_at = await session.scalar(
+            select(func.max(PlacementAttempt.created_at)).where(PlacementAttempt.task_id == task_id)
+        )
+
+    outcomes: dict[str, int] = {}
+    rejections: dict[str, int] = {}
+    for outcome, reason, count in grouped:
+        amount = int(count)
+        outcomes[outcome] = outcomes.get(outcome, 0) + amount
+        if outcome == "rejected":
+            rejection = reason or "unspecified"
+            rejections[rejection] = rejections.get(rejection, 0) + amount
+
+    return TaskSchedulingResponse(
+        task_id=task.id,
+        state=_scheduling_state(task.status, task.unschedulable_reason),
+        reason=task.unschedulable_reason,
+        considered_workers=considered_workers,
+        attempts_total=attempts_total,
+        rejections=dict(sorted(rejections.items())),
+        outcomes=dict(sorted(outcomes.items())),
+        latest_attempt_at=latest_attempt_at,
+    )
+
+
 @router.get("/{task_id}/logs", response_model=TaskLogsResponse)
 async def get_task_logs(
     task_id: uuid.UUID,
     database: Annotated[Database, Depends(get_database)],
     settings: Annotated[Settings, Depends(get_app_settings)],
+    principal: Annotated[Principal, Depends(require_api_permission(Permission.TASK_LOG_READ))],
     offset: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=5000)] = 500,
 ) -> TaskLogsResponse:
-    result = await TaskService(database, settings).logs(task_id, offset=offset, limit=limit)
+    result = await TaskService(database, settings).logs(
+        task_id, offset=offset, limit=limit, principal=principal
+    )
     if result is None:
         raise NotFoundError("TASK_NOT_FOUND", "Task not found")
     logs, total = result
@@ -114,11 +248,18 @@ async def stream_task_logs(
     database: Annotated[Database, Depends(get_database)],
     queue: Annotated[RedisQueue, Depends(get_queue)],
     settings: Annotated[Settings, Depends(get_app_settings)],
+    principal: Annotated[Principal, Depends(require_api_permission(Permission.TASK_LOG_READ))],
     offset: Annotated[int, Query(ge=0)] = 0,
     last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
 ) -> StreamingResponse:
     async with database.session() as session:
-        if await TaskRepository.get(session, task_id) is None:
+        if (
+            principal.project_id is None
+            or await TaskRepository.get_for_project(
+                session, project_id=principal.project_id, task_id=task_id
+            )
+            is None
+        ):
             raise NotFoundError("TASK_NOT_FOUND", "Task not found")
     try:
         sequence = max(offset, int(last_event_id or 0))
@@ -131,8 +272,18 @@ async def stream_task_logs(
         last_heartbeat = time.monotonic()
         while not await request.is_disconnected():
             async with database.session() as session:
-                logs = await TaskRepository.list_logs(session, task_id, offset=sequence, limit=500)
-                task = await TaskRepository.get(session, task_id)
+                if principal.project_id is None:
+                    return
+                logs = await TaskRepository.list_logs_for_project(
+                    session,
+                    project_id=principal.project_id,
+                    task_id=task_id,
+                    offset=sequence,
+                    limit=500,
+                )
+                task = await TaskRepository.get_for_project(
+                    session, project_id=principal.project_id, task_id=task_id
+                )
             for item in logs:
                 sequence = item.sequence
                 data = TaskLogResponse.model_validate(item).model_dump(mode="json")
@@ -171,3 +322,22 @@ def _sse(event: str, data: str, *, event_id: str | None = None) -> str:
         parts.append(f"id: {event_id}")
     parts.extend((f"event: {event}", f"data: {data}", "", ""))
     return "\n".join(parts)
+
+
+def _scheduling_state(task_status: TaskStatus, reason: str | None) -> str:
+    if task_status == TaskStatus.QUEUED and reason:
+        return "unschedulable"
+    if task_status in {TaskStatus.PENDING, TaskStatus.QUEUED, TaskStatus.RETRYING}:
+        return "waiting"
+    if task_status in {
+        TaskStatus.SCHEDULING,
+        TaskStatus.ASSIGNED,
+        TaskStatus.PREPARING,
+        TaskStatus.PULLING,
+        TaskStatus.STARTING,
+        TaskStatus.RUNNING,
+        TaskStatus.PREEMPTING,
+        TaskStatus.STOPPING,
+    }:
+        return "scheduled"
+    return task_status.value
