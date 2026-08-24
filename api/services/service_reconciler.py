@@ -1,6 +1,7 @@
 import uuid
 
 from core.database import Database
+from core.enums import RuntimeType
 from core.logging import get_logger
 from repositories.services import EndpointSelection, ReconcileResult, ServiceRepository
 
@@ -21,14 +22,18 @@ class ServiceReconciler:
         *,
         batch_size: int = 100,
         drain_timeout_seconds: float = 30.0,
+        kubernetes_drain_timeout_seconds: float | None = None,
     ) -> None:
         if batch_size < 1:
             raise ValueError("batch_size must be at least one")
         if drain_timeout_seconds < 0:
             raise ValueError("drain_timeout_seconds must not be negative")
+        if kubernetes_drain_timeout_seconds is not None and kubernetes_drain_timeout_seconds < 0:
+            raise ValueError("kubernetes_drain_timeout_seconds must not be negative")
         self.database = database
         self.batch_size = batch_size
         self.drain_timeout_seconds = drain_timeout_seconds
+        self.kubernetes_drain_timeout_seconds = kubernetes_drain_timeout_seconds
         self.logger = get_logger("service_reconciler")
 
     async def run_once(self) -> ReconcileResult:
@@ -40,6 +45,7 @@ class ServiceReconciler:
                 session,
                 limit=self.batch_size,
                 drain_timeout_seconds=self.drain_timeout_seconds,
+                kubernetes_drain_timeout_seconds=self.kubernetes_drain_timeout_seconds,
             )
         if recovery.replicas_lost or recovery.replicas_stopped:
             self.logger.warning(
@@ -77,7 +83,12 @@ class ServiceReconciler:
             return await ServiceRepository.reconcile_locked(
                 session,
                 service,
-                drain_timeout_seconds=self.drain_timeout_seconds,
+                drain_timeout_seconds=(
+                    self.kubernetes_drain_timeout_seconds
+                    if service.runtime_type == RuntimeType.KUBERNETES
+                    and self.kubernetes_drain_timeout_seconds is not None
+                    else self.drain_timeout_seconds
+                ),
             )
 
     async def choose_endpoint(

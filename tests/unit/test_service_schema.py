@@ -130,6 +130,21 @@ def test_fake_service_uses_cpu_single_replica_runtime_contract() -> None:
     assert payload.tensor_parallel_size == 1
 
 
+def test_fake_service_accepts_kubernetes_backend() -> None:
+    payload = ServiceCreate.model_validate(
+        {
+            "name": "fake-serving-kubernetes",
+            "model": "fake/model",
+            "runtime": "fake",
+            "runtime_type": "kubernetes",
+        }
+    )
+
+    assert payload.runtime == ServingRuntime.FAKE
+    assert payload.runtime_type == RuntimeType.KUBERNETES
+    assert payload.tensor_parallel_size == 1
+
+
 def test_service_autoscaling_bounds_include_initial_desired_replicas() -> None:
     payload = ServiceCreate.model_validate(
         {

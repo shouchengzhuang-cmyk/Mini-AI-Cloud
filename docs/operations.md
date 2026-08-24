@@ -189,6 +189,27 @@ make kind-down
 
 `kind-up` 创建专用 cluster name，`kind-down` 只删除该 cluster。测试前后记录 `kubectl config current-context`；不要覆盖或永久切换用户已有 context。真实 E2E 还应验证 Pod labels、资源 limits、GPU resource request、logs、cancel、API 重启后的 reconciliation 与 orphan cleanup。
 
+Kubernetes model serving 使用独立命令和 cluster，不与 batch Kind 验证混用：
+
+```bash
+make kind-serving-up
+make test-kind-serving
+make kind-serving-down
+```
+
+脚本把 kubeconfig 写入 `build/kind-serving/kubeconfig`，所有 kubectl 和 kind 操作都显式传这个文件。`kind-serving-down` 只删除 `mini-ai-cloud-serving-v4a`，不会删除默认 context 指向的其他集群。若前置条件缺失，命令会打印 `NOT RUN` 并返回非零；先安装或自行提供 Docker、Kind、kubectl，再重跑，不要把这类结果记为 PASS。
+
+常用排障命令：
+
+```bash
+KUBECONFIG=build/kind-serving/kubeconfig kubectl -n mini-ai-cloud-serving get pods,svc
+KUBECONFIG=build/kind-serving/kubeconfig kubectl -n mini-ai-cloud-serving describe pod <pod>
+KUBECONFIG=build/kind-serving/kubeconfig kubectl -n mini-ai-cloud-serving logs deploy/mini-ai-cloud-api
+curl -fsS http://127.0.0.1:18080/readyz
+```
+
+Controller rollout 时不要手工删除 serving Pod。正常 API Deployment restart 会在 startup recovery 中 adopt 现有 execution；Pod UID 或数量发生变化时，先查 worker session、Pod labels、Replica lease 和 controller 日志。手工删除 Pod 是受控故障测试，预期旧 Replica 进入 lost，随后出现带新 execution 的 replacement。
+
 ## 多节点 Worker 边界
 
 每个 Worker 必须有唯一 `WORKER_ID`/hostname/node name，声明 `WORKER_RUNTIME_TYPES`、总/可分配 CPU/RAM、GPU device inventory、labels 与 taints。固定 ID 重注册不能清零旧 lease reservation。

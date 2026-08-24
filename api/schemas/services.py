@@ -105,8 +105,10 @@ class ServiceCreate(RequestModel):
             return self._validate_autoscaling_bounds()
 
         if self.runtime == ServingRuntime.FAKE:
-            if self.runtime_type != RuntimeType.FAKE:
-                raise ValueError("fake serving runtime requires runtime_type='fake'")
+            if self.runtime_type not in {RuntimeType.FAKE, RuntimeType.KUBERNETES}:
+                raise ValueError(
+                    "fake serving runtime requires runtime_type='fake' or 'kubernetes'"
+                )
             if self.gpu_count or self.gpu_memory_mb or self.gpu_model is not None:
                 raise ValueError("fake serving runtime does not accept GPU resources")
             if self.tensor_parallel_size not in {None, 1}:

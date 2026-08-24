@@ -41,6 +41,8 @@ async def create_service(
     principal: Annotated[Principal, Depends(require_api_permission(Permission.MODEL_MANAGE))],
 ) -> ServiceResponse:
     project_id = _principal_project_id(principal)
+    if payload.registered_model_id is None:
+        _validate_runtime_availability(payload, settings)
     try:
         async with database.session() as session, session.begin():
             if payload.registered_model_id is not None:
@@ -52,11 +54,17 @@ async def create_service(
                 if registered_model is None:
                     raise NotFoundError("MODEL_NOT_FOUND", "Registered model not found")
                 payload = _resolve_registered_model(payload, registered_model)
+                _validate_runtime_availability(payload, settings)
 
             image = payload.image
             if image is None and payload.runtime == ServingRuntime.VLLM:
                 image = settings.vllm_image
-            if image is None and payload.runtime != ServingRuntime.FAKE:
+            if image is None and payload.runtime_type == RuntimeType.KUBERNETES:
+                image = settings.kubernetes_serving_image
+            if image is None and (
+                payload.runtime != ServingRuntime.FAKE
+                or payload.runtime_type == RuntimeType.KUBERNETES
+            ):
                 raise ConflictError(
                     "SERVICE_IMAGE_REQUIRED",
                     "A container image is required for this serving runtime",
@@ -114,7 +122,14 @@ async def create_service(
                     payload.autoscaling.cooldown_seconds if payload.autoscaling is not None else 60
                 ),
             )
-            await ServiceRepository.reconcile_locked(session, service)
+            await ServiceRepository.reconcile_locked(
+                session,
+                service,
+                drain_timeout_seconds=_drain_timeout_for_runtime(
+                    settings,
+                    service.runtime_type,
+                ),
+            )
             counts = (await ServiceRepository.counts_for_service_ids(session, [service.id]))[
                 service.id
             ]
@@ -192,6 +207,7 @@ async def scale_service(
     service_id: uuid.UUID,
     payload: ServiceScale,
     database: Annotated[Database, Depends(get_database)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
     principal: Annotated[Principal, Depends(require_api_permission(Permission.MODEL_MANAGE))],
 ) -> ServiceResponse:
     project_id = _principal_project_id(principal)
@@ -205,7 +221,14 @@ async def scale_service(
             )
             if service is None:
                 raise NotFoundError("SERVICE_NOT_FOUND", "Service not found")
-            await ServiceRepository.reconcile_locked(session, service)
+            await ServiceRepository.reconcile_locked(
+                session,
+                service,
+                drain_timeout_seconds=_drain_timeout_for_runtime(
+                    settings,
+                    service.runtime_type,
+                ),
+            )
             counts = (await ServiceRepository.counts_for_service_ids(session, [service.id]))[
                 service.id
             ]
@@ -218,9 +241,16 @@ async def scale_service(
 async def stop_service(
     service_id: uuid.UUID,
     database: Annotated[Database, Depends(get_database)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
     principal: Annotated[Principal, Depends(require_api_permission(Permission.MODEL_MANAGE))],
 ) -> ServiceResponse:
-    return await scale_service(service_id, ServiceScale(replicas=0), database, principal)
+    return await scale_service(
+        service_id,
+        ServiceScale(replicas=0),
+        database,
+        settings,
+        principal,
+    )
 
 
 @router.get("/{service_id}/replicas", response_model=ServiceReplicaListResponse)
@@ -245,6 +275,37 @@ def _principal_project_id(principal: Principal) -> uuid.UUID:
     if principal.project_id is None:
         raise NotFoundError("PROJECT_NOT_FOUND", "Project not found")
     return principal.project_id
+
+
+def _validate_runtime_availability(payload: ServiceCreate, settings: Settings) -> None:
+    if payload.runtime_type != RuntimeType.KUBERNETES:
+        return
+    if payload.runtime != ServingRuntime.FAKE:
+        raise ConflictError(
+            "KUBERNETES_SERVING_RUNTIME_UNSUPPORTED",
+            "Phase IV-A supports Kubernetes-backed fake inference only",
+        )
+    if settings.app_env == "production":
+        raise ConflictError(
+            "KUBERNETES_FAKE_SERVING_FORBIDDEN",
+            "Kubernetes fake serving is not permitted in production",
+        )
+    if not settings.kubernetes_serving_enabled:
+        raise ConflictError(
+            "KUBERNETES_SERVING_DISABLED",
+            "Kubernetes serving is disabled by configuration",
+        )
+    if not settings.kubernetes_serving_fake_enabled:
+        raise ConflictError(
+            "KUBERNETES_FAKE_SERVING_DISABLED",
+            "Kubernetes fake serving requires an explicit development/test opt-in",
+        )
+
+
+def _drain_timeout_for_runtime(settings: Settings, runtime_type: RuntimeType) -> float:
+    if runtime_type == RuntimeType.KUBERNETES:
+        return settings.kubernetes_serving_drain_timeout
+    return settings.service_drain_timeout
 
 
 def _resolve_registered_model(

@@ -1,0 +1,58 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mini-ai-cloud-migrate
+  namespace: mini-ai-cloud-serving
+  labels:
+    app.kubernetes.io/name: mini-ai-cloud-migrate
+    app.kubernetes.io/part-of: kind-serving-e2e
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mini-ai-cloud-migrate
+        app.kubernetes.io/part-of: kind-serving-e2e
+    spec:
+      restartPolicy: Never
+      serviceAccountName: mini-ai-cloud-data
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: mini-ai-cloud:kind-serving-v4a
+          imagePullPolicy: IfNotPresent
+          command: ["alembic", "upgrade", "head"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: mini-ai-cloud-kind-secrets
+                  key: database-url
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            privileged: false
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

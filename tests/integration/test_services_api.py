@@ -238,6 +238,82 @@ async def test_services_api_derives_fake_runtime_from_registered_model(
     assert body["tensor_parallel_size"] == 1
 
 
+async def test_services_api_requires_explicit_kubernetes_fake_opt_in_and_image_policy(
+    services_client: AsyncClient,
+    services_settings: Settings,
+) -> None:
+    payload = {
+        "name": "kubernetes-fake",
+        "model": "fake/kubernetes-model",
+        "runtime": "fake",
+        "runtime_type": "kubernetes",
+        "replicas": 0,
+    }
+
+    disabled = await services_client.post("/api/v1/services", json=payload)
+    assert disabled.status_code == 409
+    assert disabled.json()["error"]["code"] == "KUBERNETES_SERVING_DISABLED"
+
+    services_settings.kubernetes_serving_enabled = True
+    still_disabled = await services_client.post("/api/v1/services", json=payload)
+    assert still_disabled.status_code == 409
+    assert still_disabled.json()["error"]["code"] == "KUBERNETES_FAKE_SERVING_DISABLED"
+
+    services_settings.kubernetes_serving_fake_enabled = True
+    services_settings.kubernetes_serving_image = f"example/vllm@{DIGEST}"
+    created = await services_client.post("/api/v1/services", json=payload)
+    assert created.status_code == 201
+    body = created.json()
+    assert body["runtime"] == "fake"
+    assert body["runtime_type"] == "kubernetes"
+    assert body["image"] == f"docker.io/example/vllm@{DIGEST}"
+
+
+async def test_services_api_preserves_explicit_kubernetes_backend_for_registered_fake_model(
+    services_client: AsyncClient,
+    services_settings: Settings,
+    database: Database,
+) -> None:
+    async with database.session() as session, session.begin():
+        registered_model = await RegisteredModelRepository.create(
+            session,
+            project_id=PROJECT_ID,
+            name="registry-kubernetes-fake",
+            provider="local",
+            source="fake/registry-kubernetes-model",
+            revision=None,
+            runtime="fake",
+            default_gpu_count=0,
+            runtime_defaults={"tensor_parallel_size": 1},
+            size_bytes=None,
+            gpu_memory_mb=None,
+            architecture=None,
+            metadata={},
+            created_by_user_id=None,
+        )
+        registered_model_id = registered_model.id
+
+    services_settings.kubernetes_serving_enabled = True
+    services_settings.kubernetes_serving_fake_enabled = True
+    services_settings.kubernetes_serving_image = f"example/vllm@{DIGEST}"
+    response = await services_client.post(
+        "/api/v1/services",
+        json={
+            "name": "registry-kubernetes-service",
+            "registered_model_id": str(registered_model_id),
+            "runtime_type": "kubernetes",
+            "replicas": 0,
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["model"] == "fake/registry-kubernetes-model"
+    assert body["runtime"] == "fake"
+    assert body["runtime_type"] == "kubernetes"
+    assert body["image"] == f"docker.io/example/vllm@{DIGEST}"
+
+
 async def test_registered_model_delete_keeps_service_snapshot_and_clears_fk(
     services_client: AsyncClient,
     database: Database,

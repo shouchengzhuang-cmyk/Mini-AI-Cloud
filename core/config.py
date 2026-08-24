@@ -142,6 +142,39 @@ class Settings(BaseSettings):
     kubernetes_in_cluster: bool = False
     kubernetes_cleanup_grace_seconds: int = Field(default=30, ge=0, le=3600)
 
+    kubernetes_serving_enabled: bool = False
+    kubernetes_serving_fake_enabled: bool = False
+    kubernetes_serving_namespace: str = Field(
+        default="mini-ai-cloud-serving",
+        min_length=1,
+        max_length=63,
+        pattern=r"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+    )
+    kubernetes_serving_cluster_id: str = Field(
+        default="mini-ai-cloud-local",
+        min_length=1,
+        max_length=63,
+        pattern=r"^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$",
+    )
+    kubernetes_serving_image: OptionalNonEmptyString = Field(
+        default=None,
+        min_length=1,
+        max_length=512,
+    )
+    kubernetes_serving_startup_timeout: float = Field(default=120.0, gt=0)
+    kubernetes_serving_drain_timeout: float = Field(default=30.0, ge=0)
+    kubernetes_serving_poll_interval: float = Field(default=1.0, gt=0)
+    kubernetes_serving_probe_timeout: float = Field(default=3.0, gt=0)
+    kubernetes_serving_lease_seconds: float = Field(default=180.0, gt=0)
+    kubernetes_serving_failure_backoff: float = Field(default=5.0, gt=0, le=3600)
+    kubernetes_serving_termination_grace_seconds: int = Field(
+        default=30,
+        ge=1,
+        le=3600,
+    )
+    kubernetes_serving_fake_startup_delay: float = Field(default=0.0, ge=0, le=3600)
+    kubernetes_serving_fake_chunk_delay: float = Field(default=0.02, ge=0, le=60)
+
     service_reconcile_interval: float = Field(default=2.0, gt=0)
     service_health_interval: float = Field(default=5.0, gt=0)
     service_drain_timeout: float = Field(default=30.0, ge=0)
@@ -191,6 +224,18 @@ class Settings(BaseSettings):
             raise ValueError(
                 "SERVICE_VLLM_LEASE_SECONDS must exceed two SERVICE_VLLM_PROBE_TIMEOUTs"
             )
+        if self.kubernetes_serving_lease_seconds <= max(
+            self.kubernetes_serving_startup_timeout,
+            self.kubernetes_serving_probe_timeout * 2,
+            self.kubernetes_serving_poll_interval * 2,
+        ):
+            raise ValueError(
+                "KUBERNETES_SERVING_LEASE_SECONDS must exceed startup and probe/poll timeouts"
+            )
+        if self.kubernetes_serving_fake_enabled and not self.kubernetes_serving_enabled:
+            raise ValueError("KUBERNETES_SERVING_FAKE_ENABLED requires KUBERNETES_SERVING_ENABLED")
+        if self.kubernetes_serving_fake_enabled and self.app_env == "production":
+            raise ValueError("Kubernetes fake serving must remain disabled in production")
         if self.fake_gpu_count and self.app_env == "production":
             raise ValueError("FAKE_GPU_COUNT must be zero in production")
         runtime_types = {

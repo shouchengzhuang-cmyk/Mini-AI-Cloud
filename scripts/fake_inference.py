@@ -13,17 +13,33 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 
-def create_app(*, model: str = "fake-model", delay_seconds: float = 0.0) -> FastAPI:
+def create_app(
+    *,
+    model: str = "fake-model",
+    delay_seconds: float = 0.0,
+    startup_delay_seconds: float = 0.0,
+    chunk_delay_seconds: float | None = None,
+) -> FastAPI:
     if not model.strip():
         raise ValueError("model must not be blank")
     if delay_seconds < 0:
         raise ValueError("delay_seconds must not be negative")
+    if startup_delay_seconds < 0:
+        raise ValueError("startup_delay_seconds must not be negative")
+    if chunk_delay_seconds is not None and chunk_delay_seconds < 0:
+        raise ValueError("chunk_delay_seconds must not be negative")
+    resolved_chunk_delay = delay_seconds if chunk_delay_seconds is None else chunk_delay_seconds
     app = FastAPI(title="Mini AI Cloud Fake Inference", version="1.0")
     started_at = int(time.time())
+    app.state.ready_at_monotonic = time.monotonic() + startup_delay_seconds
 
-    @app.get("/health")
-    async def health() -> dict[str, str]:
-        return {"status": "ok", "model": model}
+    @app.get("/health", response_model=None)
+    async def health() -> Response:
+        ready = time.monotonic() >= float(app.state.ready_at_monotonic)
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={"status": "ok" if ready else "loading", "model": model},
+        )
 
     @app.get("/v1/models")
     async def models() -> dict[str, object]:
@@ -60,7 +76,7 @@ def create_app(*, model: str = "fake-model", delay_seconds: float = 0.0) -> Fast
                     model=requested_model,
                     content=content,
                     usage=_usage(prompt, content),
-                    delay_seconds=delay_seconds,
+                    delay_seconds=resolved_chunk_delay,
                 ),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -104,7 +120,7 @@ def create_app(*, model: str = "fake-model", delay_seconds: float = 0.0) -> Fast
                     model=requested_model,
                     content=content,
                     usage=_usage(prompt_value, content),
-                    delay_seconds=delay_seconds,
+                    delay_seconds=resolved_chunk_delay,
                 ),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -279,9 +295,19 @@ def main() -> None:
     parser.add_argument("--replica-id")
     parser.add_argument("--execution-id")
     parser.add_argument("--delay-seconds", type=float, default=0.0)
+    parser.add_argument("--startup-delay-seconds", type=float, default=0.0)
+    parser.add_argument("--chunk-delay-seconds", type=float)
     args = parser.parse_args()
+    inference_app = create_app(
+        model=args.model,
+        delay_seconds=args.delay_seconds,
+        startup_delay_seconds=args.startup_delay_seconds,
+        chunk_delay_seconds=args.chunk_delay_seconds,
+    )
+    inference_app.state.replica_id = args.replica_id
+    inference_app.state.execution_id = args.execution_id
     uvicorn.run(
-        create_app(model=args.model, delay_seconds=args.delay_seconds),
+        inference_app,
         host=args.host,
         port=args.port,
     )

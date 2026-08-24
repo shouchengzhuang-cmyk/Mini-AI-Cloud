@@ -11,7 +11,7 @@ Mini AI Cloud（仓库名仍为 `mini-docker-cloud`）是一个面向 AI Infra �
 - Scheduler v2：CPU/RAM/GPU reservation、具体 GPU device、label/taint/toleration、priority/aging、binpack/spread、project fairness 和两阶段抢占。
 - Runtime：统一 `ComputeRuntime` 接口，提供 Docker、Kubernetes、Fake runtime；无 GPU 机器可使用仅限开发/测试的 Fake GPU inventory。
 - Artifact：Local/S3（含 MinIO）后端、流式上传下载、大小/配额/SHA-256 与 project isolation；Task input/output 经过 execution-fenced workspace，以单文件只读/可写 mount 交给 runtime，成功后先发布输出再提交终态。
-- AI Service：Registry→Service 快照、Replica `starting/loading/running/draining` 生命周期、真实 Fake HTTP/SSE、持久化 in-flight、round-robin、health/replacement、autoscaling、serving usage/TTFT/token metrics，以及 `/v1/models`、`/v1/chat/completions`、`/v1/completions`；另有仅显式启用、面向专用 GPU serving node 的 Docker vLLM controller，使用单节点 tensor-parallel gang placement 与具体 GPU UUID。
+- AI Service：Registry→Service 快照、Replica `starting/loading/running/draining` 生命周期、真实 Fake HTTP/SSE、持久化 in-flight、round-robin、health/replacement、autoscaling、serving usage/TTFT/token metrics，以及 `/v1/models`、`/v1/chat/completions`、`/v1/completions`。Docker vLLM controller 面向专用 GPU serving node，使用单节点 tensor-parallel gang placement 与具体 GPU UUID；Phase IV-A 另有显式启用的 Kubernetes Fake serving controller，面向真实 Pod、readiness、ClusterIP Service 和重启 adopt，当前机器的实际执行状态见独立验证报告。
 - 平台资源：模型注册表、AES-256-GCM Secret、镜像策略、任务时间线、Job Group/DAG、Prometheus/Grafana、admin diagnostics 与保守 repair、备份恢复和调度模拟。
 
 实现、已验证项和环境受限项不混为一谈；逐项证据见 [验证矩阵](docs/verification-matrix.md)。
@@ -155,9 +155,13 @@ CONFIRM_CHAOS=YES make test-chaos
 make kind-up
 make test-k8s
 make kind-down
+
+make kind-serving-up
+make test-kind-serving
+make kind-serving-down
 ```
 
-`make test-k8s` 当前验证 Kubernetes runtime 构造与 Fake GPU inventory；只有本机具备 kind/k3d 及可用镜像时才能声称真实 Kubernetes E2E。`make down` 保留卷；`docker compose down --volumes` 会永久删除当前 Compose project 的数据。
+`make test-k8s` 验证 batch Kubernetes runtime 构造与 Fake GPU inventory。`kind-serving-*` 是独立的 Phase IV-A 真实 serving E2E，使用仓库内 kubeconfig，不切换用户默认 context；缺少 Docker、Kind 或 kubectl 时会明确返回 `NOT RUN` 和非零退出码。`make down` 保留卷；`docker compose down --volumes` 会永久删除当前 Compose project 的数据。
 
 Phase III 的 Fake Serving E2E 会真实启动 HTTP inference 子进程，并经 Gateway 验证 non-streaming、SSE、RR、failure replacement、draining、Project API Key 隔离和 TP gang placement。要同时执行 live PostgreSQL 并发用例：
 
@@ -167,6 +171,7 @@ LIVE_DATABASE_URL=postgresql+asyncpg://task:local-dev-only@127.0.0.1:5432/task_p
 ```
 
 完整说明与真实 vLLM 前置条件见 [Phase III AI Model Serving](docs/phase3-ai-serving.md)。
+Kubernetes Pod、readiness、drain、恢复与 Kind 命令见 [Phase IV-A Kubernetes 原生模型服务](docs/phase4-kubernetes-serving.md)。
 
 ## 文档入口
 
@@ -176,6 +181,8 @@ LIVE_DATABASE_URL=postgresql+asyncpg://task:local-dev-only@127.0.0.1:5432/task_p
 - [七个强制演示](docs/demos.md)
 - [Phase II 验证矩阵与缺口台账](docs/verification-matrix.md)
 - [Phase III AI Model Serving](docs/phase3-ai-serving.md)
+- [Phase IV-A Kubernetes 原生模型服务](docs/phase4-kubernetes-serving.md)
+- [Phase IV-A 验证报告](docs/verification-report-phase4a-2026-08-24.md)
 - [PostgreSQL hot-path 实测审计](docs/sql-review.md)
 
 FastAPI 交互文档位于 `http://localhost:8000/docs`，OpenAPI JSON 位于 `http://localhost:8000/openapi.json`。
@@ -189,6 +196,7 @@ FastAPI 交互文档位于 `http://localhost:8000/docs`，OpenAPI JSON 位于 `h
 - Docker Worker 的 socket 权限是明确 trust boundary；Kubernetes Worker 也必须使用最小 RBAC。当前 Worker 直接连接 PostgreSQL/Redis，`WORKER_AUTH_TOKEN` 只是未来 internal worker API 的保留配置，不会认证这些直连；共享环境必须依靠独立凭据、网络 ACL，并最终引入节点 mTLS。
 - 默认 Compose 给 Worker 挂载随 `COMPOSE_PROJECT_NAME` 派生的 `artifact-workspace-data` 卷，任务容器只通过 Docker `VolumeOptions.Subpath` 获取声明的单个 input/output 文件；这避免 sibling Worker 路径误映射，也避免专用 DR stack 与日常栈共享 execution workspace。裸机 Worker 与 daemon 共享宿主路径时仍使用单文件 bind。两种模式都不暴露整个 workspace；真实 Docker named-volume Subpath input→container→output E2E 已执行通过。
 - Kubernetes task Pod 已固定非 root UID/GID 65532、`RuntimeDefault` seccomp、只读 rootfs 与丢弃全部 capabilities。Artifact mount 当前仍是 pinned node 上的单文件 `hostPath(type=File)`；只有 Worker workspace 与该 node 共享同一路径时才成立。仓库已有 Pod spec/mock 测试，但尚未在 Kind 做真实文件可见性 E2E，生产多节点应采用受控 object-store/PVC/CSI 数据面。
+- Kubernetes serving Pod 使用非 root UID/GID 10001、只读 rootfs、受限 `/tmp`、drop ALL、`RuntimeDefault` seccomp、requests=limits，并关闭 token automount 和 host namespace。它不会挂载 Docker socket、kubeconfig 或 `hostPath`。Controller 的 namespace RBAC 仍是高权限基础设施边界，生产环境应使用独立 namespace 和 ServiceAccount。
 - Artifact grant 为 presigned URL 时，客户端不得转发平台 API Key。仓库演示脚本已把对象存储请求与平台认证头隔离。
 
 更多生产前检查、Secret key rotation 和灾备边界见 [运维手册](docs/operations.md)。
@@ -201,4 +209,4 @@ Phase I 稳定恢复点是：
 c47702b feat: build distributed Docker task platform
 ```
 
-Phase II 在 `feat/mini-ai-cloud-v2` 上增量演进，Phase III 位于 `feat/ai-serving-v3`。不要 rebase、force reset 或覆盖稳定提交。任务明确要求不 push；本地 commit、远端 push 和部署是三件不同的事。
+Phase II 在 `feat/mini-ai-cloud-v2` 上增量演进，Phase III 位于 `feat/ai-serving-v3`，Phase IV-A 位于 `feat/k8s-serving-v4a`。不要 rebase、force reset 或覆盖稳定提交。本地 commit、远端 push、PR 和部署是四件不同的事，验证报告会分别记录。

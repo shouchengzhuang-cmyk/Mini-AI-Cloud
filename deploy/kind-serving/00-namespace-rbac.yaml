@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mini-ai-cloud-serving
+  labels:
+    app.kubernetes.io/name: mini-ai-cloud
+    app.kubernetes.io/part-of: kind-serving-e2e
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mini-ai-cloud-controller
+  namespace: mini-ai-cloud-serving
+automountServiceAccountToken: true
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mini-ai-cloud-data
+  namespace: mini-ai-cloud-serving
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mini-ai-cloud-serving-controller
+  namespace: mini-ai-cloud-serving
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/status"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "delete", "get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mini-ai-cloud-serving-controller
+  namespace: mini-ai-cloud-serving
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mini-ai-cloud-serving-controller
+subjects:
+  - kind: ServiceAccount
+    name: mini-ai-cloud-controller
+    namespace: mini-ai-cloud-serving

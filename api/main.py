@@ -35,6 +35,7 @@ from api.services.cleanup import CleanupController
 from api.services.control_plane import ControllerSpec, ControlPlane
 from api.services.fake_replica_runtime import FakeReplicaRuntimeController
 from api.services.gateway import GatewayMetrics, GatewayService
+from api.services.kubernetes_replica_runtime import KubernetesReplicaRuntimeController
 from api.services.outbox import OutboxDispatcher
 from api.services.reaper import Reaper
 from api.services.service_health import ServiceHealthController
@@ -46,6 +47,7 @@ from core.logging import configure_logging, get_logger
 from core.metrics import API_REQUEST_DURATION, API_REQUESTS
 from core.redis import RedisQueue
 from scheduler.global_scheduler import GlobalScheduler
+from worker.kubernetes_serving_runtime import KubernetesServingRuntimeAdapter
 from worker.vllm_runtime import DockerVLLMRuntimeAdapter
 
 
@@ -76,6 +78,7 @@ def create_app(
         resolved_database,
         batch_size=resolved_settings.batch_size,
         drain_timeout_seconds=resolved_settings.service_drain_timeout,
+        kubernetes_drain_timeout_seconds=(resolved_settings.kubernetes_serving_drain_timeout),
     )
     upstream_client = httpx.AsyncClient(
         follow_redirects=False,
@@ -172,6 +175,50 @@ def create_app(
                 resolved_settings.service_reconcile_interval,
             )
         )
+    kubernetes_replica_runtime: KubernetesReplicaRuntimeController | None = None
+    if (
+        resolved_settings.kubernetes_serving_enabled
+        and resolved_settings.kubernetes_serving_fake_enabled
+    ):
+        kubernetes_replica_runtime = KubernetesReplicaRuntimeController(
+            resolved_database,
+            KubernetesServingRuntimeAdapter(
+                namespace=resolved_settings.kubernetes_serving_namespace,
+                cluster_id=resolved_settings.kubernetes_serving_cluster_id,
+                kubeconfig=resolved_settings.kubernetes_kubeconfig,
+                in_cluster=resolved_settings.kubernetes_in_cluster,
+                termination_grace_seconds=(
+                    resolved_settings.kubernetes_serving_termination_grace_seconds
+                ),
+                readiness_probe_timeout_seconds=(
+                    resolved_settings.kubernetes_serving_probe_timeout
+                ),
+                readiness_probe_period_seconds=(resolved_settings.kubernetes_serving_poll_interval),
+            ),
+            app_env=resolved_settings.app_env,
+            cluster_id=resolved_settings.kubernetes_serving_cluster_id,
+            image=resolved_settings.kubernetes_serving_image,
+            fake_enabled=resolved_settings.kubernetes_serving_fake_enabled,
+            batch_size=resolved_settings.batch_size,
+            startup_timeout_seconds=resolved_settings.kubernetes_serving_startup_timeout,
+            drain_timeout_seconds=resolved_settings.kubernetes_serving_drain_timeout,
+            poll_interval_seconds=resolved_settings.kubernetes_serving_poll_interval,
+            lease_seconds=resolved_settings.kubernetes_serving_lease_seconds,
+            failure_backoff_seconds=resolved_settings.kubernetes_serving_failure_backoff,
+            termination_grace_seconds=(
+                resolved_settings.kubernetes_serving_termination_grace_seconds
+            ),
+            fake_startup_delay_seconds=(resolved_settings.kubernetes_serving_fake_startup_delay),
+            fake_chunk_delay_seconds=resolved_settings.kubernetes_serving_fake_chunk_delay,
+        )
+        controllers.append(
+            ControllerSpec(
+                "kubernetes-serving-runtime",
+                kubernetes_replica_runtime.run_once,
+                resolved_settings.kubernetes_serving_poll_interval,
+                startup=kubernetes_replica_runtime.startup,
+            )
+        )
     if resolved_settings.scheduler_mode == "global":
         global_scheduler = GlobalScheduler(
             resolved_database.session_factory,
@@ -223,6 +270,8 @@ def create_app(
                 await fake_replica_runtime.close()
             if vllm_replica_runtime is not None:
                 await vllm_replica_runtime.close()
+            if kubernetes_replica_runtime is not None:
+                await kubernetes_replica_runtime.close()
             await upstream_client.aclose()
             await resolved_queue.close()
             await resolved_database.dispose()
@@ -239,6 +288,7 @@ def create_app(
     app.state.gateway_service = gateway_service
     app.state.fake_replica_runtime = fake_replica_runtime
     app.state.vllm_replica_runtime = vllm_replica_runtime
+    app.state.kubernetes_replica_runtime = kubernetes_replica_runtime
     app.add_middleware(
         RequestBodyLimitMiddleware,
         max_bytes=resolved_settings.api_request_max_bytes,

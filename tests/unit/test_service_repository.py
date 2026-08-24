@@ -241,6 +241,63 @@ async def test_reconciliation_is_idempotent_and_records_typed_intent(
         ("service_replica", "service.replica.created"),
         ("service_replica", "service.replica.created"),
     ]
+
+
+async def test_reconciler_uses_kubernetes_specific_drain_timeout(
+    service_database: Database,
+) -> None:
+    async with service_database.session() as session, session.begin():
+        service = await ServiceRepository.create(
+            session,
+            project_id=PROJECT_ID,
+            name="kubernetes-drain-timeout",
+            model="fake/model",
+            runtime=ServingRuntime.FAKE,
+            runtime_type=RuntimeType.KUBERNETES,
+            image="mini-ai-cloud:kind-serving-v4a",
+            cpu_millicores=100,
+            memory_mb=128,
+            gpu_count=0,
+            gpu_memory_mb=0,
+            desired_replicas=1,
+        )
+        await ServiceRepository.reconcile_locked(session, service)
+        replicas = await ServiceRepository.list_replicas(session, service.id, for_update=True)
+        replica = replicas[0]
+        replica.status = ReplicaStatus.RUNNING
+        replica.health = ReplicaHealth.HEALTHY
+        replica.execution_id = uuid.uuid4()
+        replica.endpoint_url = "http://replica.model-serving.svc.cluster.local:8000"
+        replica.active_requests = 1
+        service.status = ServiceStatus.RUNNING
+        service_id = service.id
+
+    async with service_database.session() as session, session.begin():
+        updated_service = await ServiceRepository.set_desired_replicas(
+            session,
+            service_id=service_id,
+            project_id=PROJECT_ID,
+            desired_replicas=0,
+        )
+        assert updated_service is not None
+
+    started_at = datetime.now(UTC)
+    result = await ServiceReconciler(
+        service_database,
+        drain_timeout_seconds=30,
+        kubernetes_drain_timeout_seconds=7,
+    ).run_once()
+
+    assert result.replicas_stopping == 1
+    async with service_database.session() as session:
+        replicas = await ServiceRepository.list_replicas(session, service_id)
+    replica = replicas[0]
+    assert replica.status == ReplicaStatus.DRAINING
+    assert replica.drain_deadline is not None
+    deadline = replica.drain_deadline
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=UTC)
+    assert started_at + timedelta(seconds=6) <= deadline <= datetime.now(UTC) + timedelta(seconds=8)
     replica_table = cast(Table, ServiceReplica.__table__)
     constraint_names = {constraint.name for constraint in replica_table.constraints}
     assert "uq_service_replicas_generation_ordinal" in constraint_names

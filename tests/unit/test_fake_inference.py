@@ -60,8 +60,25 @@ async def test_fake_inference_rejects_invalid_payload() -> None:
     assert response.json()["error"]["type"] == "invalid_request_error"
 
 
+async def test_fake_inference_readiness_waits_for_loading() -> None:
+    app = create_app(model="loading-model", startup_delay_seconds=60)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://fake.test") as client:
+        loading = await client.get("/health")
+        app.state.ready_at_monotonic = 0.0
+        ready = await client.get("/health")
+
+    assert loading.status_code == 503
+    assert loading.json() == {"status": "loading", "model": "loading-model"}
+    assert ready.status_code == 200
+    assert ready.json() == {"status": "ok", "model": "loading-model"}
+
+
 def test_fake_inference_configuration_validation() -> None:
     with pytest.raises(ValueError):
         create_app(model=" ")
     with pytest.raises(ValueError):
         create_app(delay_seconds=-1)
+    with pytest.raises(ValueError):
+        create_app(startup_delay_seconds=-1)
+    with pytest.raises(ValueError):
+        create_app(chunk_delay_seconds=-1)

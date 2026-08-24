@@ -1,6 +1,6 @@
 # Phase II 验证矩阵与缺口台账
 
-审计快照：2026-08-24，分支 `feat/mini-ai-cloud-v2`。状态只表达当前仓库的代码/自动化证据；本次机器上的最终执行记录单独写入验证报告。
+审计快照：2026-08-24。Phase II 基线位于 `feat/mini-ai-cloud-v2`，Phase III 位于 `feat/ai-serving-v3`，Phase IV-A 增量位于 `feat/k8s-serving-v4a`。状态只表达当前仓库的代码和自动化证据；本次机器上的最终执行记录单独写入验证报告。
 
 ## 状态含义
 
@@ -9,13 +9,25 @@
 - **部分完成**：核心路径存在，mission 的某个硬性边界仍缺。
 - **缺口**：没有发现满足要求的可执行实现或证据，不能在最终报告写 implemented。
 
+## Phase IV-A 增量台账
+
+| 验收项 | 仓库证据 | 证据边界 |
+| --- | --- | --- |
+| Kubernetes Serving runtime | `worker/kubernetes_serving_runtime.py`，Pod/Service spec 与 runtime unit tests | mock Kubernetes client 只算 unit evidence |
+| Replica 生命周期与 fencing | `api/services/kubernetes_replica_runtime.py`，controller unit/integration tests | 真实 controller restart 由 Kind E2E 单列 |
+| Fake readiness 和 SSE | `scripts/fake_inference.py`，Fake inference tests | 宿主 ASGI/TCP 测试不等于 Pod E2E |
+| Gateway、scale、drain、replacement | 复用 Phase III Gateway/Reconciler，并增加 Kubernetes controller 覆盖 | 必须再看 Kind 中 2 到 4 到 1 的结果 |
+| Pod security boundary | manifest generation tests 检查 non-root、rootfs、capabilities、seccomp、token、resources | 未做集群策略准入或攻击测试 |
+| Kind serving E2E | `deploy/kind-serving/`、`scripts/kind_serving.sh`、Make targets | 是否 PASS 只看 Phase IV-A 验证报告，不允许 silent skip |
+| Metrics | `k8s_serving_*` bounded-label metrics 与 metric tests | 无生产 Prometheus/Grafana 时序验证 |
+
 ## 功能覆盖
 
 | Mission 范围 | 当前状态 | 仓库证据 | 尚需验证/补齐 |
 | --- | --- | --- | --- |
 | 0-4 Git 安全、增量演进 | 自动化证据 | Phase I 恢复点 `c47702b`；Phase II 独立分支 | 最终 commits 与 clean status；禁止 push |
 | 5 Runtime abstraction | 自动化证据 | `worker/runtime.py`, registry, Docker/Fake/K8s tests | 全量 regression |
-| 6-7 Kubernetes/Kind | 外部验证待做 | `worker/kubernetes_runtime.py`, `tests/unit/test_kubernetes_runtime.py`, Make targets | 真实 kind API→Pod→logs→terminal E2E；context 恢复 |
+| 6-7 Kubernetes/Kind | 自动化证据 + 外部验证待做 | batch runtime tests；Phase IV-A serving runtime、controller、Kind assets | batch artifact Kind E2E 与本机 Phase IV-A Kind 实测结果分别记录；不得由 spec test 替代 |
 | 8-9 Worker inventory/reservation | 自动化证据 | Worker v2 schema、ResourceReservation/GPUDevice、lease/reaper tests | 多物理节点、网络分区实测 |
 | 10-12 GPU allocation/Fake GPU | 自动化证据 | per-device inventory、production fake guard、Docker 只接受具体 device ID；pull/global claim 都拒绝无设备绑定的 GPU reservation | 真实 NVIDIA visibility/OOM/cleanup |
 | 13-17 Scheduler v2/admission | 自动化证据 | binpack/spread、priority/aging、DRF、taint/toleration、preemption、unschedulable reason 与 scheduling explain API | 真实 multi-scheduler load |
@@ -71,7 +83,7 @@
 4. 系统化数据库并发状态机与 linearizability history checker；现有 Hypothesis 覆盖纯函数/invariant properties，但不等于长时间并发证明。
 5. Docker 自定义 seccomp/AppArmor、允许网络任务的细粒度 egress/metadata 防护、镜像签名/扫描等生产安全层。
 6. 独立 platform-admin 身份边界；当前 Project admin 仍可查看/排空全局 Worker，适合单管理域原型，不适合不互信租户。
-7. 真实 kind（含 pinned file 可见性）、NVIDIA/vLLM、多物理节点、MinIO、真实 OOM、完整 chaos 与破坏性 DR 演练。Docker named-volume Subpath E2E 已通过，不再列为缺口。
+7. Batch pinned file 的真实 Kind 可见性、NVIDIA/vLLM、多物理节点、MinIO、真实 OOM、完整 chaos 与破坏性 DR 演练仍是外部缺口。Phase IV-A serving Kind 是否执行，以独立验证报告为准；Docker named-volume Subpath E2E 已通过，不再列为缺口。
 
 这些缺口应在最终报告 `Known Limitations` 中保留，除非后续确实实现并验证。
 
@@ -117,6 +129,9 @@ CONFIRM_CHAOS=YES make test-chaos
 make kind-up
 make test-k8s
 make kind-down
+make kind-serving-up
+make test-kind-serving
+make kind-serving-down
 make backup
 make restore BACKUP=/absolute/path CONFIRM_RESTORE=YES
 ```

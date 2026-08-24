@@ -32,6 +32,11 @@ def test_phase_two_metric_contract_uses_bounded_labels() -> None:
         "gateway_tokens_total",
         "replica_active_requests",
         "replica_health",
+        "k8s_serving_pods",
+        "k8s_serving_launch_total",
+        "k8s_serving_launch_failures_total",
+        "k8s_serving_replacements_total",
+        "k8s_serving_reconcile_duration_seconds",
         "project_cpu_seconds_total",
         "project_gpu_seconds_total",
     }
