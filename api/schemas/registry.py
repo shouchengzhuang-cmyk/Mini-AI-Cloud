@@ -4,7 +4,15 @@ import uuid
 from datetime import datetime
 from typing import Self
 
-from pydantic import Field, SecretStr, StrictInt, StrictStr, field_validator, model_validator
+from pydantic import (
+    Field,
+    SecretStr,
+    StrictFloat,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 
 from api.schemas.common import PaginationMeta, RequestModel, ResponseModel
 from core.image_policy import (
@@ -12,9 +20,33 @@ from core.image_policy import (
     ImageRule,
     canonicalize_image_reference,
 )
+from models.service import ServingRuntime
 
 _RESOURCE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _SECRET_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
+
+
+class RegisteredModelRuntimeDefaults(RequestModel):
+    """Typed, allowlisted defaults copied into a model service at deploy time."""
+
+    gpu_model: StrictStr | None = Field(default=None, min_length=1, max_length=255)
+    tensor_parallel_size: StrictInt | None = Field(default=None, ge=1, le=64)
+    dtype: StrictStr = Field(
+        default="auto",
+        pattern=r"^(auto|half|float16|bfloat16|float|float32)$",
+    )
+    gpu_memory_utilization: StrictFloat = Field(default=0.9, gt=0, le=1)
+    max_model_len: StrictInt | None = Field(default=None, ge=1, le=16_777_216)
+
+    @field_validator("gpu_model")
+    @classmethod
+    def validate_gpu_model(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized or any(ord(character) < 32 for character in normalized):
+            raise ValueError("gpu_model must not be blank or contain control characters")
+        return normalized
 
 
 class RegisteredModelCreate(RequestModel):
@@ -22,6 +54,11 @@ class RegisteredModelCreate(RequestModel):
     provider: StrictStr = Field(min_length=1, max_length=64)
     source: StrictStr = Field(min_length=1, max_length=1024)
     revision: StrictStr | None = Field(default=None, min_length=1, max_length=255)
+    runtime: ServingRuntime = ServingRuntime.VLLM
+    default_gpu_count: StrictInt = Field(default=0, ge=0, le=64)
+    runtime_defaults: RegisteredModelRuntimeDefaults = Field(
+        default_factory=RegisteredModelRuntimeDefaults
+    )
     size_bytes: StrictInt | None = Field(default=None, ge=0, le=2_147_483_647)
     required_gpu_memory_mb: StrictInt | None = Field(default=None, ge=0, le=1_048_576)
     architecture: StrictStr | None = Field(default=None, min_length=1, max_length=255)
@@ -58,6 +95,21 @@ class RegisteredModelCreate(RequestModel):
             raise ValueError("metadata must be at most 16384 encoded bytes")
         return value
 
+    @model_validator(mode="after")
+    def validate_runtime_defaults(self) -> "RegisteredModelCreate":
+        expected_tensor_parallel_size = max(1, self.default_gpu_count)
+        if self.runtime == ServingRuntime.FAKE:
+            if self.default_gpu_count != 0 or self.runtime_defaults.gpu_model is not None:
+                raise ValueError("fake registered models cannot require GPU resources")
+            expected_tensor_parallel_size = 1
+        if self.runtime_defaults.tensor_parallel_size is None:
+            self.runtime_defaults.tensor_parallel_size = expected_tensor_parallel_size
+        elif self.runtime_defaults.tensor_parallel_size != expected_tensor_parallel_size:
+            raise ValueError(
+                "runtime_defaults.tensor_parallel_size must equal max(1, default_gpu_count)"
+            )
+        return self
+
 
 class RegisteredModelResponse(ResponseModel):
     id: uuid.UUID
@@ -66,6 +118,9 @@ class RegisteredModelResponse(ResponseModel):
     provider: str
     source: str
     revision: str | None
+    runtime: ServingRuntime
+    default_gpu_count: int = Field(ge=0, le=64)
+    runtime_defaults: RegisteredModelRuntimeDefaults
     size_bytes: int | None = Field(ge=0)
     required_gpu_memory_mb: int | None = Field(ge=0)
     architecture: str | None

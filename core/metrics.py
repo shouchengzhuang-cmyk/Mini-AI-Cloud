@@ -130,6 +130,42 @@ GATEWAY_REQUESTS = Counter(
 GATEWAY_DURATION = Histogram(
     "gateway_request_duration_seconds",
     "OpenAI-compatible gateway upstream latency",
+    buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600),
+    registry=REGISTRY,
+)
+GATEWAY_IN_FLIGHT = Gauge(
+    "gateway_requests_in_flight",
+    "OpenAI-compatible requests currently being proxied",
+    registry=REGISTRY,
+)
+GATEWAY_ERRORS = Counter(
+    "gateway_errors_total",
+    "OpenAI-compatible gateway failures by bounded serving error code",
+    ("code",),
+    registry=REGISTRY,
+)
+GATEWAY_TTFT = Histogram(
+    "gateway_time_to_first_token_seconds",
+    "Time from gateway request handling to the first non-empty upstream response chunk",
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120),
+    registry=REGISTRY,
+)
+GATEWAY_TOKENS = Counter(
+    "gateway_tokens_total",
+    "Tokens reported by inference upstreams",
+    ("type",),
+    registry=REGISTRY,
+)
+REPLICA_ACTIVE_REQUESTS = Gauge(
+    "replica_active_requests",
+    "Requests currently routed to a model service replica",
+    ("service_id", "replica_id"),
+    registry=REGISTRY,
+)
+REPLICA_HEALTH = Gauge(
+    "replica_health",
+    "Current model replica health as a one-hot state series",
+    ("service_id", "replica_id", "health"),
     registry=REGISTRY,
 )
 SERVICE_REQUESTS = Counter(
@@ -141,6 +177,7 @@ SERVICE_REQUESTS = Counter(
 SERVICE_REQUEST_DURATION = Histogram(
     "service_request_duration_seconds",
     "OpenAI-compatible service proxy upstream latency",
+    buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600),
     registry=REGISTRY,
 )
 PROJECT_CPU_SECONDS = Counter(

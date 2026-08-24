@@ -56,15 +56,15 @@ async def test_reaper_exports_cluster_capacity_allocation_and_service_gauges(
         )
         session.add(service)
         await session.flush()
-        session.add(
-            ServiceReplica(
-                service_id=service.id,
-                generation=1,
-                ordinal=0,
-                status=ReplicaStatus.RUNNING,
-                health=ReplicaHealth.HEALTHY,
-            )
+        replica = ServiceReplica(
+            service_id=service.id,
+            runtime=ServingRuntime.FAKE,
+            generation=1,
+            ordinal=0,
+            status=ReplicaStatus.RUNNING,
+            health=ReplicaHealth.HEALTHY,
         )
+        session.add(replica)
         old = datetime.now(UTC) - timedelta(minutes=5)
         session.add_all(
             [
@@ -105,6 +105,13 @@ async def test_reaper_exports_cluster_capacity_allocation_and_service_gauges(
     assert 'worker_allocated_resources{resource="cpu_millicores"} 1500.0' in metrics
     assert "services_ready 1.0" in metrics
     assert 'service_replicas{state="running"} 1.0' in metrics
+    replica_health = next(
+        line for line in metrics.splitlines() if line.startswith("replica_health{")
+    )
+    assert f'service_id="{service.id}"' in replica_health
+    assert f'replica_id="{replica.id}"' in replica_health
+    assert 'health="healthy"' in replica_health
+    assert replica_health.endswith(" 1.0")
     assert "outbox_pending 2.0" in metrics
     oldest_age = next(
         float(line.split()[1])

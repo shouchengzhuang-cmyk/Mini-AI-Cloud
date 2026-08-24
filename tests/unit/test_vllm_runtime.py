@@ -29,7 +29,9 @@ def _request() -> VLLMLaunchRequest:
         image="vllm/vllm-openai:pinned-test",
         model="org/model-v1",
         gpu_device_ids=("GPU-aaaa", "GPU-bbbb"),
+        revision="revision-1",
         port=8000,
+        gpu_memory_utilization=0.85,
         max_model_len=8192,
         extra_arguments=("--enable-prefix-caching",),
     )
@@ -65,6 +67,10 @@ def test_build_vllm_openai_server_spec_with_exact_gpu_visibility() -> None:
         "auto",
         "--tensor-parallel-size",
         "2",
+        "--gpu-memory-utilization",
+        "0.85",
+        "--revision",
+        "revision-1",
         "--max-model-len",
         "8192",
         "--enable-prefix-caching",
@@ -95,11 +101,16 @@ def test_build_vllm_cpu_visible_spec_uses_no_nvidia_devices() -> None:
         (replace(_request(), generation=0), "generation"),
         (replace(_request(), gpu_device_ids=("GPU-a", "GPU-a")), "unique"),
         (replace(_request(), gpu_device_ids=("GPU-a,b",)), "commas"),
+        (replace(_request(), tensor_parallel_size=1), "visible GPU"),
         (replace(_request(), tensor_parallel_size=3), "visible GPU"),
+        (replace(_request(), dtype="int8"), "dtype"),
+        (replace(_request(), revision="bad revision"), "revision"),
+        (replace(_request(), gpu_memory_utilization=0), "gpu_memory_utilization"),
         (replace(_request(), max_model_len=0), "max_model_len"),
         (replace(_request(), extra_arguments=("--host=example",)), "--host"),
         (replace(_request(), extra_arguments=("--dtype", "half")), "--dtype"),
         (replace(_request(), extra_arguments=("--api-key", "secret")), "--api-key"),
+        (replace(_request(), extra_arguments=("--trust-remote-code",)), "--trust-remote-code"),
     ],
 )
 def test_build_vllm_spec_rejects_invalid_or_reserved_configuration(
@@ -116,6 +127,7 @@ class _Container:
         self.short_id = "container"
         self.labels = labels
         self.status = "created"
+        self.image = _Image()
         self.attrs: dict[str, Any] = {
             "State": {
                 "Status": "created",
@@ -147,6 +159,11 @@ class _Container:
     def remove(self, *, force: bool, v: bool) -> None:
         assert force and v
         self.removed = True
+
+
+class _Image:
+    def __init__(self) -> None:
+        self.attrs = {"RepoDigests": [f"vllm/vllm-openai@sha256:{'a' * 64}"]}
 
 
 class _Containers:
@@ -234,6 +251,7 @@ async def test_docker_vllm_adapter_publishes_port_with_exact_gpu_ids() -> None:
 
     running = await adapter.start(prepared)
     assert running.endpoint_url == "http://10.0.0.20:32123"
+    assert running.image_digest == f"sha256:{'a' * 64}"
     state = await adapter.inspect(running)
     assert state.running is True
     assert state.status == "running"

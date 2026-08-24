@@ -31,6 +31,7 @@ from models.usage import (
     BillingRate,
     ProjectQuota,
     ProjectQuotaState,
+    ServingRequestUsage,
     TaskExecution,
     UsageLedger,
 )
@@ -62,6 +63,7 @@ __all__ = [
     "Secret",
     "SecretVersion",
     "ServiceReplica",
+    "ServingRequestUsage",
     "Task",
     "TaskArtifact",
     "TaskDependency",

@@ -5,6 +5,7 @@ from decimal import Decimal
 from sqlalchemy import (
     JSON,
     BigInteger,
+    Boolean,
     CheckConstraint,
     Date,
     DateTime,
@@ -169,6 +170,68 @@ class UsageLedger(Base):
     cost: Mapped[Decimal] = mapped_column(Numeric(20, 8))
     currency: Mapped[str] = mapped_column(String(3), default="USD")
     pricing_source: Mapped[str] = mapped_column(String(32), default="rate_snapshot")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ServingRequestUsage(Base):
+    """Immutable, backend-reported accounting for one gateway request.
+
+    Token fields are deliberately nullable. A missing or malformed upstream
+    ``usage`` object must remain unavailable rather than being estimated by the
+    control plane.
+    """
+
+    __tablename__ = "serving_request_usage"
+    __table_args__ = (
+        CheckConstraint("finished_at >= started_at", name="period"),
+        CheckConstraint("request_duration_seconds >= 0", name="duration_nonnegative"),
+        CheckConstraint(
+            "time_to_first_token_seconds IS NULL OR time_to_first_token_seconds >= 0",
+            name="ttft_nonnegative",
+        ),
+        CheckConstraint(
+            "allocated_gpu_seconds IS NULL OR allocated_gpu_seconds >= 0",
+            name="allocated_gpu_seconds_nonnegative",
+        ),
+        CheckConstraint(
+            "(prompt_tokens IS NULL AND completion_tokens IS NULL AND total_tokens IS NULL) "
+            "OR (prompt_tokens IS NOT NULL AND completion_tokens IS NOT NULL "
+            "AND total_tokens IS NOT NULL AND prompt_tokens >= 0 AND completion_tokens >= 0 "
+            "AND total_tokens = prompt_tokens + completion_tokens)",
+            name="tokens_consistent",
+        ),
+        CheckConstraint(
+            "path IN ('/v1/chat/completions','/v1/completions')",
+            name="gateway_path",
+        ),
+        UniqueConstraint("request_id", name="uq_serving_request_usage_request"),
+        Index("ix_serving_usage_project_finished", "project_id", "finished_at"),
+        Index("ix_serving_usage_service_finished", "service_id", "finished_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    request_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True))
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="RESTRICT"), index=True
+    )
+    service_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("model_services.id", ondelete="RESTRICT"), index=True
+    )
+    # Replica rows are operational and may eventually have a shorter retention
+    # period than usage. Preserve the UUID as provenance without a live FK.
+    replica_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    path: Mapped[str] = mapped_column(String(64))
+    outcome: Mapped[str] = mapped_column(String(64))
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    streamed: Mapped[bool] = mapped_column(Boolean, default=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    request_duration_seconds: Mapped[Decimal] = mapped_column(Numeric(24, 6))
+    time_to_first_token_seconds: Mapped[Decimal | None] = mapped_column(Numeric(24, 6))
+    allocated_gpu_seconds: Mapped[Decimal | None] = mapped_column(Numeric(24, 6))
+    prompt_tokens: Mapped[int | None] = mapped_column(BigInteger)
+    completion_tokens: Mapped[int | None] = mapped_column(BigInteger)
+    total_tokens: Mapped[int | None] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

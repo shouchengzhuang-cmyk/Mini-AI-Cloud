@@ -2,13 +2,16 @@ import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, status
+from fastapi.exceptions import RequestValidationError
+from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
 
-from api.dependencies import get_database, require_api_permission
+from api.dependencies import get_app_settings, get_database, require_api_permission
 from api.errors import ConflictError, NotFoundError
 from api.pagination import encode_cursor
 from api.routes._pagination import parse_list_cursor
 from api.schemas.common import PaginationMeta
+from api.schemas.registry import RegisteredModelRuntimeDefaults
 from api.schemas.services import (
     ServiceCreate,
     ServiceListResponse,
@@ -17,11 +20,14 @@ from api.schemas.services import (
     ServiceResponse,
     ServiceScale,
 )
+from core.config import Settings
 from core.database import Database
+from core.enums import RuntimeType
 from core.rbac import Permission, Principal
+from models.registry import RegisteredModel
 from models.service import ModelService, ServiceStatus, ServingRuntime
 from repositories.quotas import QuotaExceededError
-from repositories.registry import ImagePolicyRepository
+from repositories.registry import ImagePolicyRepository, RegisteredModelRepository
 from repositories.services import ServiceCounts, ServiceRepository
 
 router = APIRouter(prefix="/api/v1/services", tags=["services"])
@@ -31,12 +37,25 @@ router = APIRouter(prefix="/api/v1/services", tags=["services"])
 async def create_service(
     payload: ServiceCreate,
     database: Annotated[Database, Depends(get_database)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
     principal: Annotated[Principal, Depends(require_api_permission(Permission.MODEL_MANAGE))],
 ) -> ServiceResponse:
     project_id = _principal_project_id(principal)
     try:
         async with database.session() as session, session.begin():
+            if payload.registered_model_id is not None:
+                registered_model = await RegisteredModelRepository.get(
+                    session,
+                    project_id=project_id,
+                    model_id=payload.registered_model_id,
+                )
+                if registered_model is None:
+                    raise NotFoundError("MODEL_NOT_FOUND", "Registered model not found")
+                payload = _resolve_registered_model(payload, registered_model)
+
             image = payload.image
+            if image is None and payload.runtime == ServingRuntime.VLLM:
+                image = settings.vllm_image
             if image is None and payload.runtime != ServingRuntime.FAKE:
                 raise ConflictError(
                     "SERVICE_IMAGE_REQUIRED",
@@ -58,11 +77,14 @@ async def create_service(
                         details={"reason": decision.reason},
                     )
                 image = decision.canonical_image
+            assert payload.model is not None
             service = await ServiceRepository.create(
                 session,
                 project_id=project_id,
+                registered_model_id=payload.registered_model_id,
                 name=payload.name,
                 model=payload.model,
+                model_revision=payload.model_revision,
                 runtime=payload.runtime,
                 runtime_type=payload.runtime_type,
                 image=image,
@@ -70,6 +92,11 @@ async def create_service(
                 memory_mb=payload.memory_mb,
                 gpu_count=payload.gpu_count,
                 gpu_memory_mb=payload.gpu_memory_mb,
+                gpu_model=payload.gpu_model,
+                tensor_parallel_size=payload.tensor_parallel_size,
+                dtype=payload.dtype,
+                gpu_memory_utilization=payload.gpu_memory_utilization,
+                max_model_len=payload.max_model_len,
                 desired_replicas=payload.replicas,
                 autoscaling_enabled=(
                     payload.autoscaling.enabled if payload.autoscaling is not None else False
@@ -220,12 +247,64 @@ def _principal_project_id(principal: Principal) -> uuid.UUID:
     return principal.project_id
 
 
+def _resolve_registered_model(
+    payload: ServiceCreate,
+    registered_model: RegisteredModel,
+) -> ServiceCreate:
+    allowed_default_names = RegisteredModelRuntimeDefaults.model_fields.keys()
+    raw_defaults = {
+        name: value
+        for name, value in dict(registered_model.runtime_defaults or {}).items()
+        if name in allowed_default_names
+    }
+    try:
+        runtime_defaults = RegisteredModelRuntimeDefaults.model_validate(raw_defaults)
+    except ValidationError as exc:
+        raise ConflictError(
+            "REGISTERED_MODEL_DEFAULTS_INVALID",
+            "The registered model contains invalid runtime defaults",
+        ) from exc
+
+    resolved = payload.model_dump()
+    registry_values: dict[str, object] = {
+        "model": registered_model.source,
+        "model_revision": registered_model.revision,
+        "runtime": registered_model.runtime,
+        "gpu_count": registered_model.default_gpu_count,
+        "gpu_memory_mb": registered_model.gpu_memory_mb or 0,
+        **runtime_defaults.model_dump(),
+    }
+    for field_name, value in registry_values.items():
+        if field_name not in payload.model_fields_set:
+            resolved[field_name] = value
+
+    resolved_runtime = ServingRuntime(resolved["runtime"])
+    if "runtime_type" not in payload.model_fields_set:
+        resolved["runtime_type"] = (
+            RuntimeType.FAKE if resolved_runtime == ServingRuntime.FAKE else RuntimeType.DOCKER
+        )
+
+    # Removing the registry id forces the complete snapshot through the same
+    # runtime/resource invariants as a direct service request.
+    resolved["registered_model_id"] = None
+    try:
+        validated = ServiceCreate.model_validate(resolved)
+    except ValidationError as exc:
+        raise RequestValidationError(
+            exc.errors(),
+            body=payload.model_dump(mode="json"),
+        ) from exc
+    return validated.model_copy(update={"registered_model_id": registered_model.id})
+
+
 def _service_response(service: ModelService, counts: ServiceCounts) -> ServiceResponse:
     return ServiceResponse(
         id=service.id,
         project_id=service.project_id,
+        registered_model_id=service.registered_model_id,
         name=service.name,
         model=service.model,
+        model_revision=service.model_revision,
         runtime=service.runtime,
         runtime_type=service.runtime_type,
         image=service.image,
@@ -233,6 +312,11 @@ def _service_response(service: ModelService, counts: ServiceCounts) -> ServiceRe
         memory_mb=service.memory_mb,
         gpu_count=service.gpu_count,
         gpu_memory_mb=service.gpu_memory_mb,
+        gpu_model=service.gpu_model,
+        tensor_parallel_size=service.tensor_parallel_size,
+        dtype=service.dtype,
+        gpu_memory_utilization=service.gpu_memory_utilization,
+        max_model_len=service.max_model_len,
         desired_replicas=service.desired_replicas,
         actual_replicas=counts.actual_replicas,
         healthy_replicas=counts.healthy_replicas,
@@ -246,6 +330,8 @@ def _service_response(service: ModelService, counts: ServiceCounts) -> ServiceRe
         last_scaled_at=service.last_scaled_at,
         generation=service.generation,
         status=service.status,
+        scheduling_reason=service.scheduling_reason,
+        scheduling_details=service.scheduling_details,
         error_message=service.error_message,
         created_at=service.created_at,
         updated_at=service.updated_at,

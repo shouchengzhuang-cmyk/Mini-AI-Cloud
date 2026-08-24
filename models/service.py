@@ -3,11 +3,13 @@ from datetime import datetime
 from enum import StrEnum
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
     Enum,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -35,7 +37,9 @@ class ServiceStatus(StrEnum):
 class ReplicaStatus(StrEnum):
     PENDING = "pending"
     STARTING = "starting"
+    LOADING = "loading"
     RUNNING = "running"
+    DRAINING = "draining"
     STOPPING = "stopping"
     STOPPED = "stopped"
     FAILED = "failed"
@@ -79,6 +83,15 @@ class ModelService(Base):
         CheckConstraint("memory_mb >= 16", name="memory_mb"),
         CheckConstraint("gpu_count >= 0", name="gpu_count"),
         CheckConstraint("gpu_memory_mb >= 0", name="gpu_memory_mb"),
+        CheckConstraint("tensor_parallel_size >= 1", name="tensor_parallel_size"),
+        CheckConstraint(
+            "gpu_memory_utilization > 0 AND gpu_memory_utilization <= 1",
+            name="gpu_memory_utilization",
+        ),
+        CheckConstraint(
+            "max_model_len IS NULL OR max_model_len >= 1",
+            name="max_model_len",
+        ),
         CheckConstraint(
             "autoscaling_min_replicas >= 0 AND autoscaling_min_replicas <= 1000",
             name="autoscaling_min_replicas",
@@ -105,8 +118,12 @@ class ModelService(Base):
     project_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("projects.id", ondelete="RESTRICT"), index=True
     )
+    registered_model_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("registered_models.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     name: Mapped[str] = mapped_column(String(128))
     model: Mapped[str] = mapped_column(String(512))
+    model_revision: Mapped[str | None] = mapped_column(String(255))
     runtime: Mapped[ServingRuntime] = mapped_column(
         Enum(
             ServingRuntime,
@@ -133,6 +150,11 @@ class ModelService(Base):
     memory_mb: Mapped[int] = mapped_column(Integer, default=1024)
     gpu_count: Mapped[int] = mapped_column(Integer, default=0)
     gpu_memory_mb: Mapped[int] = mapped_column(Integer, default=0)
+    gpu_model: Mapped[str | None] = mapped_column(String(255))
+    tensor_parallel_size: Mapped[int] = mapped_column(Integer, default=1)
+    dtype: Mapped[str] = mapped_column(String(32), default="auto")
+    gpu_memory_utilization: Mapped[float] = mapped_column(Float, default=0.9)
+    max_model_len: Mapped[int | None] = mapped_column(Integer)
     desired_replicas: Mapped[int] = mapped_column(Integer, default=1)
     autoscaling_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     autoscaling_min_replicas: Mapped[int] = mapped_column(Integer, default=1)
@@ -156,6 +178,8 @@ class ModelService(Base):
         default=ServiceStatus.PENDING,
     )
     round_robin_cursor: Mapped[int] = mapped_column(BigInteger, default=0)
+    scheduling_reason: Mapped[str | None] = mapped_column(String(128))
+    scheduling_details: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
     error_message: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -176,19 +200,22 @@ class ServiceReplica(Base):
         ),
         UniqueConstraint("execution_id", name="uq_service_replicas_execution_id"),
         CheckConstraint(
-            "status IN ('pending','starting','running','stopping','stopped','failed','lost')",
+            "status IN ('pending','starting','loading','running','draining','stopping',"
+            "'stopped','failed','lost')",
             name="service_replica_status",
         ),
         CheckConstraint(
             "health IN ('unknown','healthy','unhealthy')",
             name="service_replica_health",
         ),
+        CheckConstraint("runtime IN ('vllm','fake')", name="service_replica_runtime"),
         CheckConstraint("generation >= 1", name="generation"),
         CheckConstraint("ordinal >= 0", name="ordinal"),
         CheckConstraint(
             "health_failure_count >= 0",
             name="health_failure_count",
         ),
+        CheckConstraint("active_requests >= 0", name="active_requests"),
         Index(
             "ix_service_replicas_service_generation_status",
             "service_id",
@@ -208,6 +235,16 @@ class ServiceReplica(Base):
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     service_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("model_services.id", ondelete="CASCADE"), index=True
+    )
+    runtime: Mapped[ServingRuntime] = mapped_column(
+        Enum(
+            ServingRuntime,
+            native_enum=False,
+            length=32,
+            create_constraint=False,
+            values_callable=_enum_values,
+            name="service_replica_runtime",
+        )
     )
     generation: Mapped[int] = mapped_column(Integer)
     ordinal: Mapped[int] = mapped_column(Integer)
@@ -247,11 +284,19 @@ class ServiceReplica(Base):
         DateTime(timezone=True), index=True
     )
     health_failure_count: Mapped[int] = mapped_column(Integer, default=0)
+    active_requests: Mapped[int] = mapped_column(Integer, default=0)
+    model_revision: Mapped[str | None] = mapped_column(String(255))
+    image_digest: Mapped[str | None] = mapped_column(String(255))
+    error_code: Mapped[str | None] = mapped_column(String(128))
     error_message: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    container_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    drain_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    drain_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     version: Mapped[int] = mapped_column(Integer, default=1)

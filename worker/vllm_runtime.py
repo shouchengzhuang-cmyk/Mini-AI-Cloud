@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import re
 import uuid
 from collections.abc import Mapping, Sequence
@@ -29,18 +30,8 @@ GPU_DEVICE_IDS_LABEL = "mini-ai-cloud.gpu-device-ids"
 
 _DOCKER_VOLUME_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$")
 
-_RESERVED_EXTRA_ARGUMENTS = frozenset(
-    {
-        "--api-key",
-        "--dtype",
-        "--host",
-        "--max-model-len",
-        "--model",
-        "--port",
-        "--served-model-name",
-        "--tensor-parallel-size",
-    }
-)
+_ALLOWED_DTYPES = frozenset({"auto", "half", "float16", "bfloat16", "float", "float32"})
+_ALLOWED_EXTRA_ARGUMENTS = frozenset({"--enable-prefix-caching"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,9 +44,11 @@ class VLLMLaunchRequest:
     image: str
     model: str
     gpu_device_ids: tuple[str, ...]
+    revision: str | None = None
     port: int = 8000
     tensor_parallel_size: int | None = None
     dtype: str = "auto"
+    gpu_memory_utilization: float = 0.9
     max_model_len: int | None = None
     extra_arguments: tuple[str, ...] = ()
 
@@ -76,6 +69,7 @@ class VLLMContainerHandle:
     object_id: str
     display_id: str
     endpoint_url: str | None = None
+    image_digest: str | None = None
     labels: Mapping[str, str] = MappingProxyType({})
     native: object | None = None
 
@@ -255,6 +249,7 @@ class DockerVLLMRuntimeAdapter:
             object_id=str(container.id),
             display_id=str(container.short_id),
             endpoint_url=endpoint_url,
+            image_digest=_container_image_digest(container) or handle.image_digest,
             labels=handle.labels,
             native=container,
         )
@@ -353,6 +348,7 @@ class DockerVLLMRuntimeAdapter:
         return VLLMContainerHandle(
             object_id=str(container.id),
             display_id=str(container.short_id),
+            image_digest=_container_image_digest(container),
             labels=labels,
             native=container,
         )
@@ -364,6 +360,7 @@ def build_vllm_launch_spec(request: VLLMLaunchRequest) -> VLLMLaunchSpec:
     image = request.image.strip()
     model = request.model.strip()
     dtype = request.dtype.strip()
+    revision = request.revision.strip() if request.revision is not None else None
     if not image or any(character.isspace() for character in image):
         raise ValueError("image must be a non-blank container image reference without whitespace")
     if not model:
@@ -372,8 +369,18 @@ def build_vllm_launch_spec(request: VLLMLaunchRequest) -> VLLMLaunchSpec:
         raise ValueError("generation must be at least one")
     if request.port < 1 or request.port > 65535:
         raise ValueError("port must be between 1 and 65535")
-    if not dtype:
-        raise ValueError("dtype must not be blank")
+    if dtype not in _ALLOWED_DTYPES:
+        raise ValueError(f"dtype must be one of {sorted(_ALLOWED_DTYPES)}")
+    if revision is not None and (
+        not revision or any(character.isspace() or ord(character) < 32 for character in revision)
+    ):
+        raise ValueError("revision must not be blank or contain whitespace or control characters")
+    if (
+        isinstance(request.gpu_memory_utilization, bool)
+        or not math.isfinite(request.gpu_memory_utilization)
+        or not 0 < request.gpu_memory_utilization <= 1
+    ):
+        raise ValueError("gpu_memory_utilization must be greater than zero and at most one")
     if request.max_model_len is not None and request.max_model_len < 1:
         raise ValueError("max_model_len must be at least one")
 
@@ -388,8 +395,8 @@ def build_vllm_launch_spec(request: VLLMLaunchRequest) -> VLLMLaunchSpec:
         tensor_parallel_size = max(1, len(devices))
     if tensor_parallel_size < 1:
         raise ValueError("tensor_parallel_size must be at least one")
-    if devices and tensor_parallel_size > len(devices):
-        raise ValueError("tensor_parallel_size must not exceed visible GPU device count")
+    if devices and tensor_parallel_size != len(devices):
+        raise ValueError("tensor_parallel_size must equal visible GPU device count")
     if not devices and tensor_parallel_size != 1:
         raise ValueError("CPU-visible launch specs require tensor_parallel_size=1")
 
@@ -410,7 +417,11 @@ def build_vllm_launch_spec(request: VLLMLaunchRequest) -> VLLMLaunchSpec:
         dtype,
         "--tensor-parallel-size",
         str(tensor_parallel_size),
+        "--gpu-memory-utilization",
+        format(request.gpu_memory_utilization, "g"),
     )
+    if revision is not None:
+        argv += ("--revision", revision)
     if request.max_model_len is not None:
         argv += ("--max-model-len", str(request.max_model_len))
     argv += request.extra_arguments
@@ -466,9 +477,9 @@ def _validate_extra_arguments(arguments: tuple[str, ...]) -> None:
     for argument in arguments:
         if not argument or "\x00" in argument:
             raise ValueError("extra vLLM arguments must be non-empty and contain no NUL bytes")
-        flag = argument.partition("=")[0]
-        if flag in _RESERVED_EXTRA_ARGUMENTS:
-            raise ValueError(f"extra vLLM arguments must not override {flag}")
+        if argument not in _ALLOWED_EXTRA_ARGUMENTS:
+            flag = argument.partition("=")[0]
+            raise ValueError(f"unsupported extra vLLM argument: {flag}")
 
 
 def _validate_endpoint_host(value: str) -> str:
@@ -504,3 +515,19 @@ def _published_endpoint(attrs: object, *, endpoint_host: str) -> str:
         raise VLLMRuntimeError("Docker returned an invalid vLLM host port")
     url_host = f"[{endpoint_host}]" if ":" in endpoint_host else endpoint_host
     return f"http://{url_host}:{port}"
+
+
+def _container_image_digest(container: Container) -> str | None:
+    image = getattr(container, "image", None)
+    image_attrs = getattr(image, "attrs", None)
+    repo_digests = image_attrs.get("RepoDigests") if isinstance(image_attrs, dict) else None
+    if isinstance(repo_digests, list):
+        for reference in sorted(str(item) for item in repo_digests):
+            _name, separator, digest = reference.rpartition("@")
+            if separator and re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest):
+                return digest.lower()
+    attrs = getattr(container, "attrs", None)
+    image_id = attrs.get("Image") if isinstance(attrs, dict) else None
+    if isinstance(image_id, str) and re.fullmatch(r"sha256:[0-9a-fA-F]{64}", image_id):
+        return image_id.lower()
+    return None

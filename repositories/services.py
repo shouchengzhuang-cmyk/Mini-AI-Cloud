@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlsplit
 
 from sqlalchemy import Select, func, or_, select
@@ -24,9 +24,17 @@ from repositories.outbox import OutboxRepository
 from repositories.quotas import QuotaRepository
 
 ACTIVE_REPLICA_STATUSES = frozenset(
-    {ReplicaStatus.PENDING, ReplicaStatus.STARTING, ReplicaStatus.RUNNING}
+    {
+        ReplicaStatus.PENDING,
+        ReplicaStatus.STARTING,
+        ReplicaStatus.LOADING,
+        ReplicaStatus.RUNNING,
+    }
 )
-NONTERMINAL_REPLICA_STATUSES = ACTIVE_REPLICA_STATUSES | {ReplicaStatus.STOPPING}
+NONTERMINAL_REPLICA_STATUSES = ACTIVE_REPLICA_STATUSES | {
+    ReplicaStatus.DRAINING,
+    ReplicaStatus.STOPPING,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +93,13 @@ class ServiceRepository:
         gpu_count: int,
         gpu_memory_mb: int,
         desired_replicas: int,
+        registered_model_id: uuid.UUID | None = None,
+        model_revision: str | None = None,
+        gpu_model: str | None = None,
+        tensor_parallel_size: int | None = None,
+        dtype: str = "auto",
+        gpu_memory_utilization: float = 0.9,
+        max_model_len: int | None = None,
         autoscaling_enabled: bool = False,
         autoscaling_min_replicas: int = 1,
         autoscaling_max_replicas: int = 4,
@@ -103,8 +118,10 @@ class ServiceRepository:
         now = await database_utcnow(session)
         service = ModelService(
             project_id=project_id,
+            registered_model_id=registered_model_id,
             name=name,
             model=model,
+            model_revision=model_revision,
             runtime=runtime,
             runtime_type=runtime_type,
             image=image,
@@ -112,6 +129,13 @@ class ServiceRepository:
             memory_mb=memory_mb,
             gpu_count=gpu_count,
             gpu_memory_mb=gpu_memory_mb,
+            gpu_model=gpu_model,
+            tensor_parallel_size=(
+                tensor_parallel_size if tensor_parallel_size is not None else max(1, gpu_count)
+            ),
+            dtype=dtype,
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=max_model_len,
             desired_replicas=desired_replicas,
             autoscaling_enabled=autoscaling_enabled,
             autoscaling_min_replicas=autoscaling_min_replicas,
@@ -121,6 +145,7 @@ class ServiceRepository:
             generation=1,
             status=ServiceStatus.PENDING,
             round_robin_cursor=0,
+            scheduling_details={},
             created_at=now,
             updated_at=now,
         )
@@ -291,6 +316,9 @@ class ServiceRepository:
         now = await database_utcnow(session)
         service.desired_replicas = desired_replicas
         service.status = ServiceStatus.STOPPING if desired_replicas == 0 else ServiceStatus.PENDING
+        if desired_replicas == 0:
+            service.scheduling_reason = None
+            service.scheduling_details = {}
         service.stopped_at = None
         service.updated_at = now
         service.version += 1
@@ -357,14 +385,26 @@ class ServiceRepository:
         )
 
     @staticmethod
-    async def reconcile_batch(session: AsyncSession, *, limit: int) -> ReconcileResult:
+    async def reconcile_batch(
+        session: AsyncSession,
+        *,
+        limit: int,
+        drain_timeout_seconds: float = 30.0,
+    ) -> ReconcileResult:
+        if drain_timeout_seconds < 0:
+            raise ValueError("drain_timeout_seconds must not be negative")
         services = list(await session.scalars(ServiceRepository.reconcile_candidates_query(limit)))
         if not services:
             return ReconcileResult()
         now = await database_utcnow(session)
         result = ReconcileResult()
         for service in services:
-            result += await ServiceRepository.reconcile_locked(session, service, now=now)
+            result += await ServiceRepository.reconcile_locked(
+                session,
+                service,
+                now=now,
+                drain_timeout_seconds=drain_timeout_seconds,
+            )
         return result
 
     @staticmethod
@@ -376,7 +416,9 @@ class ServiceRepository:
                 ServiceReplica.status.in_(
                     {
                         ReplicaStatus.STARTING,
+                        ReplicaStatus.LOADING,
                         ReplicaStatus.RUNNING,
+                        ReplicaStatus.DRAINING,
                         ReplicaStatus.STOPPING,
                     }
                 ),
@@ -418,7 +460,9 @@ class ServiceRepository:
                         ServiceReplica.status.in_(
                             {
                                 ReplicaStatus.STARTING,
+                                ReplicaStatus.LOADING,
                                 ReplicaStatus.RUNNING,
+                                ReplicaStatus.DRAINING,
                                 ReplicaStatus.STOPPING,
                             }
                         ),
@@ -432,7 +476,7 @@ class ServiceRepository:
             for replica in replicas:
                 status = (
                     ReplicaStatus.STOPPED
-                    if replica.status == ReplicaStatus.STOPPING
+                    if replica.status in {ReplicaStatus.DRAINING, ReplicaStatus.STOPPING}
                     else ReplicaStatus.LOST
                 )
                 replica.status = status
@@ -441,6 +485,8 @@ class ServiceRepository:
                 replica.lease_expires_at = None
                 replica.health_probe_token = None
                 replica.health_probe_expires_at = None
+                replica.active_requests = 0
+                replica.error_code = "LEASE_EXPIRED"
                 replica.error_message = "service replica lease expired"
                 replica.stopped_at = now
                 replica.updated_at = now
@@ -478,7 +524,10 @@ class ServiceRepository:
         service: ModelService,
         *,
         now: datetime | None = None,
+        drain_timeout_seconds: float = 30.0,
     ) -> ReconcileResult:
+        if drain_timeout_seconds < 0:
+            raise ValueError("drain_timeout_seconds must not be negative")
         changed_at = now or await database_utcnow(session)
         replicas = await ServiceRepository.list_replicas(session, service.id, for_update=True)
         created = 0
@@ -490,7 +539,12 @@ class ServiceRepository:
                 continue
             if replica.status in NONTERMINAL_REPLICA_STATUSES:
                 requested, immediate = _request_replica_stop(
-                    session, service, replica, changed_at, reason="generation superseded"
+                    session,
+                    service,
+                    replica,
+                    changed_at,
+                    reason="generation superseded",
+                    drain_timeout_seconds=drain_timeout_seconds,
                 )
                 stopping += requested
                 stopped += immediate
@@ -505,6 +559,7 @@ class ServiceRepository:
                 replica,
                 changed_at,
                 reason="replica health threshold exceeded",
+                drain_timeout_seconds=drain_timeout_seconds,
             )
             stopping += requested
             stopped += immediate
@@ -514,7 +569,12 @@ class ServiceRepository:
         if excess > 0:
             for replica in sorted(active, key=_scale_down_order)[:excess]:
                 requested, immediate = _request_replica_stop(
-                    session, service, replica, changed_at, reason="replica count reduced"
+                    session,
+                    service,
+                    replica,
+                    changed_at,
+                    reason="replica count reduced",
+                    drain_timeout_seconds=drain_timeout_seconds,
                 )
                 stopping += requested
                 stopped += immediate
@@ -525,10 +585,14 @@ class ServiceRepository:
         for ordinal in range(next_ordinal, next_ordinal + max(0, missing)):
             replica = ServiceReplica(
                 service_id=service.id,
+                runtime=service.runtime,
                 generation=service.generation,
                 ordinal=ordinal,
                 status=ReplicaStatus.PENDING,
                 health=ReplicaHealth.UNKNOWN,
+                active_requests=0,
+                model_revision=service.model_revision,
+                image_digest=_image_digest(service.image),
                 created_at=changed_at,
                 updated_at=changed_at,
             )
@@ -605,6 +669,13 @@ class ServiceRepository:
         replica.lease_expires_at = lease_expires_at
         replica.status = ReplicaStatus.STARTING
         replica.health = ReplicaHealth.UNKNOWN
+        replica.active_requests = 0
+        replica.container_started_at = None
+        replica.ready_at = None
+        replica.drain_started_at = None
+        replica.drain_deadline = None
+        replica.error_code = None
+        replica.error_message = None
         replica.updated_at = now
         replica.version += 1
         return True
@@ -620,18 +691,27 @@ class ServiceRepository:
         worker_id: str | None = None,
         worker_session_id: uuid.UUID | None = None,
     ) -> bool:
-        replica, service = await _owned_current_replica(
+        if not await _worker_session_matches(
             session,
-            replica_id=replica_id,
-            generation=generation,
-            execution_id=execution_id,
             worker_id=worker_id,
             worker_session_id=worker_session_id,
-        )
+        ):
+            return False
+        service, replica = await _lock_service_and_replica(session, replica_id)
         if (
-            replica is None
-            or service is None
-            or replica.status not in {ReplicaStatus.STARTING, ReplicaStatus.RUNNING}
+            service is None
+            or replica is None
+            or replica.generation != generation
+            or replica.execution_id != execution_id
+            or (worker_id is not None and replica.worker_id != worker_id)
+        ):
+            return False
+        draining = replica.status in {ReplicaStatus.DRAINING, ReplicaStatus.STOPPING}
+        if not draining and (
+            service.generation != generation
+            or service.desired_replicas == 0
+            or replica.status
+            not in {ReplicaStatus.STARTING, ReplicaStatus.LOADING, ReplicaStatus.RUNNING}
         ):
             return False
         now = await database_utcnow(session)
@@ -645,7 +725,7 @@ class ServiceRepository:
         return True
 
     @staticmethod
-    async def mark_replica_running(
+    async def mark_replica_loading(
         session: AsyncSession,
         *,
         replica_id: uuid.UUID,
@@ -655,6 +735,8 @@ class ServiceRepository:
         worker_id: str | None = None,
         worker_session_id: uuid.UUID | None = None,
     ) -> bool:
+        """Persist that the runtime started but the model is not ready yet."""
+
         replica, service = await _owned_current_replica(
             session,
             replica_id=replica_id,
@@ -667,9 +749,62 @@ class ServiceRepository:
             return False
         _validate_endpoint_url(endpoint_url)
         now = await database_utcnow(session)
+        replica.status = ReplicaStatus.LOADING
+        replica.endpoint_url = endpoint_url
+        replica.container_started_at = now
+        if replica.started_at is None:
+            replica.started_at = now
+        replica.error_code = None
+        replica.error_message = None
+        replica.updated_at = now
+        replica.version += 1
+        await _refresh_service_status(session, service, now)
+        return True
+
+    @staticmethod
+    async def mark_replica_running(
+        session: AsyncSession,
+        *,
+        replica_id: uuid.UUID,
+        generation: int,
+        execution_id: uuid.UUID,
+        endpoint_url: str,
+        model_revision: str | None = None,
+        image_digest: str | None = None,
+        worker_id: str | None = None,
+        worker_session_id: uuid.UUID | None = None,
+    ) -> bool:
+        replica, service = await _owned_current_replica(
+            session,
+            replica_id=replica_id,
+            generation=generation,
+            execution_id=execution_id,
+            worker_id=worker_id,
+            worker_session_id=worker_session_id,
+        )
+        if (
+            replica is None
+            or service is None
+            or replica.status not in {ReplicaStatus.STARTING, ReplicaStatus.LOADING}
+        ):
+            return False
+        _validate_endpoint_url(endpoint_url)
+        now = await database_utcnow(session)
         replica.status = ReplicaStatus.RUNNING
         replica.endpoint_url = endpoint_url
-        replica.started_at = now
+        if replica.container_started_at is None:
+            replica.container_started_at = now
+        if replica.started_at is None:
+            replica.started_at = replica.container_started_at
+        replica.ready_at = now
+        if model_revision is not None:
+            replica.model_revision = model_revision
+        if image_digest is not None:
+            if not image_digest.startswith("sha256:") or len(image_digest) != 71:
+                raise ValueError("image_digest must be a sha256 digest")
+            replica.image_digest = image_digest
+        replica.error_code = None
+        replica.error_message = None
         replica.updated_at = now
         replica.version += 1
         await _refresh_service_status(session, service, now)
@@ -713,10 +848,12 @@ class ServiceRepository:
         if health == ReplicaHealth.HEALTHY:
             replica.health = ReplicaHealth.HEALTHY
             replica.health_failure_count = 0
+            replica.error_code = None
         else:
             replica.health_failure_count += 1
             if replica.health_failure_count >= failure_threshold:
                 replica.health = ReplicaHealth.UNHEALTHY
+                replica.error_code = "REPLICA_UNHEALTHY"
         replica.error_message = error_message
         replica.updated_at = now
         replica.version += 1
@@ -731,6 +868,7 @@ class ServiceRepository:
         generation: int,
         execution_id: uuid.UUID,
         status: ReplicaStatus,
+        error_code: str | None = None,
         error_message: str | None = None,
         worker_id: str | None = None,
         worker_session_id: uuid.UUID | None = None,
@@ -758,6 +896,11 @@ class ServiceRepository:
         replica.health = ReplicaHealth.UNHEALTHY
         replica.endpoint_url = None
         replica.lease_expires_at = None
+        replica.health_probe_token = None
+        replica.health_probe_expires_at = None
+        replica.active_requests = 0
+        if error_code is not None or status == ReplicaStatus.STOPPED:
+            replica.error_code = error_code
         replica.error_message = error_message
         replica.stopped_at = now
         replica.updated_at = now
@@ -812,6 +955,9 @@ class ServiceRepository:
         assert replica.execution_id is not None
         assert replica.endpoint_url is not None
         now = await database_utcnow(session)
+        replica.active_requests += 1
+        replica.updated_at = now
+        replica.version += 1
         service.round_robin_cursor += 1
         service.updated_at = now
         service.version += 1
@@ -823,11 +969,41 @@ class ServiceRepository:
             endpoint_url=replica.endpoint_url,
         )
 
+    @staticmethod
+    async def release_endpoint_request(
+        session: AsyncSession,
+        *,
+        replica_id: uuid.UUID,
+        generation: int,
+        execution_id: uuid.UUID,
+    ) -> bool:
+        """Release one request acquired by ``choose_healthy_endpoint``.
+
+        A release remains valid after scale-down or generation replacement while
+        that execution still tracks an active request. Terminal recovery clears
+        leaked counters, after which a late release is safely rejected. The
+        execution fence prevents it from mutating a newer replica owner.
+        """
+
+        _service, replica = await _lock_service_and_replica(session, replica_id)
+        if (
+            replica is None
+            or replica.generation != generation
+            or replica.execution_id != execution_id
+            or replica.active_requests <= 0
+        ):
+            return False
+        now = await database_utcnow(session)
+        replica.active_requests -= 1
+        replica.updated_at = now
+        replica.version += 1
+        return True
+
 
 def _scale_down_order(replica: ServiceReplica) -> tuple[int, int]:
     if replica.status == ReplicaStatus.PENDING:
         rank = 0
-    elif replica.status == ReplicaStatus.STARTING:
+    elif replica.status in {ReplicaStatus.STARTING, ReplicaStatus.LOADING}:
         rank = 1
     elif replica.health == ReplicaHealth.UNHEALTHY:
         rank = 2
@@ -845,9 +1021,11 @@ def _request_replica_stop(
     now: datetime,
     *,
     reason: str,
+    drain_timeout_seconds: float,
 ) -> tuple[int, int]:
-    replica.health = ReplicaHealth.UNHEALTHY
-    replica.endpoint_url = None
+    if replica.status in {ReplicaStatus.DRAINING, ReplicaStatus.STOPPING}:
+        return 0, 0
+
     replica.error_message = reason
     replica.updated_at = now
     replica.version += 1
@@ -870,6 +1048,31 @@ def _request_replica_stop(
         )
         return 0, 1
 
+    if replica.status == ReplicaStatus.RUNNING:
+        replica.status = ReplicaStatus.DRAINING
+        replica.drain_started_at = now
+        replica.drain_deadline = now + timedelta(seconds=drain_timeout_seconds)
+        _add_service_event(
+            session,
+            aggregate_id=replica.id,
+            aggregate_type="service_replica",
+            event_type="service.replica.drain_requested",
+            payload={
+                "service_id": str(service.id),
+                "project_id": str(service.project_id),
+                "replica_id": str(replica.id),
+                "generation": replica.generation,
+                "execution_id": str(replica.execution_id) if replica.execution_id else None,
+                "active_requests": replica.active_requests,
+                "drain_deadline": replica.drain_deadline.isoformat(),
+                "reason": reason,
+            },
+            available_at=now,
+        )
+        return 1, 0
+
+    replica.health = ReplicaHealth.UNHEALTHY
+    replica.endpoint_url = None
     replica.status = ReplicaStatus.STOPPING
     _add_service_event(
         session,
@@ -892,7 +1095,9 @@ def _request_replica_stop(
 def _derive_service_status(service: ModelService, replicas: list[ServiceReplica]) -> ServiceStatus:
     current = [item for item in replicas if item.generation == service.generation]
     active = [item for item in current if item.status in ACTIVE_REPLICA_STATUSES]
-    stopping = any(item.status == ReplicaStatus.STOPPING for item in replicas)
+    stopping = any(
+        item.status in {ReplicaStatus.DRAINING, ReplicaStatus.STOPPING} for item in replicas
+    )
     running = [item for item in current if item.status == ReplicaStatus.RUNNING]
     healthy = [
         item for item in running if item.health == ReplicaHealth.HEALTHY and item.endpoint_url
@@ -1004,6 +1209,15 @@ def _validate_endpoint_url(endpoint_url: str) -> None:
             "endpoint_url must be an absolute HTTP(S) origin without path, credentials, "
             "query or fragment"
         )
+
+
+def _image_digest(image: str | None) -> str | None:
+    if image is None:
+        return None
+    _name, separator, digest = image.rpartition("@")
+    if separator and digest.startswith("sha256:") and len(digest) == 71:
+        return digest
+    return None
 
 
 async def _refresh_service_status(

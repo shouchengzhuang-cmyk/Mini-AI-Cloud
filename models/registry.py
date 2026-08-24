@@ -26,6 +26,11 @@ class RegisteredModel(Base):
     __tablename__ = "registered_models"
     __table_args__ = (
         UniqueConstraint("project_id", "name", name="uq_registered_models_project_name"),
+        CheckConstraint("runtime IN ('vllm','fake')", name="registered_model_runtime"),
+        CheckConstraint(
+            "default_gpu_count >= 0 AND default_gpu_count <= 64",
+            name="registered_model_default_gpu_count",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -36,6 +41,9 @@ class RegisteredModel(Base):
     provider: Mapped[str] = mapped_column(String(64))
     source: Mapped[str] = mapped_column(String(1024))
     revision: Mapped[str | None] = mapped_column(String(255))
+    runtime: Mapped[str] = mapped_column(String(32), default="vllm")
+    default_gpu_count: Mapped[int] = mapped_column(Integer, default=0)
+    runtime_defaults: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
     size_bytes: Mapped[int | None] = mapped_column(BigInteger)
     gpu_memory_mb: Mapped[int | None] = mapped_column(Integer)
     architecture: Mapped[str | None] = mapped_column(String(255))

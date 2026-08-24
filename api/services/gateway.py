@@ -2,27 +2,37 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable, Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 import httpx
+from anyio import CancelScope
 
 from api.errors import APIError
 from api.schemas.gateway import OpenAIModelList, OpenAIModelObject
 from core.database import Database
+from core.enums import ErrorCode
 from core.logging import get_logger
 from core.metrics import (
     GATEWAY_DURATION,
+    GATEWAY_ERRORS,
+    GATEWAY_IN_FLIGHT,
     GATEWAY_REQUESTS,
+    GATEWAY_TOKENS,
+    GATEWAY_TTFT,
+    REPLICA_ACTIVE_REQUESTS,
     SERVICE_REQUEST_DURATION,
     SERVICE_REQUESTS,
 )
-from repositories.services import ServiceRepository
+from repositories.services import EndpointSelection, ServiceRepository
+from repositories.usage import UsageRepository
 
 HOP_BY_HOP_HEADERS = frozenset(
     {
@@ -47,6 +57,7 @@ SENSITIVE_REQUEST_HEADERS = frozenset(
         "x-forwarded-host",
         "x-forwarded-port",
         "x-forwarded-proto",
+        "x-mini-ai-replica-id",
         "forwarded",
         "via",
         "content-length",
@@ -61,6 +72,7 @@ UNSAFE_RESPONSE_HEADERS = frozenset(
     }
 )
 _BUFFER_READ_CHUNK_BYTES = 64 * 1024
+_MAX_OBSERVED_SSE_EVENT_BYTES = 1024 * 1024
 
 
 class _UpstreamResponseTooLarge(Exception):
@@ -86,18 +98,45 @@ class GatewayMetrics(ServiceMetricsSource):
 
     def __init__(self) -> None:
         self._active: dict[uuid.UUID, int] = {}
+        self._replica_active: dict[tuple[uuid.UUID, uuid.UUID], int] = {}
         self._observed_at: dict[uuid.UUID, datetime] = {}
         self._lock = asyncio.Lock()
 
-    async def request_started(self, service_id: uuid.UUID) -> None:
+    async def request_started(
+        self, service_id: uuid.UUID, replica_id: uuid.UUID | None = None
+    ) -> None:
         async with self._lock:
             self._active[service_id] = self._active.get(service_id, 0) + 1
             self._observed_at[service_id] = datetime.now(UTC)
+            GATEWAY_IN_FLIGHT.inc()
+            if replica_id is not None:
+                key = (service_id, replica_id)
+                active = self._replica_active.get(key, 0) + 1
+                self._replica_active[key] = active
+                REPLICA_ACTIVE_REQUESTS.labels(str(service_id), str(replica_id)).set(active)
 
-    async def request_finished(self, service_id: uuid.UUID) -> None:
+    async def request_finished(
+        self, service_id: uuid.UUID, replica_id: uuid.UUID | None = None
+    ) -> None:
         async with self._lock:
-            self._active[service_id] = max(0, self._active.get(service_id, 0) - 1)
+            service_active = self._active.get(service_id, 0)
+            if service_active <= 0:
+                return
+            self._active[service_id] = service_active - 1
             self._observed_at[service_id] = datetime.now(UTC)
+            GATEWAY_IN_FLIGHT.dec()
+            if replica_id is not None:
+                key = (service_id, replica_id)
+                replica_active = self._replica_active.get(key, 0)
+                if replica_active <= 1:
+                    self._replica_active.pop(key, None)
+                    REPLICA_ACTIVE_REQUESTS.remove(str(service_id), str(replica_id))
+                else:
+                    replica_active -= 1
+                    self._replica_active[key] = replica_active
+                    REPLICA_ACTIVE_REQUESTS.labels(str(service_id), str(replica_id)).set(
+                        replica_active
+                    )
 
     async def snapshot(self, service_id: uuid.UUID) -> ServiceLoad | None:
         async with self._lock:
@@ -109,6 +148,43 @@ class GatewayMetrics(ServiceMetricsSource):
                 observed_at=observed_at,
             )
 
+    async def replica_snapshot(
+        self, service_id: uuid.UUID, replica_id: uuid.UUID
+    ) -> ServiceLoad | None:
+        async with self._lock:
+            observed_at = self._observed_at.get(service_id)
+            if observed_at is None:
+                return None
+            return ServiceLoad(
+                active_requests=self._replica_active.get((service_id, replica_id), 0),
+                observed_at=observed_at,
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ReportedTokenUsage:
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
+@dataclass(slots=True)
+class _RequestAccounting:
+    request_id: uuid.UUID
+    project_id: uuid.UUID
+    service_id: uuid.UUID
+    selection: EndpointSelection | None
+    path: str
+    streamed: bool
+    gpu_count: int
+    started_at: datetime
+    started_monotonic: float
+    tracked_in_memory: bool = False
+    time_to_first_token_seconds: float | None = None
+    token_usage: ReportedTokenUsage | None = None
+    finalized: bool = False
+    finalize_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+
 
 @dataclass(slots=True)
 class GatewayForwardResult:
@@ -116,6 +192,7 @@ class GatewayForwardResult:
     headers: dict[str, str]
     body: bytes | None = None
     stream: AsyncIterator[bytes] | None = None
+    cleanup: Callable[[], Awaitable[None]] | None = None
 
 
 class GatewayService:
@@ -126,17 +203,31 @@ class GatewayService:
         metrics: GatewayMetrics,
         *,
         request_timeout: float,
+        connect_timeout: float | None = None,
+        first_token_timeout: float | None = None,
         max_response_bytes: int = 16 * 1024 * 1024,
         endpoint_host_allowlist: str | Iterable[str] = (),
     ) -> None:
         if request_timeout <= 0:
             raise ValueError("request_timeout must be positive")
+        if connect_timeout is not None and connect_timeout <= 0:
+            raise ValueError("connect_timeout must be positive")
+        if first_token_timeout is not None and first_token_timeout <= 0:
+            raise ValueError("first_token_timeout must be positive")
         if max_response_bytes <= 0:
             raise ValueError("max_response_bytes must be positive")
         self.database = database
         self.http_client = http_client
         self.metrics = metrics
-        self.timeout = httpx.Timeout(request_timeout)
+        self.request_timeout = request_timeout
+        self.connect_timeout = min(request_timeout, connect_timeout or request_timeout)
+        self.first_token_timeout = min(request_timeout, first_token_timeout or request_timeout)
+        self.timeout = httpx.Timeout(
+            connect=self.connect_timeout,
+            read=None,
+            write=request_timeout,
+            pool=self.connect_timeout,
+        )
         self.max_response_bytes = max_response_bytes
         self.endpoint_host_allowlist = _normalize_endpoint_allowlist(endpoint_host_allowlist)
         self.logger = get_logger("gateway")
@@ -178,6 +269,13 @@ class GatewayService:
     ) -> GatewayForwardResult:
         if path not in {"/v1/chat/completions", "/v1/completions"}:
             raise ValueError("unsupported gateway upstream path")
+        started_monotonic = time.monotonic()
+        started_at = datetime.now(UTC)
+        overall_deadline = started_monotonic + self.request_timeout
+        first_token_deadline = min(
+            overall_deadline,
+            started_monotonic + self.first_token_timeout,
+        )
         async with self.database.session() as session, session.begin():
             service = await ServiceRepository.get_by_name(
                 session,
@@ -186,21 +284,62 @@ class GatewayService:
                 for_update=True,
             )
             if service is None:
+                _observe_gateway_error("MODEL_NOT_FOUND")
+                _observe_gateway("model_not_found", started_monotonic)
                 raise APIError(404, "MODEL_NOT_FOUND", "The requested model service was not found")
             selection = await ServiceRepository.choose_healthy_endpoint(
                 session,
                 service_id=service.id,
                 project_id=project_id,
             )
-            if selection is None:
-                raise APIError(
-                    503,
-                    "SERVICE_NOT_READY",
-                    "The requested model service has no healthy replicas",
-                    headers={"Retry-After": "1"},
-                )
             service_id = service.id
             upstream_model = service.model
+            gpu_count = service.gpu_count
+
+        accounting = _RequestAccounting(
+            request_id=uuid.uuid4(),
+            project_id=project_id,
+            service_id=service_id,
+            selection=selection,
+            path=path,
+            streamed=stream_requested,
+            gpu_count=gpu_count,
+            started_at=started_at,
+            started_monotonic=started_monotonic,
+        )
+        if selection is None:
+            await self._finalize_request(
+                accounting,
+                outcome="no_healthy_replica",
+                error_code=ErrorCode.NO_HEALTHY_REPLICA.value,
+                completed=False,
+            )
+            raise APIError(
+                503,
+                ErrorCode.NO_HEALTHY_REPLICA.value,
+                "The requested model service has no healthy replicas",
+                headers={"Retry-After": "1"},
+            )
+
+        try:
+            await self.metrics.request_started(service_id, selection.replica_id)
+            accounting.tracked_in_memory = True
+        except asyncio.CancelledError:
+            await self._finalize_request(
+                accounting,
+                outcome="client_disconnect",
+                error_code="CLIENT_DISCONNECTED",
+                completed=False,
+            )
+            raise
+        except Exception:
+            await self._finalize_request(
+                accounting,
+                outcome="internal_error",
+                error_code="INTERNAL_SERVER_ERROR",
+                completed=False,
+            )
+            raise
 
         try:
             _validate_gateway_endpoint(
@@ -208,6 +347,12 @@ class GatewayService:
                 host_allowlist=self.endpoint_host_allowlist,
             )
         except ValueError as exc:
+            await self._finalize_request(
+                accounting,
+                outcome="unsafe_endpoint",
+                error_code="UNSAFE_REPLICA_ENDPOINT",
+                completed=False,
+            )
             raise APIError(
                 503,
                 "UNSAFE_REPLICA_ENDPOINT",
@@ -218,8 +363,6 @@ class GatewayService:
         upstream_payload["model"] = upstream_model
         headers = _forward_request_headers(request_headers)
         headers["accept-encoding"] = "identity"
-        started_at = time.monotonic()
-        await self.metrics.request_started(service_id)
         try:
             request = self.http_client.build_request(
                 "POST",
@@ -228,34 +371,89 @@ class GatewayService:
                 headers=headers,
                 timeout=self.timeout,
             )
-            upstream = await self.http_client.send(
-                request,
-                stream=True,
-                follow_redirects=False,
+            async with asyncio.timeout(_remaining_seconds(first_token_deadline)):
+                upstream = await self.http_client.send(
+                    request,
+                    stream=True,
+                    follow_redirects=False,
+                )
+        except httpx.ConnectTimeout as exc:
+            await self._finalize_request(
+                accounting,
+                outcome="connect_timeout",
+                error_code=ErrorCode.UPSTREAM_CONNECT_TIMEOUT.value,
+                completed=False,
             )
-        except httpx.TimeoutException as exc:
-            await self.metrics.request_finished(service_id)
-            _observe_gateway("timeout", started_at)
             raise APIError(
                 503,
-                "UPSTREAM_TIMEOUT",
+                ErrorCode.UPSTREAM_CONNECT_TIMEOUT.value,
+                "The gateway could not connect to the model replica before the timeout",
+                headers={"Retry-After": "1"},
+            ) from exc
+        except TimeoutError as exc:
+            await self._finalize_request(
+                accounting,
+                outcome="first_token_timeout",
+                error_code=ErrorCode.INFERENCE_REQUEST_TIMEOUT.value,
+                completed=False,
+            )
+            raise APIError(
+                503,
+                ErrorCode.INFERENCE_REQUEST_TIMEOUT.value,
+                "The model service did not produce response headers before the first-token timeout",
+                headers={"Retry-After": "1"},
+            ) from exc
+        except httpx.TimeoutException as exc:
+            await self._finalize_request(
+                accounting,
+                outcome="inference_timeout",
+                error_code=ErrorCode.INFERENCE_REQUEST_TIMEOUT.value,
+                completed=False,
+            )
+            raise APIError(
+                503,
+                ErrorCode.INFERENCE_REQUEST_TIMEOUT.value,
                 "The model service did not respond before the gateway timeout",
                 headers={"Retry-After": "1"},
             ) from exc
         except httpx.RequestError as exc:
-            await self.metrics.request_finished(service_id)
-            _observe_gateway("unavailable", started_at)
+            await self._finalize_request(
+                accounting,
+                outcome="upstream_disconnected",
+                error_code=ErrorCode.UPSTREAM_DISCONNECTED.value,
+                completed=False,
+            )
             raise APIError(
                 503,
-                "UPSTREAM_UNAVAILABLE",
+                ErrorCode.UPSTREAM_DISCONNECTED.value,
                 "The selected model replica is unavailable",
                 headers={"Retry-After": "1"},
             ) from exc
+        except asyncio.CancelledError:
+            await self._finalize_request(
+                accounting,
+                outcome="client_disconnect",
+                error_code="CLIENT_DISCONNECTED",
+                completed=False,
+            )
+            raise
+        except Exception:
+            await self._finalize_request(
+                accounting,
+                outcome="internal_error",
+                error_code="INTERNAL_SERVER_ERROR",
+                completed=False,
+            )
+            raise
 
         if upstream.is_redirect:
-            await upstream.aclose()
-            await self.metrics.request_finished(service_id)
-            _observe_gateway("redirect_rejected", started_at)
+            await self._close_upstream_and_finalize(
+                upstream,
+                accounting,
+                outcome="redirect_rejected",
+                error_code="UPSTREAM_REDIRECT_REJECTED",
+                completed=False,
+            )
             raise APIError(
                 502,
                 "UPSTREAM_REDIRECT_REJECTED",
@@ -263,24 +461,123 @@ class GatewayService:
             )
 
         response_headers = _forward_response_headers(upstream.headers)
+        response_headers["x-mini-ai-replica-id"] = str(selection.replica_id)
         is_sse = upstream.headers.get("content-type", "").lower().startswith("text/event-stream")
         if stream_requested and upstream.is_success and is_sse:
+            iterator = upstream.aiter_bytes().__aiter__()
+            try:
+                first_chunk = await _read_first_nonempty_chunk(iterator, first_token_deadline)
+            except TimeoutError as exc:
+                await self._close_upstream_and_finalize(
+                    upstream,
+                    accounting,
+                    outcome="first_token_timeout",
+                    error_code=ErrorCode.INFERENCE_REQUEST_TIMEOUT.value,
+                    completed=False,
+                )
+                raise APIError(
+                    503,
+                    ErrorCode.INFERENCE_REQUEST_TIMEOUT.value,
+                    "The model service did not produce its first response chunk before the timeout",
+                    headers={"Retry-After": "1"},
+                ) from exc
+            except (httpx.TimeoutException, httpx.RequestError) as exc:
+                code = (
+                    ErrorCode.INFERENCE_REQUEST_TIMEOUT.value
+                    if isinstance(exc, httpx.TimeoutException)
+                    else ErrorCode.UPSTREAM_DISCONNECTED.value
+                )
+                await self._close_upstream_and_finalize(
+                    upstream,
+                    accounting,
+                    outcome="stream_start_failed",
+                    error_code=code,
+                    completed=False,
+                )
+                raise APIError(
+                    503,
+                    code,
+                    "The model service disconnected before producing its first response chunk",
+                    headers={"Retry-After": "1"},
+                ) from exc
+            except asyncio.CancelledError:
+                await self._close_upstream_and_finalize(
+                    upstream,
+                    accounting,
+                    outcome="client_disconnect",
+                    error_code="CLIENT_DISCONNECTED",
+                    completed=False,
+                )
+                raise
+            except Exception:
+                await self._close_upstream_and_finalize(
+                    upstream,
+                    accounting,
+                    outcome="internal_error",
+                    error_code="INTERNAL_SERVER_ERROR",
+                    completed=False,
+                )
+                raise
+            if first_chunk is None:
+                await self._close_upstream_and_finalize(
+                    upstream,
+                    accounting,
+                    outcome="upstream_disconnected",
+                    error_code=ErrorCode.UPSTREAM_DISCONNECTED.value,
+                    completed=False,
+                )
+                raise APIError(
+                    503,
+                    ErrorCode.UPSTREAM_DISCONNECTED.value,
+                    "The model service ended the stream before producing a response chunk",
+                    headers={"Retry-After": "1"},
+                )
+            accounting.time_to_first_token_seconds = max(0.0, time.monotonic() - started_monotonic)
+            usage_observer = _SSEUsageObserver()
+            usage_observer.feed(first_chunk)
+
+            async def cleanup_stream() -> None:
+                await self._close_upstream_and_finalize(
+                    upstream,
+                    accounting,
+                    outcome="client_disconnect",
+                    error_code="CLIENT_DISCONNECTED",
+                    completed=False,
+                )
+
             return GatewayForwardResult(
                 status_code=upstream.status_code,
                 headers=response_headers,
                 stream=self._stream_response(
                     upstream,
-                    service_id=service_id,
-                    started_at=started_at,
+                    iterator=iterator,
+                    first_chunk=first_chunk,
+                    accounting=accounting,
+                    overall_deadline=overall_deadline,
+                    usage_observer=usage_observer,
                     client_disconnected=client_disconnected,
                 ),
+                cleanup=cleanup_stream,
             )
 
         outcome = "success" if upstream.is_success else "upstream_error"
+        error_code: str | None = None if upstream.is_success else "UPSTREAM_HTTP_ERROR"
+        completed = False
         try:
-            body = await self._read_buffered_response(upstream)
+            body = await self._read_buffered_response(
+                upstream,
+                accounting=accounting,
+                first_token_deadline=first_token_deadline,
+                overall_deadline=overall_deadline,
+            )
+            completed = True
+            accounting.token_usage = _reported_usage_from_json(
+                body,
+                content_type=upstream.headers.get("content-type", ""),
+            )
         except _UpstreamResponseTooLarge as exc:
             outcome = "response_too_large"
+            error_code = "UPSTREAM_RESPONSE_TOO_LARGE"
             self.logger.warning(
                 "gateway rejected oversized buffered upstream response",
                 service_id=str(service_id),
@@ -291,38 +588,67 @@ class GatewayService:
                 "UPSTREAM_RESPONSE_TOO_LARGE",
                 "The model service response exceeds the gateway buffer limit",
             ) from exc
-        except httpx.TimeoutException as exc:
-            outcome = "timeout"
+        except TimeoutError as exc:
+            outcome = (
+                "first_token_timeout"
+                if accounting.time_to_first_token_seconds is None
+                else "inference_timeout"
+            )
+            error_code = ErrorCode.INFERENCE_REQUEST_TIMEOUT.value
             raise APIError(
                 503,
-                "UPSTREAM_TIMEOUT",
+                error_code,
+                "The model service did not complete before the inference request timeout",
+                headers={"Retry-After": "1"},
+            ) from exc
+        except httpx.TimeoutException as exc:
+            outcome = "inference_timeout"
+            error_code = ErrorCode.INFERENCE_REQUEST_TIMEOUT.value
+            raise APIError(
+                503,
+                error_code,
                 "The model service did not respond before the gateway timeout",
                 headers={"Retry-After": "1"},
             ) from exc
         except httpx.RequestError as exc:
-            outcome = "unavailable"
+            outcome = "upstream_disconnected"
+            error_code = ErrorCode.UPSTREAM_DISCONNECTED.value
             raise APIError(
                 503,
-                "UPSTREAM_UNAVAILABLE",
+                error_code,
                 "The selected model replica disconnected before completing the response",
                 headers={"Retry-After": "1"},
             ) from exc
         except asyncio.CancelledError:
             outcome = "client_disconnect"
+            error_code = "CLIENT_DISCONNECTED"
+            raise
+        except Exception:
+            outcome = "internal_error"
+            error_code = "INTERNAL_SERVER_ERROR"
             raise
         finally:
-            try:
-                await upstream.aclose()
-            finally:
-                await self.metrics.request_finished(service_id)
-                _observe_gateway(outcome, started_at)
+            await self._close_upstream_and_finalize(
+                upstream,
+                accounting,
+                outcome=outcome,
+                error_code=error_code,
+                completed=completed,
+            )
         return GatewayForwardResult(
             status_code=upstream.status_code,
             headers=response_headers,
             body=body,
         )
 
-    async def _read_buffered_response(self, upstream: httpx.Response) -> bytes:
+    async def _read_buffered_response(
+        self,
+        upstream: httpx.Response,
+        *,
+        accounting: _RequestAccounting,
+        first_token_deadline: float,
+        overall_deadline: float,
+    ) -> bytes:
         declared_length = upstream.headers.get("content-length")
         if declared_length is not None:
             try:
@@ -334,7 +660,21 @@ class GatewayService:
 
         body = bytearray()
         chunk_size = min(_BUFFER_READ_CHUNK_BYTES, self.max_response_bytes + 1)
-        async for chunk in upstream.aiter_bytes(chunk_size=chunk_size):
+        iterator = upstream.aiter_bytes(chunk_size=chunk_size).__aiter__()
+        while True:
+            deadline = (
+                first_token_deadline
+                if accounting.time_to_first_token_seconds is None
+                else overall_deadline
+            )
+            try:
+                chunk = await _next_chunk(iterator, deadline)
+            except StopAsyncIteration:
+                break
+            if chunk and accounting.time_to_first_token_seconds is None:
+                accounting.time_to_first_token_seconds = max(
+                    0.0, time.monotonic() - accounting.started_monotonic
+                )
             if len(body) + len(chunk) > self.max_response_bytes:
                 raise _UpstreamResponseTooLarge
             body.extend(chunk)
@@ -344,32 +684,396 @@ class GatewayService:
         self,
         upstream: httpx.Response,
         *,
-        service_id: uuid.UUID,
-        started_at: float,
+        iterator: AsyncIterator[bytes],
+        first_chunk: bytes,
+        accounting: _RequestAccounting,
+        overall_deadline: float,
+        usage_observer: _SSEUsageObserver,
         client_disconnected: Callable[[], Awaitable[bool]],
     ) -> AsyncIterator[bytes]:
         outcome = "success"
+        error_code: str | None = None
+        completed = False
         try:
-            async for chunk in upstream.aiter_bytes():
+            if await client_disconnected():
+                outcome = "client_disconnect"
+                error_code = "CLIENT_DISCONNECTED"
+                return
+            yield first_chunk
+            while True:
+                try:
+                    chunk = await _next_chunk(iterator, overall_deadline)
+                except StopAsyncIteration:
+                    completed = True
+                    usage_observer.finish()
+                    accounting.token_usage = usage_observer.usage
+                    return
+                usage_observer.feed(chunk)
                 if await client_disconnected():
                     outcome = "client_disconnect"
+                    error_code = "CLIENT_DISCONNECTED"
                     return
                 if chunk:
                     yield chunk
-        except asyncio.CancelledError:
-            outcome = "client_disconnect"
-            raise
-        except (httpx.TimeoutException, httpx.RequestError) as exc:
-            outcome = "stream_error"
+        except TimeoutError as exc:
+            outcome = "inference_timeout"
+            error_code = ErrorCode.INFERENCE_REQUEST_TIMEOUT.value
             self.logger.warning(
-                "gateway stream ended before upstream completion",
-                service_id=str(service_id),
+                "gateway stream exceeded inference request deadline",
+                service_id=str(accounting.service_id),
+                replica_id=str(accounting.selection.replica_id) if accounting.selection else None,
                 error=type(exc).__name__,
             )
+        except (GeneratorExit, asyncio.CancelledError):
+            outcome = "client_disconnect"
+            error_code = "CLIENT_DISCONNECTED"
+            raise
+        except httpx.TimeoutException as exc:
+            outcome = "inference_timeout"
+            error_code = ErrorCode.INFERENCE_REQUEST_TIMEOUT.value
+            self.logger.warning(
+                "gateway stream timed out before upstream completion",
+                service_id=str(accounting.service_id),
+                error=type(exc).__name__,
+            )
+        except httpx.RequestError as exc:
+            outcome = "upstream_disconnected"
+            error_code = ErrorCode.UPSTREAM_DISCONNECTED.value
+            self.logger.warning(
+                "gateway stream ended before upstream completion",
+                service_id=str(accounting.service_id),
+                error=type(exc).__name__,
+            )
+        except Exception:
+            outcome = "internal_error"
+            error_code = "INTERNAL_SERVER_ERROR"
+            raise
         finally:
-            await upstream.aclose()
-            await self.metrics.request_finished(service_id)
-            _observe_gateway(outcome, started_at)
+            await self._close_upstream_and_finalize(
+                upstream,
+                accounting,
+                outcome=outcome,
+                error_code=error_code,
+                completed=completed,
+            )
+
+    async def _close_upstream_and_finalize(
+        self,
+        upstream: httpx.Response,
+        accounting: _RequestAccounting,
+        *,
+        outcome: str,
+        error_code: str | None,
+        completed: bool,
+    ) -> None:
+        async def cleanup() -> None:
+            try:
+                await upstream.aclose()
+            finally:
+                await self._finalize_request_inner(
+                    accounting,
+                    outcome=outcome,
+                    error_code=error_code,
+                    completed=completed,
+                )
+
+        await _await_cancel_safe(cleanup())
+
+    async def _finalize_request(
+        self,
+        accounting: _RequestAccounting,
+        *,
+        outcome: str,
+        error_code: str | None,
+        completed: bool,
+    ) -> None:
+        await _await_cancel_safe(
+            self._finalize_request_inner(
+                accounting,
+                outcome=outcome,
+                error_code=error_code,
+                completed=completed,
+            )
+        )
+
+    async def _finalize_request_inner(
+        self,
+        accounting: _RequestAccounting,
+        *,
+        outcome: str,
+        error_code: str | None,
+        completed: bool,
+    ) -> None:
+        async with accounting.finalize_lock:
+            if accounting.finalized:
+                return
+            release_completed = await self._persist_request_finalization(
+                accounting,
+                outcome=outcome,
+                error_code=error_code,
+                completed=completed,
+            )
+            if release_completed:
+                accounting.finalized = True
+
+    async def _persist_request_finalization(
+        self,
+        accounting: _RequestAccounting,
+        *,
+        outcome: str,
+        error_code: str | None,
+        completed: bool,
+    ) -> bool:
+        duration = max(0.0, time.monotonic() - accounting.started_monotonic)
+
+        if accounting.selection is not None:
+            try:
+                async with self.database.session() as session, session.begin():
+                    released = await ServiceRepository.release_endpoint_request(
+                        session,
+                        replica_id=accounting.selection.replica_id,
+                        generation=accounting.selection.generation,
+                        execution_id=accounting.selection.execution_id,
+                    )
+                if not released:
+                    self.logger.warning(
+                        "gateway endpoint request release was rejected by its fence",
+                        service_id=str(accounting.service_id),
+                        replica_id=str(accounting.selection.replica_id),
+                        generation=accounting.selection.generation,
+                    )
+            except Exception:
+                self.logger.exception(
+                    "failed to persist gateway endpoint request release",
+                    service_id=str(accounting.service_id),
+                    replica_id=str(accounting.selection.replica_id),
+                )
+                return False
+
+        if accounting.tracked_in_memory and accounting.selection is not None:
+            try:
+                await self.metrics.request_finished(
+                    accounting.service_id,
+                    accounting.selection.replica_id,
+                )
+            except Exception:
+                self.logger.exception(
+                    "failed to release process-local gateway request metrics",
+                    service_id=str(accounting.service_id),
+                    replica_id=str(accounting.selection.replica_id),
+                )
+
+        _observe_gateway(outcome, accounting.started_monotonic)
+        if error_code is not None:
+            _observe_gateway_error(error_code)
+        if accounting.time_to_first_token_seconds is not None:
+            GATEWAY_TTFT.observe(accounting.time_to_first_token_seconds)
+
+        reported_usage = accounting.token_usage if completed else None
+        if reported_usage is not None:
+            GATEWAY_TOKENS.labels("prompt").inc(reported_usage.prompt_tokens)
+            GATEWAY_TOKENS.labels("completion").inc(reported_usage.completion_tokens)
+            GATEWAY_TOKENS.labels("total").inc(reported_usage.total_tokens)
+
+        finished_at = datetime.now(UTC)
+        duration_decimal = Decimal(str(duration))
+        allocated_gpu_seconds = duration_decimal * accounting.gpu_count if completed else None
+        try:
+            async with self.database.session() as session, session.begin():
+                await UsageRepository.record_serving_request(
+                    session,
+                    request_id=accounting.request_id,
+                    project_id=accounting.project_id,
+                    service_id=accounting.service_id,
+                    replica_id=(
+                        accounting.selection.replica_id
+                        if accounting.selection is not None
+                        else None
+                    ),
+                    path=accounting.path,
+                    outcome=outcome,
+                    error_code=error_code,
+                    streamed=accounting.streamed,
+                    started_at=accounting.started_at,
+                    finished_at=finished_at,
+                    request_duration_seconds=duration_decimal,
+                    time_to_first_token_seconds=(
+                        None
+                        if accounting.time_to_first_token_seconds is None
+                        else Decimal(str(accounting.time_to_first_token_seconds))
+                    ),
+                    allocated_gpu_seconds=allocated_gpu_seconds,
+                    prompt_tokens=(
+                        reported_usage.prompt_tokens if reported_usage is not None else None
+                    ),
+                    completion_tokens=(
+                        reported_usage.completion_tokens if reported_usage is not None else None
+                    ),
+                    total_tokens=(
+                        reported_usage.total_tokens if reported_usage is not None else None
+                    ),
+                )
+        except Exception:
+            self.logger.exception(
+                "failed to persist serving request usage",
+                request_id=str(accounting.request_id),
+                service_id=str(accounting.service_id),
+            )
+        return True
+
+
+class _SSEUsageObserver:
+    """Observe a bounded SSE event stream without buffering the proxied body."""
+
+    def __init__(self) -> None:
+        self._line_buffer = bytearray()
+        self._data_lines: list[bytes] = []
+        self._event_bytes = 0
+        self._disabled = False
+        self.usage: ReportedTokenUsage | None = None
+
+    def feed(self, chunk: bytes) -> None:
+        if self._disabled or not chunk:
+            return
+        if len(self._line_buffer) + len(chunk) > _MAX_OBSERVED_SSE_EVENT_BYTES:
+            self._disable()
+            return
+        self._line_buffer.extend(chunk)
+        while True:
+            newline = self._line_buffer.find(b"\n")
+            if newline < 0:
+                return
+            line = bytes(self._line_buffer[:newline])
+            del self._line_buffer[: newline + 1]
+            if line.endswith(b"\r"):
+                line = line[:-1]
+            self._consume_line(line)
+            if self._disabled:
+                return
+
+    def finish(self) -> None:
+        if self._disabled:
+            return
+        if self._line_buffer:
+            line = bytes(self._line_buffer)
+            self._line_buffer.clear()
+            if line.endswith(b"\r"):
+                line = line[:-1]
+            self._consume_line(line)
+        self._dispatch_event()
+
+    def _consume_line(self, line: bytes) -> None:
+        if not line:
+            self._dispatch_event()
+            return
+        if not line.startswith(b"data:"):
+            return
+        value = line[5:]
+        if value.startswith(b" "):
+            value = value[1:]
+        self._event_bytes += len(value)
+        if self._event_bytes > _MAX_OBSERVED_SSE_EVENT_BYTES:
+            self._disable()
+            return
+        self._data_lines.append(value)
+
+    def _dispatch_event(self) -> None:
+        if not self._data_lines:
+            self._event_bytes = 0
+            return
+        data = b"\n".join(self._data_lines)
+        self._data_lines.clear()
+        self._event_bytes = 0
+        if data.strip() == b"[DONE]":
+            return
+        try:
+            payload = json.loads(data)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return
+        observed = _reported_usage_from_payload(payload)
+        if observed is not None:
+            self.usage = observed
+
+    def _disable(self) -> None:
+        self._disabled = True
+        self._line_buffer.clear()
+        self._data_lines.clear()
+        self._event_bytes = 0
+
+
+async def _await_cancel_safe(coroutine: Coroutine[Any, Any, None]) -> None:
+    """Finish critical cleanup under AnyIO and direct asyncio cancellation."""
+
+    interrupted: asyncio.CancelledError | None = None
+    with CancelScope(shield=True):
+        cleanup_task: asyncio.Task[None] = asyncio.create_task(coroutine)
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError as exc:
+                interrupted = exc
+        cleanup_task.result()
+    if interrupted is not None:
+        raise interrupted
+
+
+async def _read_first_nonempty_chunk(
+    iterator: AsyncIterator[bytes], deadline: float
+) -> bytes | None:
+    while True:
+        try:
+            chunk = await _next_chunk(iterator, deadline)
+        except StopAsyncIteration:
+            return None
+        if chunk:
+            return chunk
+
+
+async def _next_chunk(iterator: AsyncIterator[bytes], deadline: float) -> bytes:
+    async with asyncio.timeout(_remaining_seconds(deadline)):
+        return await anext(iterator)
+
+
+def _remaining_seconds(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError
+    return remaining
+
+
+def _reported_usage_from_json(body: bytes, *, content_type: str) -> ReportedTokenUsage | None:
+    media_type = content_type.partition(";")[0].strip().lower()
+    if media_type != "application/json" and not media_type.endswith("+json"):
+        return None
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return _reported_usage_from_payload(payload)
+
+
+def _reported_usage_from_payload(payload: object) -> ReportedTokenUsage | None:
+    if not isinstance(payload, dict):
+        return None
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    prompt_tokens = usage.get("prompt_tokens")
+    completion_tokens = usage.get("completion_tokens")
+    total_tokens = usage.get("total_tokens")
+    values = (prompt_tokens, completion_tokens, total_tokens)
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values):
+        return None
+    assert isinstance(prompt_tokens, int)
+    assert isinstance(completion_tokens, int)
+    assert isinstance(total_tokens, int)
+    if total_tokens != prompt_tokens + completion_tokens:
+        return None
+    return ReportedTokenUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+    )
 
 
 def _forward_request_headers(headers: Mapping[str, str]) -> dict[str, str]:
@@ -465,6 +1169,10 @@ def _observe_gateway(outcome: str, started_at: float) -> None:
     GATEWAY_DURATION.observe(duration)
     SERVICE_REQUESTS.labels(outcome).inc()
     SERVICE_REQUEST_DURATION.observe(duration)
+
+
+def _observe_gateway_error(code: str) -> None:
+    GATEWAY_ERRORS.labels(code).inc()
 
 
 def _as_utc(value: datetime) -> datetime:

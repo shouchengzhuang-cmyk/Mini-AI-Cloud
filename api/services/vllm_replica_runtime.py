@@ -4,16 +4,15 @@ import asyncio
 import os
 import socket
 import uuid
-from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import httpx
 import psutil
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, func, or_, select
 
 from core.database import Database
-from core.enums import RuntimeType, WorkerStatus
+from core.enums import ErrorCode, RuntimeType, WorkerStatus
 from core.logging import get_logger
 from models.service import (
     ModelService,
@@ -25,6 +24,12 @@ from models.service import (
 from repositories.clock import database_utcnow
 from repositories.services import ServiceRepository
 from repositories.workers import WorkerRepository
+from scheduler.serving import (
+    ServingGPUDeviceSnapshot,
+    ServingPlacementRequest,
+    ServingWorkerSnapshot,
+    choose_single_node_gang_placement,
+)
 from worker.gpu_inventory import GPUDevice, GPUInventoryProvider, NvidiaSMIInventoryProvider
 from worker.vllm_runtime import (
     EXECUTION_ID_LABEL,
@@ -48,9 +53,14 @@ class VLLMReplicaClaim:
     execution_id: uuid.UUID
     image: str
     model: str
+    model_revision: str | None
     cpu_millicores: int
     memory_mb: int
     gpu_device_ids: tuple[str, ...]
+    tensor_parallel_size: int
+    dtype: str
+    gpu_memory_utilization: float
+    max_model_len: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +106,7 @@ class VLLMReplicaRuntimeController:
         ready_timeout_seconds: float = 600.0,
         probe_timeout_seconds: float = 3.0,
         lease_seconds: float = 900.0,
+        allow_fake_gpu_inventory: bool = False,
     ) -> None:
         if batch_size < 1:
             raise ValueError("batch_size must be at least one")
@@ -121,6 +132,7 @@ class VLLMReplicaRuntimeController:
         self.ready_timeout_seconds = ready_timeout_seconds
         self.probe_timeout = httpx.Timeout(probe_timeout_seconds)
         self.lease_seconds = lease_seconds
+        self.allow_fake_gpu_inventory = allow_fake_gpu_inventory
         self._devices: tuple[GPUDevice, ...] = ()
         self._cpu_total_millicores = max(1, os.cpu_count() or 1) * 1000
         self._memory_total_mb = max(16, int(psutil.virtual_memory().total // (1024 * 1024)))
@@ -246,7 +258,7 @@ class VLLMReplicaRuntimeController:
             return 0
 
         devices = await asyncio.to_thread(self.inventory_provider.list_devices)
-        if any(device.fake for device in devices):
+        if any(device.fake for device in devices) and not self.allow_fake_gpu_inventory:
             raise ValueError("fake GPU inventory cannot launch real vLLM containers")
         if len({device.uuid for device in devices}) != len(devices):
             raise ValueError("vLLM GPU inventory contains duplicate device UUIDs")
@@ -286,7 +298,7 @@ class VLLMReplicaRuntimeController:
                         "memory_total_mb": item.memory_total_mb,
                         "memory_free_mb": item.memory_free_mb,
                         "compute_capability": item.compute_capability,
-                        "fake": False,
+                        "fake": item.fake,
                     }
                     for item in self._devices
                 ],
@@ -314,7 +326,9 @@ class VLLMReplicaRuntimeController:
                         ServiceReplica.status.in_(
                             {
                                 ReplicaStatus.STARTING,
+                                ReplicaStatus.LOADING,
                                 ReplicaStatus.RUNNING,
+                                ReplicaStatus.DRAINING,
                                 ReplicaStatus.STOPPING,
                             }
                         ),
@@ -348,7 +362,7 @@ class VLLMReplicaRuntimeController:
             assert replica.execution_id is not None
             status = (
                 ReplicaStatus.STOPPED
-                if replica.status == ReplicaStatus.STOPPING
+                if replica.status in {ReplicaStatus.DRAINING, ReplicaStatus.STOPPING}
                 else ReplicaStatus.LOST
             )
             accepted = await self._mark_terminal_values(
@@ -367,7 +381,7 @@ class VLLMReplicaRuntimeController:
             assert replica.execution_id is not None
             status = (
                 ReplicaStatus.STOPPED
-                if replica.status == ReplicaStatus.STOPPING
+                if replica.status in {ReplicaStatus.DRAINING, ReplicaStatus.STOPPING}
                 else ReplicaStatus.LOST
             )
             accepted = await self._mark_terminal_values(
@@ -409,7 +423,11 @@ class VLLMReplicaRuntimeController:
                             ServiceReplica.service_id == service.id,
                             ServiceReplica.generation == service.generation,
                             ServiceReplica.status.in_(
-                                {ReplicaStatus.STARTING, ReplicaStatus.RUNNING}
+                                {
+                                    ReplicaStatus.STARTING,
+                                    ReplicaStatus.LOADING,
+                                    ReplicaStatus.RUNNING,
+                                }
                             ),
                         )
                     )
@@ -434,19 +452,63 @@ class VLLMReplicaRuntimeController:
                     )
                 )
                 for replica in replicas:
-                    selected_devices = _select_devices(
-                        available_devices.values(),
-                        count=service.gpu_count,
-                        required_memory_mb=service.gpu_memory_mb,
+                    placement, explain = choose_single_node_gang_placement(
+                        ServingPlacementRequest(
+                            gpu_count=service.gpu_count,
+                            gpu_model=service.gpu_model,
+                            gpu_memory_mb=service.gpu_memory_mb,
+                            allow_fake=self.allow_fake_gpu_inventory,
+                        ),
+                        (
+                            ServingWorkerSnapshot(
+                                id=self.worker_id,
+                                gpu_devices=tuple(
+                                    ServingGPUDeviceSnapshot(
+                                        uuid=device.uuid,
+                                        index=device.index,
+                                        model=device.model,
+                                        memory_free_mb=device.memory_free_mb,
+                                        fake=device.fake,
+                                    )
+                                    for device in available_devices.values()
+                                ),
+                            ),
+                        ),
                     )
-                    if (
-                        service.image is None
-                        or service.cpu_millicores > available_cpu
-                        or service.memory_mb > available_memory
-                        or selected_devices is None
-                    ):
+                    capacity_failure: tuple[str, dict[str, object]] | None = None
+                    if service.image is None:
+                        capacity_failure = ("VLLM_IMAGE_REQUIRED", {})
+                    elif service.cpu_millicores > available_cpu:
+                        capacity_failure = (
+                            "INSUFFICIENT_CPU",
+                            {
+                                "requested_cpu_millicores": service.cpu_millicores,
+                                "available_cpu_millicores": available_cpu,
+                            },
+                        )
+                    elif service.memory_mb > available_memory:
+                        capacity_failure = (
+                            "INSUFFICIENT_MEMORY",
+                            {
+                                "requested_memory_mb": service.memory_mb,
+                                "available_memory_mb": available_memory,
+                            },
+                        )
+                    elif placement is None:
+                        assert explain is not None
+                        capacity_failure = (explain.reason.value, explain.details())
+                    if capacity_failure is not None:
+                        _record_scheduling_explain(
+                            service,
+                            reason=capacity_failure[0],
+                            details=capacity_failure[1],
+                            now=now,
+                        )
                         waiting_capacity += 1
                         break
+                    assert placement is not None
+                    assert placement.worker_id == self.worker_id
+                    assert service.image is not None
                     execution_id = uuid.uuid4()
                     accepted = await ServiceRepository.bind_replica_execution(
                         session,
@@ -459,7 +521,8 @@ class VLLMReplicaRuntimeController:
                     )
                     if not accepted:
                         continue
-                    device_ids = tuple(item.uuid for item in selected_devices)
+                    device_ids = placement.gpu_device_ids
+                    _clear_scheduling_explain(service, now=now)
                     available_cpu -= service.cpu_millicores
                     available_memory -= service.memory_mb
                     for device_id in device_ids:
@@ -473,9 +536,14 @@ class VLLMReplicaRuntimeController:
                             execution_id=execution_id,
                             image=service.image,
                             model=service.model,
+                            model_revision=service.model_revision,
                             cpu_millicores=service.cpu_millicores,
                             memory_mb=service.memory_mb,
                             gpu_device_ids=device_ids,
+                            tensor_parallel_size=service.tensor_parallel_size,
+                            dtype=service.dtype,
+                            gpu_memory_utilization=service.gpu_memory_utilization,
+                            max_model_len=service.max_model_len,
                         )
                     )
         return claims, waiting_capacity
@@ -491,6 +559,11 @@ class VLLMReplicaRuntimeController:
                 image=claim.image,
                 model=claim.model,
                 gpu_device_ids=claim.gpu_device_ids,
+                revision=claim.model_revision,
+                tensor_parallel_size=claim.tensor_parallel_size,
+                dtype=claim.dtype,
+                gpu_memory_utilization=claim.gpu_memory_utilization,
+                max_model_len=claim.max_model_len,
             )
         )
         handle: VLLMContainerHandle | None = None
@@ -505,6 +578,9 @@ class VLLMReplicaRuntimeController:
             handle = await self.runtime.start(handle)
             if handle.endpoint_url is None:
                 raise RuntimeError("vLLM runtime did not publish an endpoint")
+            if not await self._publish_loading(claim, handle.endpoint_url):
+                await self._cleanup_runtime_handle(handle)
+                return "stale"
             managed = _ManagedReplica(
                 claim=claim,
                 handle=handle,
@@ -525,6 +601,7 @@ class VLLMReplicaRuntimeController:
             accepted = await self._mark_terminal(
                 claim,
                 status=ReplicaStatus.FAILED,
+                error_code=ErrorCode.MODEL_LOAD_FAILED.value,
                 error_message=f"failed to launch vLLM container: {type(exc).__name__}",
             )
             self.logger.error(
@@ -549,6 +626,7 @@ class VLLMReplicaRuntimeController:
             outcome = await self._terminate_handle(
                 item,
                 status=ReplicaStatus.FAILED,
+                error_code=ErrorCode.MODEL_LOAD_TIMEOUT.value,
                 error_message="vLLM container did not become ready before the startup deadline",
             )
             failed += int(outcome == "failed")
@@ -566,6 +644,18 @@ class VLLMReplicaRuntimeController:
         except (httpx.TimeoutException, httpx.RequestError):
             return False
 
+    async def _publish_loading(self, claim: VLLMReplicaClaim, endpoint_url: str) -> bool:
+        async with self.database.session() as session, session.begin():
+            return await ServiceRepository.mark_replica_loading(
+                session,
+                replica_id=claim.replica_id,
+                generation=claim.generation,
+                execution_id=claim.execution_id,
+                endpoint_url=endpoint_url,
+                worker_id=self.worker_id,
+                worker_session_id=self.worker_session_id,
+            )
+
     async def _publish_ready(self, item: _ManagedReplica) -> str:
         claim = item.claim
         assert item.handle.endpoint_url is not None
@@ -576,6 +666,8 @@ class VLLMReplicaRuntimeController:
                 generation=claim.generation,
                 execution_id=claim.execution_id,
                 endpoint_url=item.handle.endpoint_url,
+                model_revision=claim.model_revision,
+                image_digest=item.handle.image_digest,
                 worker_id=self.worker_id,
                 worker_session_id=self.worker_session_id,
             )
@@ -612,6 +704,11 @@ class VLLMReplicaRuntimeController:
             outcome = await self._terminate_handle(
                 item,
                 status=ReplicaStatus.FAILED,
+                error_code=(
+                    ErrorCode.OOM_KILLED.value
+                    if state.oom_killed
+                    else ErrorCode.REPLICA_UNHEALTHY.value
+                ),
                 error_message=message,
                 stop_first=False,
             )
@@ -648,12 +745,19 @@ class VLLMReplicaRuntimeController:
 
     async def _stop_requested_replicas(self) -> int:
         async with self.database.session() as session:
+            now = await database_utcnow(session)
             replicas = list(
                 await session.scalars(
                     select(ServiceReplica).where(
                         ServiceReplica.worker_id == self.worker_id,
-                        ServiceReplica.status == ReplicaStatus.STOPPING,
+                        ServiceReplica.status.in_({ReplicaStatus.DRAINING, ReplicaStatus.STOPPING}),
                         ServiceReplica.execution_id.is_not(None),
+                        or_(
+                            ServiceReplica.status == ReplicaStatus.STOPPING,
+                            ServiceReplica.active_requests == 0,
+                            ServiceReplica.drain_deadline.is_(None),
+                            ServiceReplica.drain_deadline <= now,
+                        ),
                     )
                 )
             )
@@ -685,6 +789,7 @@ class VLLMReplicaRuntimeController:
         *,
         status: ReplicaStatus,
         error_message: str,
+        error_code: str | None = None,
         stop_first: bool = True,
     ) -> str:
         if stop_first:
@@ -694,6 +799,7 @@ class VLLMReplicaRuntimeController:
         accepted = await self._mark_terminal(
             item.claim,
             status=status,
+            error_code=error_code,
             error_message=error_message,
         )
         return status.value if accepted else "stale"
@@ -724,12 +830,14 @@ class VLLMReplicaRuntimeController:
         *,
         status: ReplicaStatus,
         error_message: str,
+        error_code: str | None = None,
     ) -> bool:
         return await self._mark_terminal_values(
             replica_id=claim.replica_id,
             generation=claim.generation,
             execution_id=claim.execution_id,
             status=status,
+            error_code=error_code,
             error_message=error_message,
         )
 
@@ -740,6 +848,7 @@ class VLLMReplicaRuntimeController:
         generation: int,
         execution_id: uuid.UUID,
         status: ReplicaStatus,
+        error_code: str | None = None,
         error_message: str | None,
     ) -> bool:
         async with self.database.session() as session, session.begin():
@@ -749,33 +858,35 @@ class VLLMReplicaRuntimeController:
                 generation=generation,
                 execution_id=execution_id,
                 status=status,
+                error_code=error_code,
                 error_message=error_message,
                 worker_id=self.worker_id,
                 worker_session_id=self.worker_session_id,
             )
 
 
-def _select_devices(
-    devices: Iterable[GPUDevice],
+def _record_scheduling_explain(
+    service: ModelService,
     *,
-    count: int,
-    required_memory_mb: int,
-) -> tuple[GPUDevice, ...] | None:
-    if count == 0:
-        return ()
-    candidates = sorted(
-        (
-            item
-            for item in devices
-            if isinstance(item, GPUDevice)
-            and item.memory_free_mb >= required_memory_mb
-            and not item.fake
-        ),
-        key=lambda item: (item.memory_free_mb, item.index, item.uuid),
-    )
-    if len(candidates) < count:
-        return None
-    return tuple(candidates[:count])
+    reason: str,
+    details: dict[str, object],
+    now: datetime,
+) -> None:
+    if service.scheduling_reason == reason and service.scheduling_details == details:
+        return
+    service.scheduling_reason = reason
+    service.scheduling_details = details
+    service.updated_at = now
+    service.version += 1
+
+
+def _clear_scheduling_explain(service: ModelService, *, now: datetime) -> None:
+    if service.scheduling_reason is None and not service.scheduling_details:
+        return
+    service.scheduling_reason = None
+    service.scheduling_details = {}
+    service.updated_at = now
+    service.version += 1
 
 
 def _label_uuid(handle: VLLMContainerHandle, key: str) -> uuid.UUID | None:

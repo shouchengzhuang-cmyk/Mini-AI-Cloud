@@ -8,9 +8,11 @@ import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
-from sqlalchemy import Select, func, select
+import psutil
+from sqlalchemy import Select, func, or_, select
 
 from core.database import Database
 from core.enums import RuntimeType, WorkerStatus
@@ -75,6 +77,7 @@ class FakeReplicaRuntimeController:
         ready_timeout_seconds: float = 10.0,
         stop_timeout_seconds: float = 5.0,
         probe_interval_seconds: float = 0.1,
+        inference_delay_seconds: float = 0.0,
         lease_seconds: float = 3600.0,
     ) -> None:
         if app_env not in {"development", "test"}:
@@ -85,11 +88,14 @@ class FakeReplicaRuntimeController:
             raise ValueError("ready and stop timeouts must be positive")
         if probe_interval_seconds <= 0:
             raise ValueError("probe_interval_seconds must be positive")
+        if inference_delay_seconds < 0:
+            raise ValueError("inference_delay_seconds must not be negative")
         if lease_seconds <= ready_timeout_seconds:
             raise ValueError("lease_seconds must be greater than ready_timeout_seconds")
         if not python_executable.strip():
             raise ValueError("python_executable must not be blank")
-        if worker_id is not None and (not worker_id.strip() or len(worker_id) > 255):
+        resolved_worker_id = worker_id or f"fake-local-{socket.gethostname()}"
+        if not resolved_worker_id.strip() or len(resolved_worker_id) > 255:
             raise ValueError("worker_id must contain 1 to 255 characters")
 
         resolved_script = (
@@ -101,7 +107,7 @@ class FakeReplicaRuntimeController:
             raise ValueError(f"fake inference script does not exist: {resolved_script}")
 
         self.database = database
-        self.worker_id = worker_id or f"fake-local-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        self.worker_id = resolved_worker_id.strip()
         self.worker_session_id = uuid.uuid4()
         self.python_executable = python_executable
         self.script_path = resolved_script
@@ -109,6 +115,7 @@ class FakeReplicaRuntimeController:
         self.ready_timeout_seconds = ready_timeout_seconds
         self.stop_timeout_seconds = stop_timeout_seconds
         self.probe_interval_seconds = probe_interval_seconds
+        self.inference_delay_seconds = inference_delay_seconds
         self.lease_seconds = lease_seconds
         self.http_client = http_client or httpx.AsyncClient()
         self._owns_http_client = http_client is None
@@ -248,9 +255,9 @@ class FakeReplicaRuntimeController:
 
     async def _recover_owned_orphans(self) -> None:
         async with self.database.session() as session:
-            replicas = list(
-                await session.scalars(
-                    select(ServiceReplica)
+            rows = list(
+                await session.execute(
+                    select(ServiceReplica, ModelService.model)
                     .join(ModelService, ModelService.id == ServiceReplica.service_id)
                     .where(
                         ModelService.runtime == ServingRuntime.FAKE,
@@ -260,18 +267,27 @@ class FakeReplicaRuntimeController:
                         ServiceReplica.status.in_(
                             {
                                 ReplicaStatus.STARTING,
+                                ReplicaStatus.LOADING,
                                 ReplicaStatus.RUNNING,
+                                ReplicaStatus.DRAINING,
                                 ReplicaStatus.STOPPING,
                             }
                         ),
                     )
                 )
             )
-        for replica in replicas:
+        for replica, model in rows:
             assert replica.execution_id is not None
+            await asyncio.to_thread(
+                self._terminate_owned_orphan_process,
+                replica.endpoint_url,
+                model,
+                replica.id,
+                replica.execution_id,
+            )
             status = (
                 ReplicaStatus.STOPPED
-                if replica.status == ReplicaStatus.STOPPING
+                if replica.status in {ReplicaStatus.DRAINING, ReplicaStatus.STOPPING}
                 else ReplicaStatus.LOST
             )
             async with self.database.session() as session, session.begin():
@@ -282,7 +298,58 @@ class FakeReplicaRuntimeController:
                     execution_id=replica.execution_id,
                     status=status,
                     error_message="fake runtime restarted without a local process handle",
+                    worker_id=self.worker_id,
+                    worker_session_id=self.worker_session_id,
                 )
+
+    def _terminate_owned_orphan_process(
+        self,
+        endpoint_url: str | None,
+        model: str,
+        replica_id: uuid.UUID,
+        execution_id: uuid.UUID,
+    ) -> bool:
+        """Best-effort cleanup of a fenced fake server from an older controller.
+
+        New processes are matched by the exact script, model and fenced
+        replica/execution identity, so recovery also works before an endpoint is
+        persisted. Legacy processes without identity arguments additionally
+        require their persisted loopback port. PID reuse must never make recovery
+        terminate an unrelated Python process.
+        """
+
+        port: int | None = None
+        if endpoint_url is not None:
+            parsed = urlsplit(endpoint_url)
+            try:
+                port = parsed.port
+            except ValueError:
+                return False
+            if parsed.hostname not in {"127.0.0.1", "::1", "localhost"} or port is None:
+                return False
+        matched = False
+        for process in psutil.process_iter(["cmdline"]):
+            try:
+                command = process.info.get("cmdline") or []
+                if not _fake_process_matches(
+                    command,
+                    script_path=self.script_path,
+                    port=port,
+                    model=model,
+                    replica_id=replica_id,
+                    execution_id=execution_id,
+                ):
+                    continue
+                matched = True
+                process.terminate()
+                try:
+                    process.wait(timeout=self.stop_timeout_seconds)
+                except psutil.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=self.stop_timeout_seconds)
+            except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+                continue
+        return matched
 
     async def _claim_pending_replicas(self) -> list[FakeReplicaClaim]:
         async with self.database.session() as session, session.begin():
@@ -303,7 +370,11 @@ class FakeReplicaRuntimeController:
                             ServiceReplica.service_id == service.id,
                             ServiceReplica.generation == service.generation,
                             ServiceReplica.status.in_(
-                                {ReplicaStatus.STARTING, ReplicaStatus.RUNNING}
+                                {
+                                    ReplicaStatus.STARTING,
+                                    ReplicaStatus.LOADING,
+                                    ReplicaStatus.RUNNING,
+                                }
                             ),
                         )
                     )
@@ -331,6 +402,7 @@ class FakeReplicaRuntimeController:
                         replica_id=replica.id,
                         generation=service.generation,
                         worker_id=self.worker_id,
+                        worker_session_id=self.worker_session_id,
                         execution_id=execution_id,
                         lease_expires_at=lease_expires_at,
                     )
@@ -364,6 +436,8 @@ class FakeReplicaRuntimeController:
                     generation=claim.generation,
                     execution_id=claim.execution_id,
                     lease_expires_at=lease_expires_at,
+                    worker_id=self.worker_id,
+                    worker_session_id=self.worker_session_id,
                 )
                 if not renewed:
                     stale.append(handle)
@@ -393,6 +467,12 @@ class FakeReplicaRuntimeController:
                 str(port),
                 "--model",
                 claim.model,
+                "--replica-id",
+                str(claim.replica_id),
+                "--execution-id",
+                str(claim.execution_id),
+                "--delay-seconds",
+                str(self.inference_delay_seconds),
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
@@ -401,6 +481,7 @@ class FakeReplicaRuntimeController:
             accepted, status = await self._mark_terminal(
                 claim,
                 default_status=ReplicaStatus.FAILED,
+                error_code="MODEL_LOAD_FAILED",
                 error_message=f"failed to start fake inference process: {type(exc).__name__}",
             )
             return status.value if accepted else "stale"
@@ -436,6 +517,7 @@ class FakeReplicaRuntimeController:
             return await self._stop_handle(
                 handle,
                 status=ReplicaStatus.FAILED,
+                error_code="MODEL_LOAD_FAILED",
                 error_message=f"fake replica startup failed: {type(exc).__name__}",
             )
 
@@ -448,11 +530,29 @@ class FakeReplicaRuntimeController:
                 error_message="fake runtime controller closed during process startup",
             )
 
+        async with self.database.session() as session, session.begin():
+            accepted = await ServiceRepository.mark_replica_loading(
+                session,
+                replica_id=claim.replica_id,
+                generation=claim.generation,
+                execution_id=claim.execution_id,
+                endpoint_url=handle.endpoint_url,
+                worker_id=self.worker_id,
+                worker_session_id=self.worker_session_id,
+            )
+        if not accepted:
+            return await self._stop_handle(
+                handle,
+                status=ReplicaStatus.STOPPED,
+                error_message="fake replica ownership became stale after process start",
+            )
+
         ready = await self._wait_until_ready(handle)
         if not ready:
             return await self._stop_handle(
                 handle,
                 status=ReplicaStatus.FAILED,
+                error_code="MODEL_LOAD_TIMEOUT",
                 error_message="fake inference process did not become ready",
             )
 
@@ -463,6 +563,8 @@ class FakeReplicaRuntimeController:
                 generation=claim.generation,
                 execution_id=claim.execution_id,
                 endpoint_url=handle.endpoint_url,
+                worker_id=self.worker_id,
+                worker_session_id=self.worker_session_id,
             )
             if accepted:
                 accepted = await ServiceRepository.record_replica_health(
@@ -471,6 +573,8 @@ class FakeReplicaRuntimeController:
                     generation=claim.generation,
                     execution_id=claim.execution_id,
                     health=ReplicaHealth.HEALTHY,
+                    worker_id=self.worker_id,
+                    worker_session_id=self.worker_session_id,
                 )
         if not accepted:
             return await self._stop_handle(
@@ -518,6 +622,7 @@ class FakeReplicaRuntimeController:
                 accepted, status = await self._mark_terminal(
                     handle.claim,
                     default_status=ReplicaStatus.FAILED,
+                    error_code="REPLICA_UNHEALTHY",
                     error_message=f"fake inference process exited with code {return_code}",
                 )
             except asyncio.CancelledError:
@@ -546,6 +651,7 @@ class FakeReplicaRuntimeController:
 
     async def _stop_requested_replicas(self) -> int:
         async with self.database.session() as session:
+            now = await database_utcnow(session)
             requested = list(
                 await session.scalars(
                     select(ServiceReplica.id)
@@ -554,7 +660,13 @@ class FakeReplicaRuntimeController:
                         ModelService.runtime == ServingRuntime.FAKE,
                         ModelService.runtime_type == RuntimeType.FAKE,
                         ServiceReplica.worker_id == self.worker_id,
-                        ServiceReplica.status == ReplicaStatus.STOPPING,
+                        ServiceReplica.status.in_({ReplicaStatus.DRAINING, ReplicaStatus.STOPPING}),
+                        or_(
+                            ServiceReplica.status == ReplicaStatus.STOPPING,
+                            ServiceReplica.active_requests == 0,
+                            ServiceReplica.drain_deadline.is_(None),
+                            ServiceReplica.drain_deadline <= now,
+                        ),
                     )
                 )
             )
@@ -577,6 +689,7 @@ class FakeReplicaRuntimeController:
         handle: _ManagedReplica,
         *,
         status: ReplicaStatus,
+        error_code: str | None = None,
         error_message: str,
     ) -> str:
         handle.expected_stop = True
@@ -585,6 +698,7 @@ class FakeReplicaRuntimeController:
             accepted, terminal_status = await self._mark_terminal(
                 handle.claim,
                 default_status=status,
+                error_code=error_code,
                 error_message=error_message,
             )
         finally:
@@ -616,6 +730,7 @@ class FakeReplicaRuntimeController:
         claim: FakeReplicaClaim,
         *,
         default_status: ReplicaStatus,
+        error_code: str | None = None,
         error_message: str,
     ) -> tuple[bool, ReplicaStatus]:
         async with self.database.session() as session, session.begin():
@@ -624,7 +739,7 @@ class FakeReplicaRuntimeController:
             )
             status = (
                 ReplicaStatus.STOPPED
-                if current_status == ReplicaStatus.STOPPING
+                if current_status in {ReplicaStatus.DRAINING, ReplicaStatus.STOPPING}
                 else default_status
             )
             accepted = await ServiceRepository.mark_replica_terminal(
@@ -633,7 +748,10 @@ class FakeReplicaRuntimeController:
                 generation=claim.generation,
                 execution_id=claim.execution_id,
                 status=status,
+                error_code=error_code,
                 error_message=error_message,
+                worker_id=self.worker_id,
+                worker_session_id=self.worker_session_id,
             )
         return accepted, status
 
@@ -643,3 +761,41 @@ def _allocate_loopback_port() -> int:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     return int(port)
+
+
+def _fake_process_matches(
+    command: list[str],
+    *,
+    script_path: Path,
+    port: int | None,
+    model: str,
+    replica_id: uuid.UUID,
+    execution_id: uuid.UUID,
+) -> bool:
+    resolved_script = script_path.resolve()
+    script_matches = False
+    for argument in command:
+        try:
+            if Path(argument).resolve() == resolved_script:
+                script_matches = True
+                break
+        except (OSError, ValueError):
+            continue
+    if not script_matches or _command_option(command, "--model") != model:
+        return False
+
+    process_replica_id = _command_option(command, "--replica-id")
+    process_execution_id = _command_option(command, "--execution-id")
+    if process_replica_id is None and process_execution_id is None:
+        # Compatibility with Fake processes created before identity arguments
+        # were added. A persisted loopback port is still required for safety.
+        return port is not None and _command_option(command, "--port") == str(port)
+    return process_replica_id == str(replica_id) and process_execution_id == str(execution_id)
+
+
+def _command_option(command: list[str], name: str) -> str | None:
+    try:
+        index = command.index(name)
+    except ValueError:
+        return None
+    return command[index + 1] if index + 1 < len(command) else None

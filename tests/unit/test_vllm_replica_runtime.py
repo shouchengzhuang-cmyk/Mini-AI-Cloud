@@ -19,6 +19,7 @@ from core.enums import RuntimeType, WorkerStatus
 from models.base import Base
 from models.identity import Project, User
 from models.outbox import OutboxEvent
+from models.registry import RegisteredModel
 from models.scheduling import GPUDevice as PersistedGPUDevice
 from models.service import (
     ModelService,
@@ -62,6 +63,7 @@ async def vllm_runtime_database(tmp_path: Path) -> AsyncIterator[Database]:
                 cast(Table, ProjectQuotaState.__table__),
                 cast(Table, Worker.__table__),
                 cast(Table, PersistedGPUDevice.__table__),
+                cast(Table, RegisteredModel.__table__),
                 cast(Table, ModelService.__table__),
                 cast(Table, ServiceReplica.__table__),
                 cast(Table, OutboxEvent.__table__),
@@ -179,6 +181,8 @@ async def _create_service(
     database: Database,
     *,
     gpu_count: int = 1,
+    gpu_model: str | None = None,
+    tensor_parallel_size: int | None = None,
     desired_replicas: int = 1,
 ) -> uuid.UUID:
     async with database.session() as session, session.begin():
@@ -187,6 +191,7 @@ async def _create_service(
             project_id=PROJECT_ID,
             name=f"vllm-{uuid.uuid4().hex[:8]}",
             model="Qwen/test-model",
+            model_revision="revision-1",
             runtime=ServingRuntime.VLLM,
             runtime_type=RuntimeType.DOCKER,
             image="vllm/vllm-openai@sha256:test",
@@ -194,6 +199,11 @@ async def _create_service(
             memory_mb=2048,
             gpu_count=gpu_count,
             gpu_memory_mb=4096,
+            gpu_model=gpu_model,
+            tensor_parallel_size=tensor_parallel_size,
+            dtype="bfloat16",
+            gpu_memory_utilization=0.8,
+            max_model_len=8192,
             desired_replicas=desired_replicas,
         )
         await ServiceRepository.reconcile_locked(session, service)
@@ -284,6 +294,51 @@ async def test_vllm_runtime_starts_exact_gpu_replica_and_stops_scale_down(
             await controller.close()
 
 
+async def test_vllm_runtime_launches_four_gpu_tensor_parallel_gang_on_one_worker(
+    vllm_runtime_database: Database,
+) -> None:
+    service_id = await _create_service(
+        vllm_runtime_database,
+        gpu_count=4,
+        gpu_model="NVIDIA A100",
+        tensor_parallel_size=4,
+    )
+    runtime = _Runtime()
+    devices = tuple(_gpu(f"GPU-real-{index}", index=index) for index in range(4))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_healthy_response)) as client:
+        controller = VLLMReplicaRuntimeController(
+            vllm_runtime_database,
+            runtime,
+            http_client=client,
+            inventory_provider=_Inventory(devices),
+            worker_id="tensor-worker",
+            probe_timeout_seconds=1,
+            lease_seconds=30,
+        )
+        try:
+            result = await controller.run_once()
+            assert (result.claimed, result.ready, result.waiting_capacity) == (1, 1, 0)
+
+            spec = runtime.prepared[0][0]
+            assert spec.gpu_device_ids == tuple(f"GPU-real-{index}" for index in range(4))
+            assert spec.argv[spec.argv.index("--tensor-parallel-size") + 1] == "4"
+            assert spec.argv[spec.argv.index("--revision") + 1] == "revision-1"
+            assert spec.argv[spec.argv.index("--dtype") + 1] == "bfloat16"
+            assert spec.argv[spec.argv.index("--gpu-memory-utilization") + 1] == "0.8"
+            assert spec.argv[spec.argv.index("--max-model-len") + 1] == "8192"
+
+            replica = (await _replicas(vllm_runtime_database, service_id))[0]
+            assert replica.status == ReplicaStatus.RUNNING
+            assert replica.model_revision == "revision-1"
+            async with vllm_runtime_database.session() as session:
+                service = await ServiceRepository.get(session, service_id)
+            assert service is not None
+            assert service.scheduling_reason is None
+            assert service.scheduling_details == {}
+        finally:
+            await controller.close()
+
+
 async def test_vllm_runtime_leaves_gpu_service_pending_without_concrete_capacity(
     vllm_runtime_database: Database,
 ) -> None:
@@ -308,6 +363,12 @@ async def test_vllm_runtime_leaves_gpu_service_pending_without_concrete_capacity
             assert runtime.prepared == []
             assert replica.status == ReplicaStatus.PENDING
             assert replica.execution_id is None
+            async with vllm_runtime_database.session() as session:
+                service = await ServiceRepository.get(session, service_id)
+            assert service is not None
+            assert service.scheduling_reason == "INSUFFICIENT_CONTIGUOUS_GPUS"
+            assert service.scheduling_details["requested_gpu_count"] == 2
+            assert service.scheduling_details["largest_available_worker_gpu_count"] == 1
         finally:
             await controller.close()
 
@@ -338,6 +399,7 @@ async def test_vllm_runtime_fails_and_cleans_replica_after_readiness_timeout(
 
             assert timed_out.failed == 1
             assert replica.status == ReplicaStatus.FAILED
+            assert replica.error_code == "MODEL_LOAD_TIMEOUT"
             assert replica.endpoint_url is None
             assert controller.active_container_count == 0
             assert runtime.stopped == ["container-1"]

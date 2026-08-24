@@ -16,16 +16,30 @@ from core.rbac import Principal, PrincipalKind
 from models.identity import Project
 from models.usage import ProjectQuotaState
 from repositories.quotas import QuotaRepository
-from repositories.registry import ImagePolicyRepository
+from repositories.registry import ImagePolicyRepository, RegisteredModelRepository
 
 pytestmark = pytest.mark.integration
 
 PROJECT_ID = uuid.UUID("10000000-0000-0000-0000-000000000001")
+OTHER_PROJECT_ID = uuid.UUID("10000000-0000-0000-0000-000000000002")
 DIGEST = "sha256:" + "b" * 64
 
 
+@pytest.fixture
+def services_settings() -> Settings:
+    return Settings(
+        redis_url="redis://unused.invalid/0",
+        control_plane_enabled=False,
+        legacy_project_id=str(PROJECT_ID),
+        vllm_image=f"example/vllm@{DIGEST}",
+    )
+
+
 @pytest_asyncio.fixture
-async def services_client(database: Database) -> AsyncIterator[AsyncClient]:
+async def services_client(
+    database: Database,
+    services_settings: Settings,
+) -> AsyncIterator[AsyncClient]:
     async with database.session() as session, session.begin():
         session.add(Project(id=PROJECT_ID, name="API Services", slug="api-services"))
         await session.flush()
@@ -46,12 +60,7 @@ async def services_client(database: Database) -> AsyncIterator[AsyncClient]:
 
     app = FastAPI()
     app.state.database = database
-    app.state.settings = Settings(
-        database_url=str(database.engine.url),
-        redis_url="redis://unused.invalid/0",
-        control_plane_enabled=False,
-        legacy_project_id=str(PROJECT_ID),
-    )
+    app.state.settings = services_settings
     register_exception_handlers(app)
     app.include_router(services.router)
     app.dependency_overrides[get_principal] = lambda: Principal(
@@ -67,11 +76,48 @@ def _payload() -> dict[str, object]:
     return {
         "name": "chat-main",
         "model": "org/model-v1",
+        "model_revision": "revision-1",
         "runtime": "vllm",
         "runtime_type": "docker",
         "image": f"example/vllm@{DIGEST}",
+        "tensor_parallel_size": 1,
+        "dtype": "float16",
+        "gpu_memory_utilization": 0.85,
+        "max_model_len": 8192,
         "replicas": 2,
     }
+
+
+async def _create_registered_model(
+    database: Database,
+    *,
+    project_id: uuid.UUID = PROJECT_ID,
+) -> uuid.UUID:
+    async with database.session() as session, session.begin():
+        model = await RegisteredModelRepository.create(
+            session,
+            project_id=project_id,
+            name="registry-chat",
+            provider="huggingface",
+            source="org/registry-model",
+            revision="registry-revision",
+            runtime="vllm",
+            default_gpu_count=4,
+            runtime_defaults={
+                "gpu_model": "NVIDIA A100",
+                "tensor_parallel_size": 4,
+                "dtype": "bfloat16",
+                "gpu_memory_utilization": 0.8,
+                "max_model_len": 16_384,
+                "extra_arguments": ["--trust-remote-code"],
+            },
+            size_bytes=None,
+            gpu_memory_mb=40_960,
+            architecture="transformer",
+            metadata={},
+            created_by_user_id=None,
+        )
+        return model.id
 
 
 async def test_services_api_create_list_duplicate_and_stop(
@@ -88,6 +134,13 @@ async def test_services_api_create_list_duplicate_and_stop(
     assert created_body["generation"] == 1
     assert created_body["status"] == "deploying"
     assert created_body["image"] == f"docker.io/example/vllm@{DIGEST}"
+    assert created_body["model_revision"] == "revision-1"
+    assert created_body["tensor_parallel_size"] == 1
+    assert created_body["dtype"] == "float16"
+    assert created_body["gpu_memory_utilization"] == 0.85
+    assert created_body["max_model_len"] == 8192
+    assert created_body["scheduling_reason"] is None
+    assert created_body["scheduling_details"] == {}
 
     listed = await services_client.get("/api/v1/services")
     assert listed.status_code == 200
@@ -109,6 +162,165 @@ async def test_services_api_create_list_duplicate_and_stop(
         "stopped",
         "stopped",
     ]
+
+
+async def test_services_api_deploys_a_registered_model_snapshot_with_explicit_overrides(
+    services_client: AsyncClient,
+    database: Database,
+) -> None:
+    registered_model_id = await _create_registered_model(database)
+
+    response = await services_client.post(
+        "/api/v1/services",
+        json={
+            "name": "registry-backed",
+            "registered_model_id": str(registered_model_id),
+            "dtype": "float16",
+            "replicas": 0,
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["registered_model_id"] == str(registered_model_id)
+    assert body["model"] == "org/registry-model"
+    assert body["model_revision"] == "registry-revision"
+    assert body["runtime"] == "vllm"
+    assert body["runtime_type"] == "docker"
+    assert body["image"] == f"docker.io/example/vllm@{DIGEST}"
+    assert body["gpu_count"] == 4
+    assert body["gpu_memory_mb"] == 40_960
+    assert body["gpu_model"] == "NVIDIA A100"
+    assert body["tensor_parallel_size"] == 4
+    assert body["dtype"] == "float16"
+    assert body["gpu_memory_utilization"] == 0.8
+    assert body["max_model_len"] == 16_384
+
+
+async def test_services_api_derives_fake_runtime_from_registered_model(
+    services_client: AsyncClient,
+    database: Database,
+) -> None:
+    async with database.session() as session, session.begin():
+        registered_model = await RegisteredModelRepository.create(
+            session,
+            project_id=PROJECT_ID,
+            name="registry-fake",
+            provider="local",
+            source="fake/registry-model",
+            revision=None,
+            runtime="fake",
+            default_gpu_count=0,
+            runtime_defaults={"tensor_parallel_size": 1},
+            size_bytes=None,
+            gpu_memory_mb=None,
+            architecture=None,
+            metadata={},
+            created_by_user_id=None,
+        )
+        registered_model_id = registered_model.id
+
+    response = await services_client.post(
+        "/api/v1/services",
+        json={
+            "name": "registry-fake-service",
+            "registered_model_id": str(registered_model_id),
+            "replicas": 0,
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["runtime"] == "fake"
+    assert body["runtime_type"] == "fake"
+    assert body["image"] is None
+    assert body["gpu_count"] == 0
+    assert body["tensor_parallel_size"] == 1
+
+
+async def test_registered_model_delete_keeps_service_snapshot_and_clears_fk(
+    services_client: AsyncClient,
+    database: Database,
+) -> None:
+    registered_model_id = await _create_registered_model(database)
+    created = await services_client.post(
+        "/api/v1/services",
+        json={
+            "name": "durable-snapshot",
+            "registered_model_id": str(registered_model_id),
+            "replicas": 0,
+        },
+    )
+    assert created.status_code == 201
+    service_id = created.json()["id"]
+
+    async with database.session() as session, session.begin():
+        deleted = await RegisteredModelRepository.delete(
+            session,
+            project_id=PROJECT_ID,
+            model_id=registered_model_id,
+        )
+    assert deleted is True
+
+    fetched = await services_client.get(f"/api/v1/services/{service_id}")
+    assert fetched.status_code == 200
+    body = fetched.json()
+    assert body["registered_model_id"] is None
+    assert body["model"] == "org/registry-model"
+    assert body["model_revision"] == "registry-revision"
+    assert body["gpu_count"] == 4
+
+
+async def test_services_api_hides_missing_and_cross_project_registered_models(
+    services_client: AsyncClient,
+    database: Database,
+) -> None:
+    async with database.session() as session, session.begin():
+        session.add(
+            Project(
+                id=OTHER_PROJECT_ID,
+                name="Other API Services",
+                slug="other-api-services",
+            )
+        )
+    cross_project_model_id = await _create_registered_model(
+        database,
+        project_id=OTHER_PROJECT_ID,
+    )
+
+    for registered_model_id in (cross_project_model_id, uuid.uuid4()):
+        response = await services_client.post(
+            "/api/v1/services",
+            json={
+                "name": f"hidden-{registered_model_id.hex[:8]}",
+                "registered_model_id": str(registered_model_id),
+            },
+        )
+
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "MODEL_NOT_FOUND"
+
+
+async def test_services_api_applies_image_policy_to_vllm_fallback(
+    services_client: AsyncClient,
+    services_settings: Settings,
+    database: Database,
+) -> None:
+    registered_model_id = await _create_registered_model(database)
+    services_settings.vllm_image = "example/vllm:test"
+
+    response = await services_client.post(
+        "/api/v1/services",
+        json={
+            "name": "unpinned-fallback",
+            "registered_model_id": str(registered_model_id),
+            "replicas": 0,
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "IMAGE_POLICY_DENIED"
+    assert response.json()["error"]["details"]["reason"] == "digest_required"
 
 
 async def test_services_api_rejects_unpinned_or_unallowed_images(
