@@ -103,12 +103,6 @@ def create_app(
         interval_seconds=resolved_settings.service_health_interval,
         batch_size=resolved_settings.batch_size,
     )
-    service_autoscaler = ServiceAutoscaler(
-        resolved_database,
-        gateway_metrics,
-        batch_size=resolved_settings.batch_size,
-        scale_to_zero_enabled=resolved_settings.service_scale_to_zero_enabled,
-    )
     cleanup = CleanupController(resolved_database, resolved_queue, resolved_settings)
     controllers = [
         ControllerSpec(
@@ -120,11 +114,6 @@ def create_app(
             "service-health",
             service_health.run_once,
             resolved_settings.service_health_interval,
-        ),
-        ControllerSpec(
-            "service-autoscaler",
-            service_autoscaler.run_once,
-            resolved_settings.service_autoscale_interval,
         ),
         ControllerSpec(
             "cleanup",
@@ -221,6 +210,21 @@ def create_app(
                 startup=kubernetes_replica_runtime.startup,
             )
         )
+    service_autoscaler = ServiceAutoscaler(
+        resolved_database,
+        gateway_metrics,
+        batch_size=resolved_settings.batch_size,
+        scale_to_zero_enabled=resolved_settings.service_scale_to_zero_enabled,
+        kubernetes_runtime=kubernetes_replica_runtime,
+    )
+    controllers.insert(
+        2,
+        ControllerSpec(
+            "service-autoscaler",
+            service_autoscaler.run_once,
+            resolved_settings.service_autoscale_interval,
+        ),
+    )
     if resolved_settings.scheduler_mode == "global":
         global_scheduler = GlobalScheduler(
             resolved_database.session_factory,

@@ -931,7 +931,11 @@ class KubernetesReplicaRuntimeController:
                 # service desires zero replicas; lease renewal below remains the
                 # ownership check and will report a real fence loss.
                 return "healthy" if accepted else "unchanged"
-            accepted = await self._publish_ready(claim, endpoint_url)
+            accepted = await self._publish_ready(
+                claim,
+                endpoint_url,
+                state.image_digest or item.handle.image_digest,
+            )
             if accepted:
                 item.published = True
                 return "ready"
@@ -1092,7 +1096,12 @@ class KubernetesReplicaRuntimeController:
                 worker_session_id=self.worker_session_id,
             )
 
-    async def _publish_ready(self, claim: KubernetesReplicaClaim, endpoint_url: str) -> bool:
+    async def _publish_ready(
+        self,
+        claim: KubernetesReplicaClaim,
+        endpoint_url: str,
+        image_digest: str | None,
+    ) -> bool:
         async with self.database.session() as session, session.begin():
             accepted = await ServiceRepository.mark_replica_running(
                 session,
@@ -1100,6 +1109,7 @@ class KubernetesReplicaRuntimeController:
                 generation=claim.generation,
                 execution_id=claim.execution_id,
                 endpoint_url=endpoint_url,
+                image_digest=image_digest,
                 worker_id=self.worker_id,
                 worker_session_id=self.worker_session_id,
             )

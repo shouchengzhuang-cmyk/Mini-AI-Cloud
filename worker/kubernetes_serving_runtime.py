@@ -95,6 +95,7 @@ class KubernetesServingState:
     reason: str | None
     message: str | None
     endpoint_url: str | None
+    image_digest: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,6 +338,7 @@ class KubernetesServingRuntimeAdapter:
             reason=reason,
             message=_bounded(message),
             endpoint_url=handle.endpoint_url if not service_missing else None,
+            image_digest=_pod_image_digest(status),
         )
 
     async def request_stop(self, handle: KubernetesServingHandle) -> None:

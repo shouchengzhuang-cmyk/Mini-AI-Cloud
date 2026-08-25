@@ -204,6 +204,7 @@ def _state(
     oom_killed: bool = False,
     reason: str | None = None,
     endpoint_url: str | None = None,
+    image_digest: str | None = None,
 ) -> KubernetesServingState:
     return KubernetesServingState(
         phase=phase,
@@ -216,6 +217,7 @@ def _state(
         reason=reason,
         message=None,
         endpoint_url=endpoint_url,
+        image_digest=image_digest,
     )
 
 
@@ -447,6 +449,7 @@ async def test_pod_ready_is_required_before_replica_becomes_healthy(
         assert replica.status == ReplicaStatus.LOADING
         assert replica.health == ReplicaHealth.UNKNOWN
         assert replica.endpoint_url is not None
+        assert replica.image_digest is None
         assert replica.ready_at is None
 
         handle = next(iter(runtime.handles.values()))
@@ -455,12 +458,14 @@ async def test_pod_ready_is_required_before_replica_becomes_healthy(
             running=True,
             ready=True,
             endpoint_url=handle.endpoint_url,
+            image_digest=f"sha256:{'a' * 64}",
         )
         ready = await controller.run_once()
         assert ready.ready == 1
         replica = (await _replicas(kubernetes_controller_database, service_id))[0]
         assert replica.status == ReplicaStatus.RUNNING
         assert replica.health == ReplicaHealth.HEALTHY
+        assert replica.image_digest == f"sha256:{'a' * 64}"
         assert replica.ready_at is not None
     finally:
         await controller.close()

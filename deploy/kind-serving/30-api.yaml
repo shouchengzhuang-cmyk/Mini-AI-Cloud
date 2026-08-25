@@ -50,6 +50,8 @@ spec:
               value: "8000"
             - name: LOG_LEVEL
               value: INFO
+            - name: ARTIFACT_LOCAL_ROOT
+              value: /tmp/mini-ai-cloud/artifacts
             - name: CONTROL_PLANE_ENABLED
               value: "true"
             - name: LEGACY_ANONYMOUS_ENABLED

@@ -405,6 +405,7 @@ async def test_start_and_inspect_publish_only_ready_non_deleting_service() -> No
     assert state.missing is False
     assert state.deleting is False
     assert state.endpoint_url == handle.endpoint_url
+    assert state.image_digest == f"sha256:{'a' * 64}"
     assert state.reason is None
 
     service.metadata.deletion_timestamp = "terminating"

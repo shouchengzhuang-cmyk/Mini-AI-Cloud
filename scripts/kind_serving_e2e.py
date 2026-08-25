@@ -364,9 +364,20 @@ async def _run_serving_scenario(
             service_id=service_id,
             image=image,
         )
+        for row in _ready_rows(replicas):
+            digest = row.get("image_digest")
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 71
+                or not digest.startswith("sha256:")
+                or any(character not in "0123456789abcdef" for character in digest[7:])
+            ):
+                raise KindServingE2EError(
+                    "ready Kubernetes Replica did not persist its resolved image digest"
+                )
         if len(kube.serving_services(service_id)) != 2:
             raise KindServingE2EError("expected one Kubernetes Service per ready Replica")
-        print("PASS: two real Kubernetes serving Pods reached ready and healthy")
+        print("PASS: two real Kubernetes serving Pods reached ready with resolved image digests")
 
         models = await api.json("GET", "/v1/models")
         model_rows = models.get("data")
