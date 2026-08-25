@@ -393,7 +393,14 @@ async def _run_serving_scenario(
         victim_replica_id = _required_label(victim_labels, REPLICA_ID_LABEL)
         victim_execution_id = _required_label(victim_labels, EXECUTION_ID_LABEL)
         kube.delete_pod(victim_name)
-        _, replacements, _ = await _wait_service_ready(api, service_id, 2, timeout_seconds=90)
+        replacements = await _wait_replacement_ready(
+            api,
+            service_id,
+            victim_replica_id=victim_replica_id,
+            previous_ready_ids=old_ready_ids,
+            expected=2,
+            timeout_seconds=90,
+        )
         replacement_pods = await _wait_pods(
             kube, service_id, expected=2, ready=True, timeout_seconds=60
         )
@@ -539,6 +546,42 @@ async def _wait_pods(
     ]
     raise KindServingE2EError(
         f"expected {expected} serving Pods (ready={ready}); observed {states}"
+    )
+
+
+async def _wait_replacement_ready(
+    api: API,
+    service_id: str,
+    *,
+    victim_replica_id: str,
+    previous_ready_ids: set[str],
+    expected: int,
+    timeout_seconds: float,
+) -> list[dict[str, Any]]:
+    """Wait past the transient DB snapshot that still reports the deleted Pod ready."""
+
+    deadline = time.monotonic() + timeout_seconds
+    last_summary = "unavailable"
+    while time.monotonic() < deadline:
+        service = await api.json("GET", f"/api/v1/services/{service_id}")
+        replica_document = await api.json("GET", f"/api/v1/services/{service_id}/replicas")
+        replicas = _object_items(replica_document)
+        ready_ids = {_required_string(row, "id") for row in _ready_rows(replicas)}
+        last_summary = (
+            f"healthy={service.get('healthy_replicas')}, ready_ids={sorted(ready_ids)}, "
+            f"victim={victim_replica_id}"
+        )
+        if (
+            service.get("desired_replicas") == expected
+            and service.get("healthy_replicas") == expected
+            and len(ready_ids) == expected
+            and victim_replica_id not in ready_ids
+            and ready_ids != previous_ready_ids
+        ):
+            return replicas
+        await asyncio.sleep(0.25)
+    raise KindServingE2EError(
+        f"deleted Pod did not converge to a replacement Replica ({last_summary})"
     )
 
 
