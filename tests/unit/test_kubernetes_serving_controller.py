@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
@@ -15,6 +16,7 @@ from sqlalchemy.dialects import postgresql
 from api.services.kubernetes_replica_runtime import (
     KubernetesReplicaRuntimeController,
     StaleKubernetesServingController,
+    _as_utc,
     _pod_metric_state,
 )
 from core.database import Database
@@ -690,6 +692,86 @@ async def test_startup_adopts_existing_execution_and_close_preserves_it(
     assert replica.status == ReplicaStatus.RUNNING
     await replacement.close()
     assert runtime.force_cleaned == []
+
+
+async def test_restart_rebuilds_startup_deadline_from_execution_claim_time(
+    kubernetes_controller_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service_id = await _create_service(kubernetes_controller_database)
+    stale_created_at = datetime.now(UTC) - timedelta(minutes=5)
+    async with kubernetes_controller_database.session() as session, session.begin():
+        replica = (await ServiceRepository.list_replicas(session, service_id, for_update=True))[0]
+        replica.created_at = stale_created_at
+        replica.updated_at = stale_created_at
+
+    runtime = _Runtime()
+    first = _controller(
+        kubernetes_controller_database,
+        runtime,
+        startup_timeout_seconds=120,
+        lease_seconds=300,
+    )
+    await first.startup()
+    claims, _waiting_backoff = await first._claim_pending_replicas()
+    assert len(claims) == 1
+
+    original_start = runtime.start
+
+    async def delayed_start(handle: KubernetesServingHandle) -> KubernetesServingHandle:
+        await asyncio.sleep(0.05)
+        return await original_start(handle)
+
+    monkeypatch.setattr(runtime, "start", delayed_start)
+
+    async def interrupt_before_publish(
+        _claim: object,
+        _endpoint_url: str,
+    ) -> bool:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(first, "_publish_loading", interrupt_before_publish)
+    with pytest.raises(asyncio.CancelledError):
+        await first._launch(claims[0])
+
+    claimed = (await _replicas(kubernetes_controller_database, service_id))[0]
+    assert claimed.status == ReplicaStatus.STARTING
+    assert claimed.started_at is not None
+    assert _as_utc(claimed.started_at) > stale_created_at + timedelta(minutes=4)
+    claim_started_at = _as_utc(claimed.started_at)
+    assert first._handles[claimed.id].startup_deadline == claim_started_at + timedelta(seconds=120)
+    await first.close()
+
+    async with kubernetes_controller_database.session() as session, session.begin():
+        legacy = (await ServiceRepository.list_replicas(session, service_id, for_update=True))[0]
+        legacy.started_at = None
+        legacy.updated_at = claim_started_at
+
+    runtime.closed = False
+    replacement = _controller(
+        kubernetes_controller_database,
+        runtime,
+        worker_id=first.worker_id,
+        startup_timeout_seconds=120,
+        lease_seconds=300,
+    )
+    startup = await replacement.startup()
+
+    assert startup.recovered == 1
+    item = replacement._handles[claimed.id]
+    assert item.startup_deadline == claim_started_at + timedelta(seconds=120)
+    assert item.startup_deadline > datetime.now(UTC)
+    persisted = (await _replicas(kubernetes_controller_database, service_id))[0]
+    assert persisted.started_at is not None
+    assert _as_utc(persisted.started_at) == claim_started_at
+    cycle = await replacement.run_once()
+    assert cycle.failed == 0
+    recovered = (await _replicas(kubernetes_controller_database, service_id))[0]
+    assert recovered.status == ReplicaStatus.LOADING
+    assert recovered.started_at is not None
+    assert _as_utc(recovered.started_at) == claim_started_at
+    assert runtime.force_cleaned == []
+    await replacement.close()
 
 
 async def test_recovery_quarantines_identity_proven_drift_without_loss_or_replacement(

@@ -668,6 +668,7 @@ class ServiceRepository:
             or (replica.worker_id is not None and replica.worker_id != worker_id)
         ):
             return False
+        first_claim = replica.execution_id is None
         now = await database_utcnow(session)
         if lease_expires_at.tzinfo is None:
             raise ValueError("lease_expires_at must include a timezone")
@@ -685,6 +686,8 @@ class ServiceRepository:
         replica.drain_deadline = None
         replica.error_code = None
         replica.error_message = None
+        if first_claim:
+            replica.started_at = now
         replica.updated_at = now
         replica.version += 1
         return True

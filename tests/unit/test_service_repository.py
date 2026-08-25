@@ -483,6 +483,26 @@ async def test_replica_loading_and_fenced_request_drain_lifecycle(
             execution_id=execution_id,
             lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
         )
+        claim_started_at = replica.started_at
+        assert claim_started_at is not None
+        assert await ServiceRepository.bind_replica_execution(
+            session,
+            replica_id=replica.id,
+            generation=replica.generation,
+            worker_id="worker-drain",
+            execution_id=execution_id,
+            lease_expires_at=datetime.now(UTC) + timedelta(minutes=2),
+        )
+        assert replica.started_at == claim_started_at
+        assert await ServiceRepository.renew_replica_lease(
+            session,
+            replica_id=replica.id,
+            generation=replica.generation,
+            execution_id=execution_id,
+            worker_id="worker-drain",
+            lease_expires_at=datetime.now(UTC) + timedelta(minutes=3),
+        )
+        assert replica.started_at == claim_started_at
         assert await ServiceRepository.mark_replica_loading(
             session,
             replica_id=replica.id,

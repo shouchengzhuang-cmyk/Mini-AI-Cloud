@@ -96,6 +96,7 @@ class KubernetesReplicaClaim:
     model: str
     cpu_millicores: int
     memory_mb: int
+    claimed_at: datetime
     replacement_reason: str | None = None
 
 
@@ -490,7 +491,12 @@ class KubernetesReplicaRuntimeController:
         handles = list(await self.runtime.list_managed(worker_id=self.worker_id))
         conflicts = tuple(getattr(self.runtime, "recovery_conflicts", ()))
         self._record_recovery_conflicts(conflicts)
-        async with self.database.session() as session:
+        async with self.database.session() as session, session.begin():
+            worker = await session.get(Worker, self.worker_id, with_for_update=True)
+            if worker is None or worker.worker_session_id != self.worker_session_id:
+                raise StaleKubernetesServingController(
+                    "Worker session changed during Kubernetes serving recovery"
+                )
             rows = list(
                 await session.execute(
                     select(ServiceReplica, ModelService)
@@ -502,8 +508,14 @@ class KubernetesReplicaRuntimeController:
                         ServiceReplica.execution_id.is_not(None),
                         ServiceReplica.status.in_(_ACTIVE_RUNTIME_STATUSES),
                     )
+                    .with_for_update()
                 )
             )
+            for replica, _service in rows:
+                if replica.status == ReplicaStatus.STARTING and replica.started_at is None:
+                    # Persist the best available claim-time approximation for
+                    # pre-upgrade rows before lease renewal advances updated_at.
+                    replica.started_at = replica.updated_at
         replicas_by_execution = {
             replica.execution_id: (replica, service)
             for replica, service in rows
@@ -564,6 +576,7 @@ class KubernetesReplicaRuntimeController:
                         model=service.model,
                         cpu_millicores=service.cpu_millicores,
                         memory_mb=service.memory_mb,
+                        claimed_at=_replica_claimed_at(replica),
                     ),
                     status=ReplicaStatus.FAILED,
                     error_code=ErrorCode.CONTAINER_START_FAILED.value,
@@ -572,12 +585,10 @@ class KubernetesReplicaRuntimeController:
                 )
                 orphans_cleaned += 1
                 continue
-            base_time = replica.container_started_at or replica.started_at or replica.created_at
             item = _ManagedReplica(
                 claim=claim,
                 handle=handle,
-                startup_deadline=_as_utc(base_time)
-                + timedelta(seconds=self.startup_timeout_seconds),
+                startup_deadline=claim.claimed_at + timedelta(seconds=self.startup_timeout_seconds),
                 # DRAINING is entered from RUNNING and intentionally retains
                 # its endpoint while active requests finish. Treat it as an
                 # already-published replica so recovery cannot attempt a second
@@ -610,6 +621,7 @@ class KubernetesReplicaRuntimeController:
                     model=service.model,
                     cpu_millicores=service.cpu_millicores,
                     memory_mb=service.memory_mb,
+                    claimed_at=_replica_claimed_at(replica),
                 )
             terminal_status = (
                 ReplicaStatus.STOPPED
@@ -725,6 +737,7 @@ class KubernetesReplicaRuntimeController:
                         lease_expires_at=lease_expires_at,
                     )
                     if accepted:
+                        assert replica.started_at is not None
                         claims.append(
                             KubernetesReplicaClaim(
                                 service_id=service.id,
@@ -736,6 +749,7 @@ class KubernetesReplicaRuntimeController:
                                 model=service.model,
                                 cpu_millicores=service.cpu_millicores,
                                 memory_mb=service.memory_mb,
+                                claimed_at=_as_utc(replica.started_at),
                                 replacement_reason=_replacement_metric_reason(service, replica),
                             )
                         )
@@ -764,8 +778,7 @@ class KubernetesReplicaRuntimeController:
             item = _ManagedReplica(
                 claim=claim,
                 handle=handle,
-                startup_deadline=datetime.now(UTC)
-                + timedelta(seconds=self.startup_timeout_seconds),
+                startup_deadline=claim.claimed_at + timedelta(seconds=self.startup_timeout_seconds),
             )
             self._handles[claim.replica_id] = item
             endpoint_url = handle.endpoint_url
@@ -1225,7 +1238,16 @@ def _claim_from_models(
         model=service.model,
         cpu_millicores=service.cpu_millicores,
         memory_mb=service.memory_mb,
+        claimed_at=_replica_claimed_at(replica),
     )
+
+
+def _replica_claimed_at(replica: ServiceReplica) -> datetime:
+    if replica.started_at is not None:
+        return _as_utc(replica.started_at)
+    if replica.status == ReplicaStatus.STARTING:
+        return _as_utc(replica.updated_at)
+    return _as_utc(replica.container_started_at or replica.created_at)
 
 
 def _stable_worker_id(cluster_id: str) -> str:

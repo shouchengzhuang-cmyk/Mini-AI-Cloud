@@ -312,6 +312,28 @@ async def test_services_api_preserves_explicit_kubernetes_backend_for_registered
     services_settings.kubernetes_serving_enabled = True
     services_settings.kubernetes_serving_fake_enabled = True
     services_settings.kubernetes_serving_image = f"example/vllm@{DIGEST}"
+    rejected_name = "registry-kubernetes-positive"
+    rejected = await services_client.post(
+        "/api/v1/services",
+        json={
+            "name": rejected_name,
+            "registered_model_id": str(registered_model_id),
+            "runtime_type": "kubernetes",
+            "replicas": 1,
+        },
+    )
+    assert rejected.status_code == 409
+    assert rejected.json()["error"]["code"] == "KUBERNETES_SERVING_RUNTIME_UNAVAILABLE"
+    async with database.session() as session:
+        assert (
+            await ServiceRepository.get_by_name(
+                session,
+                project_id=PROJECT_ID,
+                name=rejected_name,
+            )
+            is None
+        )
+
     response = await services_client.post(
         "/api/v1/services",
         json={
@@ -467,6 +489,19 @@ async def test_kubernetes_positive_scale_rejects_when_control_plane_was_not_star
         transport=ASGITransport(app=app),
         base_url="http://testserver",
     ) as client:
+        rejected_name = "kubernetes-positive-control-plane-not-started"
+        rejected_create = await client.post(
+            "/api/v1/services",
+            json={
+                "name": rejected_name,
+                "model": "fake/kubernetes-positive-control-plane-not-started",
+                "runtime": "fake",
+                "runtime_type": "kubernetes",
+                "replicas": 1,
+            },
+        )
+        assert rejected_create.status_code == 409
+        assert rejected_create.json()["error"]["code"] == "KUBERNETES_SERVING_RUNTIME_UNAVAILABLE"
         created = await client.post(
             "/api/v1/services",
             json={
@@ -487,8 +522,14 @@ async def test_kubernetes_positive_scale_rejects_when_control_plane_was_not_star
     assert rejected.status_code == 409
     assert rejected.json()["error"]["code"] == "KUBERNETES_SERVING_RUNTIME_UNAVAILABLE"
     async with database.session() as session:
+        rejected_service = await ServiceRepository.get_by_name(
+            session,
+            project_id=PROJECT_ID,
+            name=rejected_name,
+        )
         service = await ServiceRepository.get(session, uuid.UUID(service_id))
         replicas = await ServiceRepository.list_replicas(session, uuid.UUID(service_id))
+    assert rejected_service is None
     assert service is not None and service.desired_replicas == 0
     assert replicas == []
 

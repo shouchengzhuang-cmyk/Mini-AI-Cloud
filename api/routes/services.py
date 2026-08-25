@@ -36,13 +36,12 @@ router = APIRouter(prefix="/api/v1/services", tags=["services"])
 @router.post("", response_model=ServiceResponse, status_code=status.HTTP_201_CREATED)
 async def create_service(
     payload: ServiceCreate,
+    request: Request,
     database: Annotated[Database, Depends(get_database)],
     settings: Annotated[Settings, Depends(get_app_settings)],
     principal: Annotated[Principal, Depends(require_api_permission(Permission.MODEL_MANAGE))],
 ) -> ServiceResponse:
     project_id = _principal_project_id(principal)
-    if payload.registered_model_id is None:
-        _validate_runtime_availability(payload, settings)
     try:
         async with database.session() as session, session.begin():
             if payload.registered_model_id is not None:
@@ -54,7 +53,16 @@ async def create_service(
                 if registered_model is None:
                     raise NotFoundError("MODEL_NOT_FOUND", "Registered model not found")
                 payload = _resolve_registered_model(payload, registered_model)
-                _validate_runtime_availability(payload, settings)
+
+            _validate_runtime_availability(
+                payload,
+                settings,
+                runtime_controller=getattr(
+                    request.app.state,
+                    "kubernetes_replica_runtime",
+                    None,
+                ),
+            )
 
             image = payload.image
             if image is None and payload.runtime == ServingRuntime.VLLM:
@@ -298,10 +306,20 @@ def _principal_project_id(principal: Principal) -> uuid.UUID:
     return principal.project_id
 
 
-def _validate_runtime_availability(payload: ServiceCreate, settings: Settings) -> None:
+def _validate_runtime_availability(
+    payload: ServiceCreate,
+    settings: Settings,
+    *,
+    runtime_controller: object | None,
+) -> None:
     if payload.runtime_type != RuntimeType.KUBERNETES:
         return
     _validate_kubernetes_runtime_configuration(payload.runtime, settings)
+    _validate_kubernetes_runtime_admission(
+        desired_replicas=payload.replicas,
+        settings=settings,
+        runtime_controller=runtime_controller,
+    )
 
 
 def _validate_kubernetes_runtime_configuration(
@@ -340,6 +358,21 @@ def _validate_scale_runtime_availability(
     if desired_replicas == 0 or service.runtime_type != RuntimeType.KUBERNETES:
         return
     _validate_kubernetes_runtime_configuration(service.runtime, settings)
+    _validate_kubernetes_runtime_admission(
+        desired_replicas=desired_replicas,
+        settings=settings,
+        runtime_controller=runtime_controller,
+    )
+
+
+def _validate_kubernetes_runtime_admission(
+    *,
+    desired_replicas: int,
+    settings: Settings,
+    runtime_controller: object | None,
+) -> None:
+    if desired_replicas == 0:
+        return
     runtime_admission_ready = (
         runtime_controller is not None
         and getattr(runtime_controller, "admission_ready", False) is True
