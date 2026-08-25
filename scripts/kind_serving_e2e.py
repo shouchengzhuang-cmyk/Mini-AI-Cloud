@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 from collections.abc import AsyncIterator, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -374,16 +374,19 @@ async def _run_serving_scenario(
             row.get("id") for row in model_rows if isinstance(row, dict)
         }:
             raise KindServingE2EError("/v1/models omitted the Kubernetes-backed service")
+        initial_ready_ids = {_required_string(row, "id") for row in _ready_rows(replicas)}
         first_body, first_replica = await api.chat(service_name, "first Kind request")
         second_body, second_replica = await api.chat(service_name, "second Kind request")
-        if first_replica == second_replica:
-            raise KindServingE2EError("two ready replicas did not round-robin")
+        if {first_replica, second_replica} != initial_ready_ids:
+            raise KindServingE2EError(
+                "round-robin did not route exactly once to each ready Replica"
+            )
         _assert_chat_body(first_body)
         _assert_chat_body(second_body)
         await _assert_sse(api, service_name)
         print("PASS: Gateway completed /v1/models, JSON, SSE, and round-robin inference")
 
-        old_ready_ids = {_required_string(row, "id") for row in _ready_rows(replicas)}
+        old_ready_ids = initial_ready_ids
         victim = pods[0]
         victim_name = _metadata_name(victim)
         victim_labels = _labels(victim)
@@ -583,6 +586,7 @@ async def _assert_scale_down_drain(
     ready = sorted(_ready_rows(replicas), key=lambda row: int(row.get("ordinal", -1)))
     if len(ready) != 4:
         raise KindServingE2EError("drain test requires four ready Replica records")
+    expected_survivor_id = _required_string(ready[0], "id")
     target_id = _required_string(ready[-1], "id")
     sequence: list[str] = []
     for index in range(4):
@@ -647,8 +651,14 @@ async def _assert_scale_down_drain(
     body = b"".join(chunks)
     if not body.endswith(b"data: [DONE]\n\n"):
         raise KindServingE2EError("active SSE request did not complete during normal drain")
-    await _wait_service_ready(api, service_id, 1, timeout_seconds=60)
-    await _wait_pods(kube, service_id, expected=1, ready=True, timeout_seconds=60)
+    _, final_replicas, _ = await _wait_service_ready(api, service_id, 1, timeout_seconds=60)
+    final_pods = await _wait_pods(kube, service_id, expected=1, ready=True, timeout_seconds=60)
+    final_ready_ids = {_required_string(row, "id") for row in _ready_rows(final_replicas)}
+    final_pod_replica_id = _required_label(_labels(final_pods[0]), REPLICA_ID_LABEL)
+    if final_ready_ids != {expected_survivor_id} or final_pod_replica_id != expected_survivor_id:
+        raise KindServingE2EError("scale-down did not retain the expected healthy Replica")
+    if len(kube.serving_services(service_id)) != 1:
+        raise KindServingE2EError("scale-down left duplicate per-Replica Services")
 
 
 async def _wait_replica_status(
@@ -718,7 +728,7 @@ async def _assert_bad_image_backoff(
     for row in failed:
         code = row.get("error_code")
         message = row.get("error_message")
-        if code not in {"IMAGE_PULL_FAILED", "MODEL_LOAD_FAILED", "MODEL_LOAD_TIMEOUT"}:
+        if code != "IMAGE_PULL_FAILED":
             raise KindServingE2EError(f"bad-image Replica persisted unexpected code {code!r}")
         if not isinstance(message, str) or not message or len(message) > 4096:
             raise KindServingE2EError("bad-image Replica error message is missing or unbounded")
@@ -738,10 +748,31 @@ async def _assert_bad_image_backoff(
         raise KindServingE2EError("bad-image backoff has an invalid retry timestamp") from exc
     if retry_at is not None and retry_at.tzinfo is None:
         retry_at = retry_at.replace(tzinfo=UTC)
-    if retry_at is None or retry_at.astimezone(UTC) <= datetime.now(UTC):
+    now = datetime.now(UTC)
+    if retry_at is None or retry_at.astimezone(UTC) <= now:
         raise KindServingE2EError("bad-image backoff was not future-bounded when observed")
+    retry_at = retry_at.astimezone(UTC)
+    if retry_at > now + timedelta(seconds=10):
+        raise KindServingE2EError("bad-image backoff exceeded the bounded E2E retry window")
 
     failed_ids = {_required_string(row, "id") for row in failed}
+    initial_execution_ids = {
+        execution_id
+        for row in all_rows
+        if isinstance((execution_id := row.get("execution_id")), str)
+    }
+    while (retry_at - datetime.now(UTC)).total_seconds() > 0.1:
+        pre_retry_document = await api.json("GET", f"/api/v1/services/{service_id}/replicas")
+        pre_retry_rows = _object_items(pre_retry_document)
+        observed_execution_ids = {
+            execution_id
+            for row in pre_retry_rows
+            if isinstance((execution_id := row.get("execution_id")), str)
+        }
+        if not observed_execution_ids.issubset(initial_execution_ids):
+            raise KindServingE2EError("bad-image replacement launched before retry_not_before")
+        await asyncio.sleep(0.1)
+
     count_before = len(all_rows)
     replacement_deadline = time.monotonic() + 15
     replacement_seen = False
