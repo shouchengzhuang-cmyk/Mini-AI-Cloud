@@ -1,7 +1,7 @@
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
@@ -206,6 +206,7 @@ async def get_service(
 async def scale_service(
     service_id: uuid.UUID,
     payload: ServiceScale,
+    request: Request,
     database: Annotated[Database, Depends(get_database)],
     settings: Annotated[Settings, Depends(get_app_settings)],
     principal: Annotated[Principal, Depends(require_api_permission(Permission.MODEL_MANAGE))],
@@ -213,6 +214,24 @@ async def scale_service(
     project_id = _principal_project_id(principal)
     try:
         async with database.session() as session, session.begin():
+            existing = await ServiceRepository.get(
+                session,
+                service_id,
+                project_id=project_id,
+                for_update=True,
+            )
+            if existing is None:
+                raise NotFoundError("SERVICE_NOT_FOUND", "Service not found")
+            _validate_scale_runtime_availability(
+                existing,
+                desired_replicas=payload.replicas,
+                settings=settings,
+                runtime_controller=getattr(
+                    request.app.state,
+                    "kubernetes_replica_runtime",
+                    None,
+                ),
+            )
             service = await ServiceRepository.set_desired_replicas(
                 session,
                 service_id=service_id,
@@ -240,6 +259,7 @@ async def scale_service(
 @router.post("/{service_id}/stop", response_model=ServiceResponse)
 async def stop_service(
     service_id: uuid.UUID,
+    request: Request,
     database: Annotated[Database, Depends(get_database)],
     settings: Annotated[Settings, Depends(get_app_settings)],
     principal: Annotated[Principal, Depends(require_api_permission(Permission.MODEL_MANAGE))],
@@ -247,6 +267,7 @@ async def stop_service(
     return await scale_service(
         service_id,
         ServiceScale(replicas=0),
+        request,
         database,
         settings,
         principal,
@@ -280,7 +301,14 @@ def _principal_project_id(principal: Principal) -> uuid.UUID:
 def _validate_runtime_availability(payload: ServiceCreate, settings: Settings) -> None:
     if payload.runtime_type != RuntimeType.KUBERNETES:
         return
-    if payload.runtime != ServingRuntime.FAKE:
+    _validate_kubernetes_runtime_configuration(payload.runtime, settings)
+
+
+def _validate_kubernetes_runtime_configuration(
+    runtime: ServingRuntime,
+    settings: Settings,
+) -> None:
+    if runtime != ServingRuntime.FAKE:
         raise ConflictError(
             "KUBERNETES_SERVING_RUNTIME_UNSUPPORTED",
             "Phase IV-A supports Kubernetes-backed fake inference only",
@@ -299,6 +327,27 @@ def _validate_runtime_availability(payload: ServiceCreate, settings: Settings) -
         raise ConflictError(
             "KUBERNETES_FAKE_SERVING_DISABLED",
             "Kubernetes fake serving requires an explicit development/test opt-in",
+        )
+
+
+def _validate_scale_runtime_availability(
+    service: ModelService,
+    *,
+    desired_replicas: int,
+    settings: Settings,
+    runtime_controller: object | None,
+) -> None:
+    if desired_replicas == 0 or service.runtime_type != RuntimeType.KUBERNETES:
+        return
+    _validate_kubernetes_runtime_configuration(service.runtime, settings)
+    runtime_admission_ready = (
+        runtime_controller is not None
+        and getattr(runtime_controller, "admission_ready", False) is True
+    )
+    if not settings.control_plane_enabled or not runtime_admission_ready:
+        raise ConflictError(
+            "KUBERNETES_SERVING_RUNTIME_UNAVAILABLE",
+            "Kubernetes serving runtime is not available in this API process",
         )
 
 

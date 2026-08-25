@@ -182,25 +182,25 @@ SERVICE_REQUEST_DURATION = Histogram(
 )
 K8S_SERVING_PODS = Gauge(
     "k8s_serving_pods",
-    "Kubernetes serving Pods by bounded lifecycle state",
+    "Tracked Kubernetes serving Pods by bounded controller observation state",
     ("state",),
     registry=REGISTRY,
 )
 K8S_SERVING_LAUNCHES = Counter(
     "k8s_serving_launch_total",
-    "Kubernetes serving Pod launch outcomes",
+    "Initial Kubernetes serving execution launch-cycle outcomes",
     ("outcome",),
     registry=REGISTRY,
 )
 K8S_SERVING_LAUNCH_FAILURES = Counter(
     "k8s_serving_launch_failures_total",
-    "Kubernetes serving Pod launch failures by bounded reason",
+    "Kubernetes serving Pods that failed before first readiness by bounded reason",
     ("reason",),
     registry=REGISTRY,
 )
 K8S_SERVING_REPLACEMENTS = Counter(
     "k8s_serving_replacements_total",
-    "Kubernetes serving replica replacements by bounded reason",
+    "Kubernetes serving replacement execution claims by bounded reason",
     ("reason",),
     registry=REGISTRY,
 )

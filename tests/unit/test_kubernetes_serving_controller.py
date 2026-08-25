@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, cast
@@ -14,9 +15,11 @@ from sqlalchemy.dialects import postgresql
 from api.services.kubernetes_replica_runtime import (
     KubernetesReplicaRuntimeController,
     StaleKubernetesServingController,
+    _pod_metric_state,
 )
 from core.database import Database
 from core.enums import RuntimeType
+from core.metrics import K8S_SERVING_LAUNCH_FAILURES, K8S_SERVING_REPLACEMENTS
 from models.base import Base
 from models.identity import Project, User
 from models.outbox import OutboxEvent
@@ -47,6 +50,8 @@ from worker.kubernetes_serving_runtime import (
     WORKER_SESSION_ID_LABEL,
     KubernetesServingHandle,
     KubernetesServingLaunchSpec,
+    KubernetesServingOwnershipIdentity,
+    KubernetesServingRecoveryConflict,
     KubernetesServingState,
 )
 
@@ -105,6 +110,8 @@ class _Runtime:
         self.stop_requested: list[str] = []
         self.force_cleaned: list[str] = []
         self.inspect_hook: Callable[[], Awaitable[None]] | None = None
+        self.recovery_conflicts: Sequence[KubernetesServingRecoveryConflict] = ()
+        self.list_error: Exception | None = None
         self.closed = False
 
     async def version(self) -> str:
@@ -172,6 +179,8 @@ class _Runtime:
         self.states[handle.object_id] = _state(missing=True)
 
     async def list_managed(self, *, worker_id: str) -> Sequence[KubernetesServingHandle]:
+        if self.list_error is not None:
+            raise self.list_error
         return tuple(
             handle
             for handle in self.handles.values()
@@ -205,6 +214,19 @@ def _state(
         reason=reason,
         message=None,
         endpoint_url=endpoint_url,
+    )
+
+
+def _ownership(handle: KubernetesServingHandle) -> KubernetesServingOwnershipIdentity:
+    return KubernetesServingOwnershipIdentity(
+        service_id=uuid.UUID(handle.labels[SERVICE_ID_LABEL]),
+        replica_id=uuid.UUID(handle.labels[REPLICA_ID_LABEL]),
+        project_id=uuid.UUID(handle.labels[PROJECT_ID_LABEL]),
+        generation=int(handle.labels[GENERATION_LABEL]),
+        execution_id=uuid.UUID(handle.labels[EXECUTION_ID_LABEL]),
+        cluster_id=handle.labels[CLUSTER_ID_LABEL],
+        worker_id=handle.labels[WORKER_ID_LABEL],
+        worker_session_id=uuid.UUID(handle.labels[WORKER_SESSION_ID_LABEL]),
     )
 
 
@@ -330,6 +352,80 @@ def test_default_worker_id_is_stable_kubernetes_label_value() -> None:
     assert first.worker_id == second.worker_id
     assert first.worker_id != different.worker_id
     assert len(first.worker_id) <= 63
+
+
+def test_pod_metric_state_never_treats_unready_running_pod_as_ready() -> None:
+    assert _pod_metric_state(_state(phase="Running", running=True)) == "not_ready"
+    assert (
+        _pod_metric_state(
+            _state(
+                phase="Running",
+                running=True,
+                ready=True,
+                endpoint_url="http://replica.test.svc.cluster.local:8000",
+            )
+        )
+        == "ready"
+    )
+    assert (
+        _pod_metric_state(
+            _state(
+                phase="Running",
+                running=True,
+                ready=True,
+                deleting=True,
+            )
+        )
+        == "terminating"
+    )
+
+
+async def test_global_managed_resource_discovery_failure_aborts_recovery_cycle(
+    kubernetes_controller_database: Database,
+) -> None:
+    runtime = _Runtime()
+    runtime.list_error = TimeoutError("Kubernetes API unavailable")
+    controller = _controller(kubernetes_controller_database, runtime)
+    assert controller.admission_ready is False
+
+    with pytest.raises(TimeoutError, match="Kubernetes API unavailable"):
+        await controller.startup()
+
+    assert controller.active_pod_count == 0
+    assert controller._recovered is False
+    assert controller.admission_ready is False
+
+    runtime.list_error = None
+    await controller.startup()
+    assert controller.admission_ready is True
+    await controller.close()
+    assert controller.admission_ready is False
+
+
+async def test_admission_readiness_recovers_after_global_cycle_failure(
+    kubernetes_controller_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _Runtime()
+    controller = _controller(kubernetes_controller_database, runtime)
+    await controller.startup()
+    assert controller.admission_ready is True
+
+    original_heartbeat = controller._heartbeat_worker
+
+    async def fail_heartbeat() -> None:
+        raise TimeoutError("PostgreSQL heartbeat unavailable")
+
+    monkeypatch.setattr(controller, "_heartbeat_worker", fail_heartbeat)
+    with pytest.raises(TimeoutError, match="PostgreSQL heartbeat unavailable"):
+        await controller.run_once()
+    assert controller.admission_ready is False
+
+    monkeypatch.setattr(controller, "_heartbeat_worker", original_heartbeat)
+    await controller.run_once()
+    assert controller.admission_ready is True
+    await controller.close()
+    assert controller.admission_ready is False
 
 
 async def test_pod_ready_is_required_before_replica_becomes_healthy(
@@ -479,6 +575,7 @@ async def test_new_worker_session_fences_old_controller_without_deleting_pod(
     await controller.startup()
     await controller.run_once()
     assert runtime.handles
+    assert controller.admission_ready is True
 
     async with kubernetes_controller_database.session() as session, session.begin():
         await WorkerRepository.register(
@@ -500,6 +597,7 @@ async def test_new_worker_session_fences_old_controller_without_deleting_pod(
 
     with pytest.raises(StaleKubernetesServingController):
         await controller.run_once()
+    assert controller.admission_ready is False
     assert runtime.stop_requested == []
     assert runtime.force_cleaned == []
     await controller.close()
@@ -513,6 +611,7 @@ async def test_session_change_during_inspect_prevents_missing_pod_cleanup(
     controller = _controller(kubernetes_controller_database, runtime)
     await controller.startup()
     await controller.run_once()
+    assert controller.admission_ready is True
     handle = next(iter(runtime.handles.values()))
     runtime.states[handle.object_id] = _state(missing=True)
 
@@ -539,6 +638,7 @@ async def test_session_change_during_inspect_prevents_missing_pod_cleanup(
     result = await controller.run_once()
 
     assert result.stale == 1
+    assert controller.admission_ready is False
     assert runtime.force_cleaned == []
     replica = (await _replicas(kubernetes_controller_database, service_id))[0]
     assert replica.status == ReplicaStatus.LOADING
@@ -568,6 +668,14 @@ async def test_startup_adopts_existing_execution_and_close_preserves_it(
     assert runtime.force_cleaned == []
 
     runtime.closed = False
+    runtime.recovery_conflicts = (
+        KubernetesServingRecoveryConflict(
+            resource_kind="pod",
+            resource_name="drifted-pod",
+            reason="ownership_conflict",
+            message="workload contract mismatch",
+        ),
+    )
     replacement = _controller(
         kubernetes_controller_database,
         runtime,
@@ -575,12 +683,121 @@ async def test_startup_adopts_existing_execution_and_close_preserves_it(
     )
     startup = await replacement.startup()
     assert startup.recovered == 1
+    assert startup.recovery_conflicts == 1
     assert len(runtime.prepared) == 1
     replica = (await _replicas(kubernetes_controller_database, service_id))[0]
     assert replica.execution_id == original_execution
     assert replica.status == ReplicaStatus.RUNNING
     await replacement.close()
     assert runtime.force_cleaned == []
+
+
+async def test_recovery_quarantines_identity_proven_drift_without_loss_or_replacement(
+    kubernetes_controller_database: Database,
+) -> None:
+    service_id = await _create_service(kubernetes_controller_database, desired_replicas=3)
+    runtime = _Runtime()
+    first = _controller(kubernetes_controller_database, runtime)
+    await first.startup()
+    await first.run_once()
+    handles = list(runtime.handles.values())
+    assert len(handles) == 3
+    replicas_before = await _replicas(kubernetes_controller_database, service_id)
+    executions_before = {replica.id: replica.execution_id for replica in replicas_before}
+    await first.close()
+
+    drifted = handles[2]
+    runtime.handles.pop(drifted.object_id)
+    runtime.recovery_conflicts = (
+        KubernetesServingRecoveryConflict(
+            resource_kind="pod",
+            resource_name=drifted.object_id,
+            reason="ownership_conflict",
+            message="workload contract mismatch",
+            ownership=_ownership(drifted),
+        ),
+    )
+    runtime.closed = False
+    replacement = _controller(
+        kubernetes_controller_database,
+        runtime,
+        worker_id=first.worker_id,
+    )
+
+    startup = await replacement.startup()
+    cycle = await replacement.run_once()
+
+    assert startup.recovered == 2
+    assert startup.recovery_conflicts == 1
+    assert startup.orphans_cleaned == 0
+    assert cycle.claimed == 0
+    assert cycle.failed == 0
+    replicas_after = await _replicas(kubernetes_controller_database, service_id)
+    assert len(replicas_after) == 3
+    assert {replica.id: replica.execution_id for replica in replicas_after} == executions_before
+    assert all(
+        replica.status in {ReplicaStatus.STARTING, ReplicaStatus.LOADING, ReplicaStatus.RUNNING}
+        for replica in replicas_after
+    )
+    assert len(runtime.prepared) == 3
+    assert runtime.force_cleaned == []
+    assert runtime.stop_requested == []
+    await replacement.close()
+
+
+async def test_restart_missing_pre_ready_counts_launch_failure_but_running_does_not(
+    kubernetes_controller_database: Database,
+) -> None:
+    service_id = await _create_service(kubernetes_controller_database, desired_replicas=3)
+    runtime = _Runtime()
+    first = _controller(kubernetes_controller_database, runtime)
+    await first.startup()
+    await first.run_once()
+    handles = list(runtime.handles.values())
+    runtime.states[handles[0].object_id] = _state(
+        phase="Running",
+        running=True,
+        ready=True,
+        endpoint_url=handles[0].endpoint_url,
+    )
+    await first.run_once()
+    async with kubernetes_controller_database.session() as session, session.begin():
+        replicas = await ServiceRepository.list_replicas(
+            session,
+            service_id,
+            for_update=True,
+        )
+        loading = next(replica for replica in replicas if replica.status == ReplicaStatus.LOADING)
+        loading.status = ReplicaStatus.STARTING
+    replicas_before = await _replicas(kubernetes_controller_database, service_id)
+    assert {replica.status for replica in replicas_before} == {
+        ReplicaStatus.STARTING,
+        ReplicaStatus.LOADING,
+        ReplicaStatus.RUNNING,
+    }
+    await first.close()
+
+    runtime.handles.clear()
+    runtime.closed = False
+    launch_failures_before = K8S_SERVING_LAUNCH_FAILURES.labels(reason="pod_missing")._value.get()
+    replacement = _controller(
+        kubernetes_controller_database,
+        runtime,
+        worker_id=first.worker_id,
+    )
+
+    startup = await replacement.startup()
+
+    assert startup.recovered == 0
+    assert (
+        K8S_SERVING_LAUNCH_FAILURES.labels(reason="pod_missing")._value.get()
+        == launch_failures_before + 2
+    )
+    replicas_after = await _replicas(kubernetes_controller_database, service_id)
+    assert len(replicas_after) == 3
+    assert all(replica.status == ReplicaStatus.LOST for replica in replicas_after)
+    assert len(runtime.prepared) == 3
+    await replacement.close()
 
 
 async def test_restart_adopts_draining_replica_without_deleting_active_request(
@@ -660,10 +877,15 @@ async def test_missing_pod_is_fenced_and_backoff_blocks_fast_relaunch(
     )
     await controller.run_once()
 
+    launch_failures_before = K8S_SERVING_LAUNCH_FAILURES.labels(reason="pod_missing")._value.get()
     runtime.states[handle.object_id] = _state(missing=True)
     failed = await controller.run_once()
     assert failed.failed == 1
     assert runtime.force_cleaned == [handle.object_id]
+    assert (
+        K8S_SERVING_LAUNCH_FAILURES.labels(reason="pod_missing")._value.get()
+        == launch_failures_before
+    )
     replicas = await _replicas(kubernetes_controller_database, service_id)
     assert replicas[0].status == ReplicaStatus.LOST
 
@@ -687,6 +909,9 @@ async def test_image_pull_and_oom_are_persisted_as_bounded_failures(
     await controller.startup()
     await controller.run_once()
     handles = list(runtime.handles.values())
+    image_failures_before = K8S_SERVING_LAUNCH_FAILURES.labels(reason="image_pull")._value.get()
+    oom_failures_before = K8S_SERVING_LAUNCH_FAILURES.labels(reason="oom")._value.get()
+    replacements_before = K8S_SERVING_REPLACEMENTS.labels(reason="failure_backoff")._value.get()
     runtime.states[handles[0].object_id] = _state(
         phase="Pending",
         reason="ImagePullBackOff",
@@ -699,6 +924,15 @@ async def test_image_pull_and_oom_are_persisted_as_bounded_failures(
     )
     result = await controller.run_once()
     assert result.failed == 2
+    assert (
+        K8S_SERVING_LAUNCH_FAILURES.labels(reason="image_pull")._value.get()
+        == image_failures_before + 1
+    )
+    assert K8S_SERVING_LAUNCH_FAILURES.labels(reason="oom")._value.get() == oom_failures_before + 1
+    assert (
+        K8S_SERVING_REPLACEMENTS.labels(reason="failure_backoff")._value.get()
+        == replacements_before
+    )
     replicas = await _replicas(kubernetes_controller_database, service_id)
     assert {replica.error_code for replica in replicas} == {
         "IMAGE_PULL_FAILED",
@@ -707,5 +941,20 @@ async def test_image_pull_and_oom_are_persisted_as_bounded_failures(
     assert all(
         replica.error_message and len(replica.error_message.encode()) <= 4096
         for replica in replicas
+    )
+
+    async with kubernetes_controller_database.session() as session, session.begin():
+        service = await ServiceRepository.get(session, service_id, for_update=True)
+        assert service is not None
+        service.scheduling_details = {
+            **service.scheduling_details,
+            "retry_not_before": (datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
+        }
+        await ServiceRepository.reconcile_locked(session, service)
+    replacement_result = await controller.run_once()
+    assert replacement_result.claimed == 2
+    assert (
+        K8S_SERVING_REPLACEMENTS.labels(reason="failure_backoff")._value.get()
+        == replacements_before + 2
     )
     await controller.close()

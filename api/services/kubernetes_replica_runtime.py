@@ -42,6 +42,8 @@ from worker.kubernetes_serving_runtime import (
     WORKER_ID_LABEL,
     KubernetesServingHandle,
     KubernetesServingLaunchSpec,
+    KubernetesServingOwnershipIdentity,
+    KubernetesServingRecoveryConflict,
     KubernetesServingRuntime,
     KubernetesServingState,
 )
@@ -50,8 +52,9 @@ _BACKOFF_REASON = "KUBERNETES_SERVING_BACKOFF"
 _IMAGE_REQUIRED_REASON = "KUBERNETES_SERVING_IMAGE_REQUIRED"
 _MAX_ERROR_MESSAGE_BYTES = 4096
 _MAX_BACKOFF_SECONDS = 300.0
+_MAX_RECOVERY_CONFLICT_WARNINGS = 20
 _KUBERNETES_LABEL_VALUE = re.compile(r"^[A-Za-z0-9](?:[-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$")
-_POD_METRIC_STATES = ("pending", "running", "ready", "terminating", "failed", "orphan")
+_POD_METRIC_STATES = ("unknown", "not_ready", "ready", "terminating")
 _ACTIVE_RUNTIME_STATUSES = frozenset(
     {
         ReplicaStatus.STARTING,
@@ -93,6 +96,7 @@ class KubernetesReplicaClaim:
     model: str
     cpu_millicores: int
     memory_mb: int
+    replacement_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +109,7 @@ class KubernetesRuntimeRunResult:
     stale: int = 0
     recovered: int = 0
     orphans_cleaned: int = 0
+    recovery_conflicts: int = 0
     waiting_backoff: int = 0
 
 
@@ -116,6 +121,7 @@ class _ManagedReplica:
     published: bool = False
     expected_stop: bool = False
     stop_requested_at: datetime | None = None
+    metric_state: str = "unknown"
 
 
 class KubernetesReplicaRuntimeController:
@@ -192,12 +198,26 @@ class KubernetesReplicaRuntimeController:
         self._cycle_lock = asyncio.Lock()
         self._registered = False
         self._recovered = False
+        self._admission_ready = False
+        self._closing = False
         self._closed = False
         self.logger = get_logger("kubernetes_replica_runtime")
 
     @property
     def active_pod_count(self) -> int:
         return len(self._handles)
+
+    @property
+    def admission_ready(self) -> bool:
+        """Whether this controller has a current session and completed recovery."""
+
+        return (
+            self._admission_ready
+            and self._registered
+            and self._recovered
+            and not self._closing
+            and not self._closed
+        )
 
     @staticmethod
     def claim_candidates_query(limit: int) -> Select[tuple[ModelService]]:
@@ -227,33 +247,56 @@ class KubernetesReplicaRuntimeController:
         """Register the current session, adopt resources, and renew leases first."""
 
         async with self._cycle_lock:
-            if self._closed:
+            if self._closed or self._closing:
                 raise RuntimeError("Kubernetes replica runtime is closed")
             if self._recovered:
                 return KubernetesRuntimeRunResult()
-            await self._register_worker()
-            recovered, orphans_cleaned = await self._recover_managed_resources()
-            stale = await self._renew_active_leases()
-            self._recovered = True
-            return KubernetesRuntimeRunResult(
-                recovered=recovered,
-                orphans_cleaned=orphans_cleaned,
-                stale=stale,
-            )
+            try:
+                await self._register_worker()
+                (
+                    recovered,
+                    orphans_cleaned,
+                    recovery_conflicts,
+                ) = await self._recover_managed_resources()
+                stale = await self._renew_active_leases()
+                self._recovered = True
+                if not await self._session_is_current():
+                    self._handles.clear()
+                    raise StaleKubernetesServingController(
+                        "Worker session changed during Kubernetes serving startup"
+                    )
+                self._admission_ready = True
+                return KubernetesRuntimeRunResult(
+                    recovered=recovered,
+                    orphans_cleaned=orphans_cleaned,
+                    recovery_conflicts=recovery_conflicts,
+                    stale=stale,
+                )
+            except asyncio.CancelledError:
+                self._admission_ready = False
+                raise
+            except Exception:
+                self._admission_ready = False
+                raise
 
     async def run_once(self) -> KubernetesRuntimeRunResult:
         async with self._cycle_lock:
             started_at = time.monotonic()
-            if self._closed:
+            if self._closed or self._closing:
                 raise RuntimeError("Kubernetes replica runtime is closed")
             try:
                 startup_result = KubernetesRuntimeRunResult()
                 if not self._recovered:
                     await self._register_worker()
-                    recovered, orphans_cleaned = await self._recover_managed_resources()
+                    (
+                        recovered,
+                        orphans_cleaned,
+                        recovery_conflicts,
+                    ) = await self._recover_managed_resources()
                     startup_result = KubernetesRuntimeRunResult(
                         recovered=recovered,
                         orphans_cleaned=orphans_cleaned,
+                        recovery_conflicts=recovery_conflicts,
                     )
                     self._recovered = True
                 else:
@@ -263,6 +306,9 @@ class KubernetesReplicaRuntimeController:
                 ready, failed, inspected_stale = await self._inspect_managed_replicas()
                 lease_stale = await self._renew_active_leases()
                 claims, waiting_backoff = await self._claim_pending_replicas()
+                for claim in claims:
+                    if claim.replacement_reason is not None:
+                        K8S_SERVING_REPLACEMENTS.labels(reason=claim.replacement_reason).inc()
                 outcomes = await asyncio.gather(*(self._launch(claim) for claim in claims))
                 for outcome in outcomes:
                     K8S_SERVING_LAUNCHES.labels(outcome=_launch_metric_outcome(outcome)).inc()
@@ -280,6 +326,7 @@ class KubernetesReplicaRuntimeController:
                     ),
                     recovered=startup_result.recovered,
                     orphans_cleaned=startup_result.orphans_cleaned,
+                    recovery_conflicts=startup_result.recovery_conflicts,
                     waiting_backoff=waiting_backoff,
                 )
                 if any(
@@ -291,6 +338,7 @@ class KubernetesReplicaRuntimeController:
                         result.stale,
                         result.recovered,
                         result.orphans_cleaned,
+                        result.recovery_conflicts,
                     )
                 ):
                     self.logger.info(
@@ -304,9 +352,21 @@ class KubernetesReplicaRuntimeController:
                         stale=result.stale,
                         recovered=result.recovered,
                         orphans_cleaned=result.orphans_cleaned,
+                        recovery_conflicts=result.recovery_conflicts,
                         waiting_backoff=result.waiting_backoff,
                     )
+                if not await self._session_is_current():
+                    self._handles.clear()
+                    self._admission_ready = False
+                    return result
+                self._admission_ready = True
                 return result
+            except asyncio.CancelledError:
+                self._admission_ready = False
+                raise
+            except Exception:
+                self._admission_ready = False
+                raise
             finally:
                 self._publish_pod_metrics()
                 K8S_SERVING_RECONCILE_DURATION.observe(max(0.0, time.monotonic() - started_at))
@@ -314,6 +374,8 @@ class KubernetesReplicaRuntimeController:
     async def close(self) -> None:
         """Release clients without deleting healthy Pods owned by this cluster."""
 
+        self._admission_ready = False
+        self._closing = True
         async with self._cycle_lock:
             if self._closed:
                 return
@@ -332,12 +394,8 @@ class KubernetesReplicaRuntimeController:
     def _publish_pod_metrics(self) -> None:
         counts = dict.fromkeys(_POD_METRIC_STATES, 0)
         for item in self._handles.values():
-            if item.expected_stop:
-                counts["terminating"] += 1
-            elif item.published:
-                counts["ready"] += 1
-            else:
-                counts["running"] += 1
+            state = "terminating" if item.expected_stop else item.metric_state
+            counts[state] += 1
         for state in _POD_METRIC_STATES:
             K8S_SERVING_PODS.labels(state=state).set(counts[state])
 
@@ -428,8 +486,10 @@ class KubernetesReplicaRuntimeController:
             )
             return await self.runtime.start(handle)
 
-    async def _recover_managed_resources(self) -> tuple[int, int]:
+    async def _recover_managed_resources(self) -> tuple[int, int, int]:
         handles = list(await self.runtime.list_managed(worker_id=self.worker_id))
+        conflicts = tuple(getattr(self.runtime, "recovery_conflicts", ()))
+        self._record_recovery_conflicts(conflicts)
         async with self.database.session() as session:
             rows = list(
                 await session.execute(
@@ -450,6 +510,23 @@ class KubernetesReplicaRuntimeController:
             if replica.execution_id is not None
         }
         matched_replica_ids: set[uuid.UUID] = set()
+        for conflict in conflicts:
+            ownership = conflict.ownership
+            if ownership is None:
+                continue
+            pair = replicas_by_execution.get(ownership.execution_id)
+            if pair is not None and _ownership_matches_replica(
+                ownership,
+                pair[0],
+                pair[1].project_id,
+                self.worker_id,
+                self.cluster_id,
+            ):
+                # The workload contract is unsafe to adopt, but its complete
+                # identity fence proves that this active DB execution still has
+                # a concrete Kubernetes resource. Quarantine it for operator
+                # repair instead of converting uncertainty into deletion/loss.
+                matched_replica_ids.add(pair[0].id)
         recovered = 0
         orphans_cleaned = 0
         for handle in handles:
@@ -549,8 +626,32 @@ class KubernetesReplicaRuntimeController:
                 ),
                 error_message="Kubernetes serving controller restarted without a managed Pod",
                 apply_backoff=terminal_status == ReplicaStatus.LOST,
+                launch_failure=replica.status
+                in {
+                    ReplicaStatus.STARTING,
+                    ReplicaStatus.LOADING,
+                },
             )
-        return recovered, orphans_cleaned
+        return recovered, orphans_cleaned, len(conflicts)
+
+    def _record_recovery_conflicts(
+        self,
+        conflicts: tuple[KubernetesServingRecoveryConflict, ...],
+    ) -> None:
+        for conflict in conflicts[:_MAX_RECOVERY_CONFLICT_WARNINGS]:
+            self.logger.warning(
+                "Kubernetes serving managed resource quarantined",
+                resource_kind=conflict.resource_kind,
+                resource_name=conflict.resource_name,
+                reason=conflict.reason,
+                detail=conflict.message,
+            )
+        omitted = len(conflicts) - _MAX_RECOVERY_CONFLICT_WARNINGS
+        if omitted > 0:
+            self.logger.warning(
+                "Additional Kubernetes serving recovery conflicts suppressed",
+                omitted=omitted,
+            )
 
     async def _claim_pending_replicas(
         self,
@@ -635,6 +736,7 @@ class KubernetesReplicaRuntimeController:
                                 model=service.model,
                                 cpu_millicores=service.cpu_millicores,
                                 memory_mb=service.memory_mb,
+                                replacement_reason=_replacement_metric_reason(service, replica),
                             )
                         )
         return claims, waiting_backoff
@@ -675,6 +777,7 @@ class KubernetesReplicaRuntimeController:
                     return "stale"
                 return "stale"
             state = await self.runtime.inspect(handle)
+            item.metric_state = _pod_metric_state(state)
             return await self._advance_item(item, state)
         except asyncio.CancelledError:
             # Kubernetes labels make an in-flight launch recoverable. Preserve it
@@ -703,6 +806,7 @@ class KubernetesReplicaRuntimeController:
                     type(exc).__name__,
                 ),
                 apply_backoff=True,
+                launch_failure=True,
             )
             return "failed" if accepted else "stale"
 
@@ -720,6 +824,7 @@ class KubernetesReplicaRuntimeController:
                     error_type=type(exc).__name__,
                 )
                 continue
+            item.metric_state = _pod_metric_state(state)
             outcome = await self._advance_item(item, state)
             ready += int(outcome == "ready")
             failed += int(outcome == "failed")
@@ -747,6 +852,7 @@ class KubernetesReplicaRuntimeController:
                     else "Kubernetes serving Pod disappeared"
                 ),
                 apply_backoff=not item.expected_stop,
+                launch_failure=not item.published and not item.expected_stop,
             )
             self._handles.pop(claim.replica_id, None)
             if not accepted:
@@ -763,6 +869,7 @@ class KubernetesReplicaRuntimeController:
                 error_code=ErrorCode.WORKER_LOST.value,
                 error_message="Kubernetes serving Pod was deleted outside the controller",
                 apply_backoff=True,
+                launch_failure=not item.published,
             )
             self._handles.pop(claim.replica_id, None)
             return "failed" if accepted else "stale"
@@ -795,6 +902,7 @@ class KubernetesReplicaRuntimeController:
                 error_code=error_code,
                 error_message=message,
                 apply_backoff=True,
+                launch_failure=not item.published,
             )
             self._handles.pop(claim.replica_id, None)
             return "failed" if accepted else "stale"
@@ -839,6 +947,7 @@ class KubernetesReplicaRuntimeController:
                 error_code=ErrorCode.MODEL_LOAD_TIMEOUT.value,
                 error_message="Kubernetes serving Pod did not become ready before startup timeout",
                 apply_backoff=True,
+                launch_failure=not item.published,
             )
             self._handles.pop(claim.replica_id, None)
             return "failed" if accepted else "stale"
@@ -913,6 +1022,7 @@ class KubernetesReplicaRuntimeController:
                     )
                 item.expected_stop = True
                 item.stop_requested_at = datetime.now(UTC)
+                item.metric_state = "terminating"
         return stopped
 
     def _effective_drain_deadline(self, replica: ServiceReplica) -> datetime:
@@ -1032,6 +1142,7 @@ class KubernetesReplicaRuntimeController:
         error_code: str | None,
         error_message: str,
         apply_backoff: bool,
+        launch_failure: bool = False,
     ) -> bool:
         return await self._mark_terminal_values(
             service_id=claim.service_id,
@@ -1042,6 +1153,7 @@ class KubernetesReplicaRuntimeController:
             error_code=error_code,
             error_message=error_message,
             apply_backoff=apply_backoff,
+            launch_failure=launch_failure,
         )
 
     async def _mark_terminal_values(
@@ -1055,6 +1167,7 @@ class KubernetesReplicaRuntimeController:
         error_code: str | None,
         error_message: str,
         apply_backoff: bool,
+        launch_failure: bool = False,
     ) -> bool:
         failure_reason: str | None = None
         async with self.database.session() as session, session.begin():
@@ -1087,9 +1200,8 @@ class KubernetesReplicaRuntimeController:
                 service.updated_at = now
                 service.version += 1
                 failure_reason = _failure_metric_reason(error_code, status)
-        if failure_reason is not None:
+        if failure_reason is not None and launch_failure:
             K8S_SERVING_LAUNCH_FAILURES.labels(reason=failure_reason).inc()
-            K8S_SERVING_REPLACEMENTS.labels(reason=failure_reason).inc()
         return accepted
 
 
@@ -1146,6 +1258,24 @@ def _labels_match_replica(
         and handle.labels.get(GENERATION_LABEL) == str(replica.generation)
         and handle.labels.get(EXECUTION_ID_LABEL) == str(replica.execution_id)
         and handle.labels.get(WORKER_ID_LABEL) == worker_id
+    )
+
+
+def _ownership_matches_replica(
+    ownership: KubernetesServingOwnershipIdentity,
+    replica: ServiceReplica,
+    project_id: uuid.UUID,
+    worker_id: str,
+    cluster_id: str,
+) -> bool:
+    return (
+        ownership.service_id == replica.service_id
+        and ownership.replica_id == replica.id
+        and ownership.project_id == project_id
+        and ownership.generation == replica.generation
+        and ownership.execution_id == replica.execution_id
+        and ownership.worker_id == worker_id
+        and ownership.cluster_id == cluster_id
     )
 
 
@@ -1235,6 +1365,26 @@ def _launch_metric_outcome(outcome: str) -> str:
     if outcome == "failed":
         return "failure"
     return "fenced"
+
+
+def _pod_metric_state(state: KubernetesServingState) -> str:
+    """Map the last successful Pod observation onto non-overlapping gauge states."""
+
+    if state.deleting:
+        return "terminating"
+    if state.ready:
+        return "ready"
+    return "not_ready"
+
+
+def _replacement_metric_reason(service: ModelService, replica: ServiceReplica) -> str | None:
+    """Identify a post-terminal claim without treating ordinary scale-out as replacement."""
+
+    if replica.ordinal < service.desired_replicas:
+        return None
+    if _backoff_failure_count(service) > 0:
+        return "failure_backoff"
+    return "terminal_replica"
 
 
 def _failure_metric_reason(error_code: str | None, status: ReplicaStatus) -> str:

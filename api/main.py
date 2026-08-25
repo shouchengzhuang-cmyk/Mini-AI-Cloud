@@ -177,7 +177,9 @@ def create_app(
         )
     kubernetes_replica_runtime: KubernetesReplicaRuntimeController | None = None
     if (
-        resolved_settings.kubernetes_serving_enabled
+        should_start_control
+        and resolved_settings.control_plane_enabled
+        and resolved_settings.kubernetes_serving_enabled
         and resolved_settings.kubernetes_serving_fake_enabled
     ):
         kubernetes_replica_runtime = KubernetesReplicaRuntimeController(

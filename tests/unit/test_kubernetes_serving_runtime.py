@@ -29,6 +29,7 @@ from worker.kubernetes_serving_runtime import (
     KubernetesServingOwnershipError,
     KubernetesServingRuntime,
     KubernetesServingRuntimeAdapter,
+    KubernetesServingRuntimeError,
 )
 
 SERVICE_ID = uuid.UUID("11111111-1111-1111-1111-111111111111")
@@ -580,31 +581,109 @@ async def test_list_managed_uses_bounded_selectors_and_recovers_service_identity
 
     api.list_namespaced_pod.return_value = SimpleNamespace(items=[pod])
     pod.metadata.labels.pop(EXECUTION_ID_LABEL)
-    with pytest.raises(KubernetesServingOwnershipError, match="incomplete"):
-        await runtime.list_managed(worker_id="k8s-serving-worker")
+    quarantined = await runtime.list_managed(worker_id="k8s-serving-worker")
+    assert quarantined == ()
+    assert {conflict.resource_kind for conflict in runtime.recovery_conflicts} == {"pod"}
+    assert all(conflict.reason == "ownership_conflict" for conflict in runtime.recovery_conflicts)
+    assert all(conflict.ownership is None for conflict in runtime.recovery_conflicts)
 
 
-async def test_list_managed_rejects_workload_or_hash_drift_without_database_spec() -> None:
+@pytest.mark.parametrize("drifted_kind", ["pod", "service"])
+async def test_list_managed_isolates_one_drifted_pair_and_recovers_other_resources(
+    drifted_kind: str,
+) -> None:
     api = _prepare_api()
     runtime = _runtime(api)
-    _handle, pod, service = await _prepare(runtime)
-    api.list_namespaced_pod = AsyncMock(return_value=SimpleNamespace(items=[pod]))
-    api.list_namespaced_service = AsyncMock(return_value=SimpleNamespace(items=[service]))
-
-    pod.spec.containers[0].image = "mini-docker-cloud:wrong-image"
-    with pytest.raises(KubernetesServingOwnershipError, match="mismatched spec hash"):
-        await runtime.list_managed(worker_id="k8s-serving-worker")
-
-    selector = runtime._selector_labels(
+    specs = [
         _spec(),
-        worker_id="k8s-serving-worker",
-        worker_session_id=WORKER_SESSION_ID,
+        replace(
+            _spec(),
+            service_id=uuid.uuid4(),
+            replica_id=uuid.uuid4(),
+            execution_id=uuid.uuid4(),
+        ),
+        replace(
+            _spec(),
+            service_id=uuid.uuid4(),
+            replica_id=uuid.uuid4(),
+            execution_id=uuid.uuid4(),
+        ),
+    ]
+    pairs: list[tuple[Any, Any]] = []
+    for index, spec in enumerate(specs):
+        selector = runtime._selector_labels(
+            spec,
+            worker_id="k8s-serving-worker",
+            worker_session_id=WORKER_SESSION_ID,
+        )
+        pod = _set_uid(runtime._build_pod(spec, selector), f"pod-uid-{index}")
+        service = _set_uid(runtime._build_service(spec, selector), f"service-uid-{index}")
+        pairs.append((pod, service))
+
+    drifted_pod, drifted_service = pairs[2]
+    if drifted_kind == "pod":
+        drifted_pod.spec.containers[0].image = "mini-docker-cloud:drifted-image"
+    else:
+        drifted_service.spec.selector[PROJECT_ID_LABEL] = str(uuid.uuid4())
+
+    api.list_namespaced_pod = AsyncMock(
+        return_value=SimpleNamespace(items=[pairs[0][0], drifted_pod, pairs[1][0]])
     )
-    exact_pod = runtime._build_pod(_spec(), selector)
-    exact_pod.metadata.labels[SPEC_HASH_LABEL] = "0" * 32
-    api.list_namespaced_pod.return_value = SimpleNamespace(items=[exact_pod])
-    with pytest.raises(KubernetesServingOwnershipError, match="mismatched spec hash"):
+    api.list_namespaced_service = AsyncMock(
+        return_value=SimpleNamespace(items=[pairs[0][1], drifted_service, pairs[1][1]])
+    )
+    api.delete_namespaced_pod = AsyncMock()
+    api.delete_namespaced_service = AsyncMock()
+
+    recovered = await runtime.list_managed(worker_id="k8s-serving-worker")
+
+    assert {handle.object_id for handle in recovered} == {
+        KubernetesServingRuntimeAdapter.pod_name(specs[0]),
+        KubernetesServingRuntimeAdapter.pod_name(specs[1]),
+    }
+    assert len(runtime.recovery_conflicts) == 1
+    conflict = runtime.recovery_conflicts[0]
+    assert conflict.resource_kind == drifted_kind
+    assert conflict.reason == "ownership_conflict"
+    assert conflict.resource_name == (
+        KubernetesServingRuntimeAdapter.pod_name(specs[2])
+        if drifted_kind == "pod"
+        else KubernetesServingRuntimeAdapter.service_name(specs[2])
+    )
+    assert conflict.ownership is not None
+    assert conflict.ownership.service_id == specs[2].service_id
+    assert conflict.ownership.replica_id == specs[2].replica_id
+    assert conflict.ownership.project_id == specs[2].project_id
+    assert conflict.ownership.generation == specs[2].generation
+    assert conflict.ownership.execution_id == specs[2].execution_id
+    assert conflict.ownership.worker_id == "k8s-serving-worker"
+    assert conflict.ownership.worker_session_id == WORKER_SESSION_ID
+    api.delete_namespaced_pod.assert_not_awaited()
+    api.delete_namespaced_service.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_error"),
+    [
+        (ApiException(status=403, reason="Forbidden"), KubernetesServingRuntimeError),
+        (TimeoutError("Kubernetes API unavailable"), TimeoutError),
+    ],
+)
+async def test_list_managed_propagates_global_kubernetes_api_failures(
+    failure: Exception,
+    expected_error: type[Exception],
+) -> None:
+    api = SimpleNamespace(
+        list_namespaced_pod=AsyncMock(side_effect=failure),
+        list_namespaced_service=AsyncMock(),
+    )
+    runtime = _runtime(api)
+
+    with pytest.raises(expected_error):
         await runtime.list_managed(worker_id="k8s-serving-worker")
+
+    api.list_namespaced_service.assert_not_awaited()
+    assert runtime.recovery_conflicts == ()
 
 
 async def test_version_and_close_only_close_owned_client() -> None:

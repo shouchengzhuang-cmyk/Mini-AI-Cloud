@@ -39,6 +39,7 @@ _DNS_1123_LABEL = re.compile(r"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$")
 _LABEL_VALUE = re.compile(r"^[A-Za-z0-9](?:[-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$")
 _IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _MAX_ERROR_LENGTH = 512
+_MAX_RESOURCE_NAME_LENGTH = 128
 _CONTRACT_LABEL_KEYS = (
     SERVICE_ID_LABEL,
     REPLICA_ID_LABEL,
@@ -96,6 +97,31 @@ class KubernetesServingState:
     endpoint_url: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class KubernetesServingOwnershipIdentity:
+    """Canonical identity labels that are safe to correlate with a DB execution."""
+
+    service_id: uuid.UUID
+    replica_id: uuid.UUID
+    project_id: uuid.UUID
+    generation: int
+    execution_id: uuid.UUID
+    cluster_id: str
+    worker_id: str
+    worker_session_id: uuid.UUID
+
+
+@dataclass(frozen=True, slots=True)
+class KubernetesServingRecoveryConflict:
+    """A single managed resource quarantined during restart discovery."""
+
+    resource_kind: str
+    resource_name: str
+    reason: str
+    message: str
+    ownership: KubernetesServingOwnershipIdentity | None = None
+
+
 class KubernetesServingRuntimeError(RuntimeError):
     """A Kubernetes serving resource lifecycle operation failed."""
 
@@ -127,6 +153,9 @@ class KubernetesServingRuntime(Protocol):
     async def force_cleanup(self, handle: KubernetesServingHandle) -> None: ...
 
     async def list_managed(self, *, worker_id: str) -> Sequence[KubernetesServingHandle]: ...
+
+    @property
+    def recovery_conflicts(self) -> Sequence[KubernetesServingRecoveryConflict]: ...
 
     async def close(self) -> None: ...
 
@@ -185,6 +214,13 @@ class KubernetesServingRuntimeAdapter:
         self._version_api = version_api
         self._owns_api = api is None
         self._client_lock = asyncio.Lock()
+        self._recovery_conflicts: list[KubernetesServingRecoveryConflict] = []
+
+    @property
+    def recovery_conflicts(self) -> Sequence[KubernetesServingRecoveryConflict]:
+        """Per-resource conflicts from the most recent managed-resource listing attempt."""
+
+        return tuple(self._recovery_conflicts)
 
     async def version(self) -> str:
         version_api = await self._ensure_version_api()
@@ -313,6 +349,7 @@ class KubernetesServingRuntimeAdapter:
         normalized_worker_id = worker_id.strip()
         _validate_worker_id(normalized_worker_id)
         api = await self._ensure_api()
+        self._recovery_conflicts = []
         selector = ",".join(
             (
                 f"{MANAGED_LABEL}=true",
@@ -342,28 +379,177 @@ class KubernetesServingRuntimeAdapter:
         except ApiException as exc:
             raise self._operation_error("list managed Kubernetes serving resources", exc) from exc
 
-        services = {
-            str(getattr(getattr(item, "metadata", None), "name", "")): item
-            for item in (getattr(service_list, "items", None) or [])
-        }
+        services: dict[str, object] = {}
+        for service in getattr(service_list, "items", None) or []:
+            observed_service_name = _observed_resource_name(service)
+            if not observed_service_name:
+                self._record_recovery_conflict(
+                    resource_kind="service",
+                    resource=service,
+                    worker_id=normalized_worker_id,
+                    error=KubernetesServingOwnershipError(
+                        "managed Kubernetes serving Service has no name"
+                    ),
+                )
+                continue
+            services[observed_service_name] = service
+
         handles: list[KubernetesServingHandle] = []
         matched_services: set[str] = set()
+        observed_pod_names = {
+            name
+            for pod in (getattr(pod_list, "items", None) or [])
+            if (name := _observed_resource_name(pod))
+        }
         for pod in getattr(pod_list, "items", None) or []:
-            labels = self._managed_pod_labels(pod)
-            service_name = _service_name_from_labels(labels)
-            service = services.get(service_name)
-            if service is not None:
-                self._validate_observed_service(
-                    service,
-                    expected_selector=_selector_from_resource_labels(labels),
-                    expected_port=_container_port(pod),
+            service_name: str | None = None
+            try:
+                labels = self._managed_pod_labels(pod)
+                service_name = _service_name_from_labels(labels)
+                service = services.get(service_name)
+                if service is not None:
+                    # Mark the pair before validation so a drifted endpoint is
+                    # quarantined with its Pod instead of being returned later
+                    # as a deletable Service-only orphan.
+                    matched_services.add(service_name)
+                    try:
+                        self._validate_observed_service(
+                            service,
+                            expected_selector=_selector_from_resource_labels(labels),
+                            expected_port=_container_port(pod),
+                        )
+                    except KubernetesServingOwnershipError as exc:
+                        self._record_recovery_conflict(
+                            resource_kind="service",
+                            resource=service,
+                            worker_id=normalized_worker_id,
+                            error=exc,
+                        )
+                        continue
+                handles.append(self._handle(pod, service=service))
+            except KubernetesServingOwnershipError as exc:
+                if service_name is not None:
+                    matched_services.add(service_name)
+                self._record_recovery_conflict(
+                    resource_kind="pod",
+                    resource=pod,
+                    worker_id=normalized_worker_id,
+                    error=exc,
                 )
-                matched_services.add(service_name)
-            handles.append(self._handle(pod, service=service))
+                continue
         for service_name, service in services.items():
-            if service_name not in matched_services:
-                handles.append(self._service_only_handle(service))
+            if service_name in matched_services:
+                continue
+            try:
+                handle = self._service_only_handle(service)
+                if handle.object_id in observed_pod_names:
+                    # The Pod pass already recorded the resource-level conflict.
+                    # Do not turn its otherwise valid Service into a deletable
+                    # orphan handle or emit a duplicate warning for the pair.
+                    continue
+                handles.append(handle)
+            except KubernetesServingOwnershipError as exc:
+                self._record_recovery_conflict(
+                    resource_kind="service",
+                    resource=service,
+                    worker_id=normalized_worker_id,
+                    error=exc,
+                )
         return tuple(handles)
+
+    def _ownership_identity(
+        self,
+        resource: object,
+        *,
+        resource_kind: str,
+        worker_id: str,
+    ) -> KubernetesServingOwnershipIdentity | None:
+        """Parse identity only when every DB correlation fence is canonical."""
+
+        expected_resource_kind = {
+            "pod": POD_RESOURCE_KIND,
+            "service": SERVICE_RESOURCE_KIND,
+        }.get(resource_kind)
+        if expected_resource_kind is None:
+            return None
+        try:
+            labels = _resource_labels(resource)
+        except KubernetesServingOwnershipError:
+            return None
+        if any(
+            (
+                labels.get(MANAGED_LABEL) != "true",
+                labels.get(CLUSTER_ID_LABEL) != self.cluster_id,
+                labels.get(WORKER_ID_LABEL) != worker_id,
+                labels.get(RUNTIME_LABEL) != RUNTIME_LABEL_VALUE,
+                labels.get(RESOURCE_KIND_LABEL) != expected_resource_kind,
+            )
+        ):
+            return None
+        try:
+            service_id = uuid.UUID(labels[SERVICE_ID_LABEL])
+            replica_id = uuid.UUID(labels[REPLICA_ID_LABEL])
+            project_id = uuid.UUID(labels[PROJECT_ID_LABEL])
+            execution_id = uuid.UUID(labels[EXECUTION_ID_LABEL])
+            worker_session_id = uuid.UUID(labels[WORKER_SESSION_ID_LABEL])
+            generation = int(labels[GENERATION_LABEL])
+        except (KeyError, TypeError, ValueError):
+            return None
+        canonical_values = {
+            SERVICE_ID_LABEL: str(service_id),
+            REPLICA_ID_LABEL: str(replica_id),
+            PROJECT_ID_LABEL: str(project_id),
+            EXECUTION_ID_LABEL: str(execution_id),
+            WORKER_SESSION_ID_LABEL: str(worker_session_id),
+            GENERATION_LABEL: str(generation),
+        }
+        if generation < 1 or any(
+            labels.get(key) != value for key, value in canonical_values.items()
+        ):
+            return None
+        expected_name = _resource_name(
+            "sr" if resource_kind == "pod" else "ss",
+            service_id=service_id,
+            replica_id=replica_id,
+            generation=generation,
+            execution_id=execution_id,
+        )
+        if _observed_resource_name(resource) != expected_name:
+            return None
+        return KubernetesServingOwnershipIdentity(
+            service_id=service_id,
+            replica_id=replica_id,
+            project_id=project_id,
+            generation=generation,
+            execution_id=execution_id,
+            cluster_id=self.cluster_id,
+            worker_id=worker_id,
+            worker_session_id=worker_session_id,
+        )
+
+    def _record_recovery_conflict(
+        self,
+        *,
+        resource_kind: str,
+        resource: object,
+        worker_id: str,
+        error: KubernetesServingOwnershipError,
+    ) -> None:
+        self._recovery_conflicts.append(
+            KubernetesServingRecoveryConflict(
+                resource_kind=resource_kind,
+                resource_name=(
+                    _observed_resource_name(resource)[:_MAX_RESOURCE_NAME_LENGTH] or "<unknown>"
+                ),
+                reason="ownership_conflict",
+                message=_bounded(str(error)) or "Kubernetes serving ownership conflict",
+                ownership=self._ownership_identity(
+                    resource,
+                    resource_kind=resource_kind,
+                    worker_id=worker_id,
+                ),
+            )
+        )
 
     async def close(self) -> None:
         if not self._owns_api or self._api is None:
@@ -1237,7 +1423,15 @@ def _validate_worker_id(worker_id: str) -> None:
 def _resource_labels(resource: object) -> dict[str, str]:
     metadata = getattr(resource, "metadata", None)
     raw_labels = getattr(metadata, "labels", None) or {}
+    if not isinstance(raw_labels, Mapping):
+        raise KubernetesServingOwnershipError(
+            "Kubernetes serving resource labels are not a mapping"
+        )
     return {str(key): str(value) for key, value in raw_labels.items()}
+
+
+def _observed_resource_name(resource: object) -> str:
+    return str(getattr(getattr(resource, "metadata", None), "name", "") or "")
 
 
 def _selector_from_resource_labels(labels: Mapping[str, str]) -> dict[str, str]:
