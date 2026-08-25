@@ -1,20 +1,19 @@
 # Mini AI Cloud
 
-Mini AI Cloud（仓库名仍为 `mini-docker-cloud`）是一个面向 AI Infra 学习、架构验证和本地演示的多租户计算平台雏形。它在 Phase I 的 Docker 分布式任务链路上增量加入项目/API Key、配额与用量、GPU 感知全局调度、Docker/Kubernetes 运行时、对象存储、DAG、Model Service、OpenAI-compatible Gateway、审计与诊断能力。
+*An evidence-driven experimental control plane for reliable AI workload scheduling and model serving.*
 
-这是一套“生产思维的可运行原型”，不是可直接暴露到公网的托管云。Worker 仍是可信基础设施，Docker Worker 挂载 Docker socket，该权限通常等价于宿主机 root。生产部署还需要独立节点身份、mTLS、网络隔离、镜像签名/扫描、HA 数据层和更强沙箱。
+Mini AI Cloud 是一个面向 AI 工作负载控制面正确性的轻量级实验平台。它重点研究在并发调度、Worker、Pod、Controller 故障和在线请求缩容时，如何依靠 PostgreSQL 这一状态真相源、lease、execution fencing 与 reconciliation，让任务和模型服务状态收敛。
 
-## 当前能力
+项目定位是 **production-minded experimental system**。代码按生产系统会遇到的并发、故障和权限边界来设计，能力声明则以可复现证据为准。它不是 production-ready cloud、KServe replacement、AWS replacement，也不是 production-grade Kubernetes operator。
 
-- Batch Job：Phase I 的 `/api/v1/tasks` 保持兼容，支持持久日志、SSE、lease、`execution_id` fencing、重试、取消、超时和恢复。
-- 多租户控制面：User、Project、Membership、RBAC、一次性展示的 API Key、并发安全 Project Quota、Usage Ledger 与模拟成本。
-- Scheduler v2：CPU/RAM/GPU reservation、具体 GPU device、label/taint/toleration、priority/aging、binpack/spread、project fairness 和两阶段抢占。
-- Runtime：统一 `ComputeRuntime` 接口，提供 Docker、Kubernetes、Fake runtime；无 GPU 机器可使用仅限开发/测试的 Fake GPU inventory。
-- Artifact：Local/S3（含 MinIO）后端、流式上传下载、大小/配额/SHA-256 与 project isolation；Task input/output 经过 execution-fenced workspace，以单文件只读/可写 mount 交给 runtime，成功后先发布输出再提交终态。
-- AI Service：Registry→Service 快照、Replica `starting/loading/running/draining` 生命周期、真实 Fake HTTP/SSE、持久化 in-flight、round-robin、health/replacement、autoscaling、serving usage/TTFT/token metrics，以及 `/v1/models`、`/v1/chat/completions`、`/v1/completions`。Docker vLLM controller 面向专用 GPU serving node，使用单节点 tensor-parallel gang placement 与具体 GPU UUID；Phase IV-A 另有显式启用的 Kubernetes Fake serving controller，面向真实 Pod、readiness、ClusterIP Service 和重启 adopt，当前机器的实际执行状态见独立验证报告。
-- 平台资源：模型注册表、AES-256-GCM Secret、镜像策略、任务时间线、Job Group/DAG、Prometheus/Grafana、admin diagnostics 与保守 repair、备份恢复和调度模拟。
+## 它在研究什么
 
-实现、已验证项和环境受限项不混为一谈；逐项证据见 [验证矩阵](docs/verification-matrix.md)。
+- **Scheduling**：CPU、内存和具体 GPU device 如何在配额、公平性、优先级、污点与容忍度约束下分配。
+- **Ownership and fencing**：Worker session、lease 和 `execution_id` 如何阻止旧进程继续续租、写回终态或删除新执行的资源。
+- **Failure recovery**：API、Worker、Controller 或 Pod 重启和丢失后，reconciliation 如何从 PostgreSQL desired state 恢复，并隔离单个漂移资源。
+- **Model serving lifecycle**：Replica 如何经过 starting、loading、running、draining，Gateway 如何避开不健康或正在排空的副本，以及活跃 SSE 请求结束后如何完成缩容。
+
+功能存在、自动化测试通过和真实外部运行是三种不同证据。逐项状态见 [验证证据矩阵](docs/verification-matrix.md)，Phase IV-A.1 的实时验收状态见 [Kubernetes Serving 验证报告](docs/verification-report-phase4a-2026-08-24.md)。
 
 ## 最短启动路径
 
@@ -161,7 +160,9 @@ make test-kind-serving
 make kind-serving-down
 ```
 
-`make test-k8s` 验证 batch Kubernetes runtime 构造与 Fake GPU inventory。`kind-serving-*` 是独立的 Phase IV-A 真实 serving E2E，使用仓库内 kubeconfig，不切换用户默认 context；缺少 Docker、Kind 或 kubectl 时会明确返回 `NOT RUN` 和非零退出码。`make down` 保留卷；`docker compose down --volumes` 会永久删除当前 Compose project 的数据。
+`make test-k8s` 验证 batch Kubernetes runtime 构造与 Fake GPU inventory。`kind-serving-*` 是独立的 Phase IV-A 真实 serving E2E，kubeconfig 与临时凭据保存在当前用户私有的 runtime state 目录，不切换用户默认 context；可用 `KIND_SERVING_STATE_DIR` 指定其他私有绝对路径。缺少 Docker、Kind 或 kubectl 时会明确返回 `NOT RUN` 和非零退出码。`make down` 保留卷；`docker compose down --volumes` 会永久删除当前 Compose project 的数据。
+
+已有 Kubernetes-backed Service 在当前 API 进程无法提供对应 controller 时，正向 scale 会在修改 desired state 前 fail closed。Scale-to-zero 和 stop 仍会把 desired state 改为 0，但 Service 保持 `stopping`，Replica 保持 `draining`，不会伪装成 Kubernetes 资源已经删除。Controller 重新启用后从 PostgreSQL 和 managed resource labels 恢复 reconciliation，再完成 fenced cleanup；Controller 一直关闭时，资源不会自动清理。
 
 Phase III 的 Fake Serving E2E 会真实启动 HTTP inference 子进程，并经 Gateway 验证 non-streaming、SSE、RR、failure replacement、draining、Project API Key 隔离和 TP gang placement。要同时执行 live PostgreSQL 并发用例：
 
@@ -179,7 +180,7 @@ Kubernetes Pod、readiness、drain、恢复与 Kind 命令见 [Phase IV-A Kubern
 - [API 与 CLI 示例](docs/api-cli.md)
 - [部署、回滚、备份恢复与排障](docs/operations.md)
 - [七个强制演示](docs/demos.md)
-- [Phase II 验证矩阵与缺口台账](docs/verification-matrix.md)
+- [验证证据矩阵与缺口台账](docs/verification-matrix.md)
 - [Phase III AI Model Serving](docs/phase3-ai-serving.md)
 - [Phase IV-A Kubernetes 原生模型服务](docs/phase4-kubernetes-serving.md)
 - [Phase IV-A 验证报告](docs/verification-report-phase4a-2026-08-24.md)
