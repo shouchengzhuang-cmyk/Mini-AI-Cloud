@@ -47,6 +47,15 @@ jobs:
         run: uv run pytest -m "not integration and not docker and not e2e"
       - name: Run local fencing hero demo
         run: uv run mini-cloud demo fencing --output-dir build/hero-demo-ci
+      - name: Collect commit-bound evidence bundle
+        run: uv run mini-cloud evidence collect
+      - name: Upload evidence bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-${{ github.sha }}
+          path: build/evidence/${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 7
 
   integration:
     runs-on: ubuntu-latest

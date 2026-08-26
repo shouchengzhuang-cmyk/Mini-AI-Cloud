@@ -7,11 +7,12 @@ import subprocess
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 
 import httpx
 import typer
 
+from cli.evidence import DeploymentStatus, EvidenceCollectionError, collect_evidence
 from cli.hero_demo import HeroDemoError, ScenarioName, run_hero_scenarios
 
 _DEFAULT_BASE_URL = "http://localhost:8000"
@@ -34,6 +35,7 @@ service_app = typer.Typer(no_args_is_help=True, help="Manage model services.")
 admin_app = typer.Typer(no_args_is_help=True, help="Run admin diagnostics and safe repairs.")
 worker_app = typer.Typer(no_args_is_help=True, help="Inspect and manage compute workers.")
 demo_app = typer.Typer(no_args_is_help=True, help="Run evidence-producing hero scenarios.")
+evidence_app = typer.Typer(no_args_is_help=True, help="Collect commit-bound evidence bundles.")
 app.add_typer(auth_app, name="auth")
 app.add_typer(project_app, name="project")
 app.add_typer(task_app, name="task")
@@ -41,6 +43,7 @@ app.add_typer(service_app, name="service")
 app.add_typer(admin_app, name="admin")
 app.add_typer(worker_app, name="worker")
 app.add_typer(demo_app, name="demo")
+app.add_typer(evidence_app, name="evidence")
 
 
 class CLIConfigError(RuntimeError):
@@ -607,6 +610,37 @@ def demo_all(
     ),
 ) -> None:
     _run_hero_demo(("fencing", "controller-adoption", "sse-drain"), output_dir)
+
+
+@evidence_app.command("collect")
+def evidence_collect(
+    output_dir: Annotated[Path, typer.Option(help="Evidence bundle root")] = Path("build/evidence"),
+    allow_dirty: Annotated[
+        bool,
+        typer.Option(
+            "--allow-dirty",
+            help="Permit non-release evidence from a dirty tree and mark it explicitly.",
+        ),
+    ] = False,
+    deployment_status: Annotated[
+        str,
+        typer.Option(help="Deployment state: NOT_DEPLOYED or UNKNOWN"),
+    ] = "NOT_DEPLOYED",
+) -> None:
+    if deployment_status not in {"NOT_DEPLOYED", "UNKNOWN"}:
+        raise typer.BadParameter(
+            "deployment status must be NOT_DEPLOYED or UNKNOWN", param_hint="--deployment-status"
+        )
+    try:
+        bundle = collect_evidence(
+            output_dir,
+            allow_dirty=allow_dirty,
+            deployment_status=cast(DeploymentStatus, deployment_status),
+        )
+    except EvidenceCollectionError as exc:
+        typer.echo(f"evidence collection failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(f"Evidence bundle: {bundle.path}")
 
 
 def main() -> None:
