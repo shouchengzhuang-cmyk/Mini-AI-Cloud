@@ -1,0 +1,31 @@
+environments:
+  - id: unit-sqlite
+    description: Python unit, property, and isolated repository tests without external services.
+    level: UNIT
+    execution: uv run pytest -m "not integration and not docker and not e2e"
+    limitations:
+      - SQLite and fakes do not prove PostgreSQL, Docker, Kubernetes, or GPU behavior.
+  - id: postgres-integration
+    description: PostgreSQL 16 and Redis integration job with real migrations and concurrency.
+    level: INTEGRATION
+    execution: uv run pytest -m integration
+    limitations:
+      - Single-runner integration does not prove production scale or high availability.
+  - id: docker-compose
+    description: Local Docker Engine and Compose task lifecycle environment.
+    level: DOCKER
+    execution: uv run pytest -m "docker or e2e"
+    limitations:
+      - Local Docker is not a multi-node scheduler or production container platform.
+  - id: kind-serving
+    description: Ephemeral Kind cluster running the mandatory Kubernetes serving acceptance.
+    level: KIND
+    execution: make test-kind-serving
+    limitations:
+      - Kind uses one CI host and fake inference; it does not prove real GPU or multi-node behavior.
+  - id: real-nvidia-vllm
+    description: Optional NVIDIA Container Toolkit and vLLM acceptance environment.
+    level: REAL_GPU
+    execution: NOT RUN
+    limitations:
+      - No real NVIDIA/vLLM evidence is part of the core release contract.

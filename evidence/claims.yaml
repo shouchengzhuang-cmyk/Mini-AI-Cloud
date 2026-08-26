@@ -1,0 +1,166 @@
+claims:
+  - id: task.atomic-claim
+    description: Concurrent workers produce a single winning task execution claim.
+    invariant_ids: [task.single-active-execution]
+    failure_model: Concurrent PostgreSQL claim attempts for the same queued task.
+    required_environment_ids: [postgres-integration]
+    evidence:
+      - environment_id: postgres-integration
+        level: INTEGRATION
+        status: PENDING
+        command: uv run pytest tests/integration/test_task_repository.py -m integration
+        references:
+          - kind: test
+            path: tests/integration/test_task_repository.py
+    known_limitations:
+      - This proves repository concurrency on one PostgreSQL service, not multi-region consensus.
+  - id: task.stale-execution-rejection
+    description: A stale worker session or execution cannot mutate the replacement execution.
+    invariant_ids: [task.single-active-execution]
+    failure_model: Lease expiry, reassignment, delayed heartbeat, result, log, artifact, or cleanup.
+    required_environment_ids: [postgres-integration]
+    evidence:
+      - environment_id: postgres-integration
+        level: INTEGRATION
+        status: PENDING
+        command: uv run pytest tests/integration/test_worker_session_fencing.py -m integration
+        references:
+          - kind: test
+            path: tests/integration/test_worker_session_fencing.py
+    known_limitations:
+      - It does not prove behavior under a network partition spanning independent regions.
+  - id: scheduler.gpu-reservation-uniqueness
+    description: Scheduler placement never assigns one concrete GPU device to two active owners.
+    invariant_ids: [scheduler.unique-gpu-reservation]
+    failure_model: Concurrent task and service claims, preemption, cancellation, and retry.
+    required_environment_ids: [unit-sqlite]
+    evidence:
+      - environment_id: unit-sqlite
+        level: UNIT
+        status: PENDING
+        command: uv run pytest tests/unit/test_gpu_inventory.py tests/property/test_platform_invariants.py
+        references:
+          - kind: test
+            path: tests/unit/test_gpu_inventory.py
+          - kind: test
+            path: tests/property/test_platform_invariants.py
+    known_limitations:
+      - GPU inventory is fake; no NVIDIA device plugin or CUDA allocation is exercised.
+  - id: quota.non-negative-reservations
+    description: Reservation accounting remains non-negative across retries and releases.
+    invariant_ids: [quota.non-negative]
+    failure_model: Duplicate release, cancellation race, preemption, and reconcile retry.
+    required_environment_ids: [unit-sqlite]
+    evidence:
+      - environment_id: unit-sqlite
+        level: UNIT
+        status: PENDING
+        command: uv run pytest tests/property/test_platform_invariants.py
+        references:
+          - kind: test
+            path: tests/property/test_platform_invariants.py
+    known_limitations:
+      - Property inputs are generated in-process and do not establish a production load limit.
+  - id: project.resource-isolation
+    description: Protected resources remain isolated by project at API and Gateway boundaries.
+    invariant_ids: [project.no-cross-tenant-disclosure]
+    failure_model: A valid key from one project requests another project's task, service, or endpoint.
+    required_environment_ids: [unit-sqlite]
+    evidence:
+      - environment_id: unit-sqlite
+        level: UNIT
+        status: PENDING
+        command: uv run pytest tests/integration/test_gateway_project_isolation.py tests/integration/test_identity_api.py
+        references:
+          - kind: test
+            path: tests/integration/test_gateway_project_isolation.py
+          - kind: test
+            path: tests/integration/test_identity_api.py
+    known_limitations:
+      - This does not replace network policy, database role isolation, or a production threat model.
+  - id: service.desired-actual-convergence
+    description: Concurrent reconciliation converges to the exact desired replica count.
+    invariant_ids: [service.desired-actual-convergence]
+    failure_model: Concurrent controllers, failed claims, replacement, and scale transitions.
+    required_environment_ids: [postgres-integration]
+    evidence:
+      - environment_id: postgres-integration
+        level: INTEGRATION
+        status: PENDING
+        command: uv run pytest tests/integration/test_service_reconcile_concurrency.py -m integration
+        references:
+          - kind: test
+            path: tests/integration/test_service_reconcile_concurrency.py
+    known_limitations:
+      - A single PostgreSQL service is used; production HA is not established.
+  - id: service.controller-restart-adoption
+    description: A restarted controller adopts exact existing resources without duplicate creation.
+    invariant_ids: [service.adopt-exact-identity]
+    failure_model: Controller process restart while managed Pods and Services remain present.
+    required_environment_ids: [kind-serving]
+    evidence:
+      - environment_id: kind-serving
+        level: KIND
+        status: PENDING
+        command: make test-kind-serving
+        references:
+          - kind: test
+            path: tests/e2e/test_kind_serving.py
+    known_limitations:
+      - Kind is single-host and uses fake inference rather than a real GPU model runtime.
+  - id: service.active-sse-drain
+    description: Scale down drains active SSE requests before fenced resource deletion.
+    invariant_ids: [service.drain-preserves-active-requests]
+    failure_model: Scale from four replicas to one while an SSE response is active.
+    required_environment_ids: [kind-serving]
+    evidence:
+      - environment_id: kind-serving
+        level: KIND
+        status: PENDING
+        command: make test-kind-serving
+        references:
+          - kind: test
+            path: tests/e2e/test_kind_serving.py
+    known_limitations:
+      - Fake chunk timing does not characterize vLLM latency, TTFT, or production load.
+  - id: serving.fail-closed-positive-capacity
+    description: Positive Kubernetes serving capacity is not accepted without a live controller.
+    invariant_ids: [serving.positive-capacity-fails-closed]
+    failure_model: Create or scale up while Kubernetes serving runtime is disabled.
+    required_environment_ids: [unit-sqlite]
+    evidence:
+      - environment_id: unit-sqlite
+        level: UNIT
+        status: PENDING
+        command: uv run pytest tests/integration/test_services_api.py tests/unit/test_serving_scheduler.py
+        references:
+          - kind: test
+            path: tests/integration/test_services_api.py
+          - kind: test
+            path: tests/unit/test_serving_scheduler.py
+    known_limitations:
+      - Runtime unavailability is injected in-process; no Kubernetes control-plane outage is created.
+  - id: artifact.hash-size-readiness
+    description: Artifacts become ready only after size and SHA-256 verification.
+    invariant_ids: [artifact.integrity-before-ready, project.no-cross-tenant-disclosure]
+    failure_model: Truncated, oversized, checksum-mismatched, or cross-project artifact completion.
+    required_environment_ids: [unit-sqlite, docker-compose]
+    evidence:
+      - environment_id: unit-sqlite
+        level: UNIT
+        status: PENDING
+        command: uv run pytest tests/unit/test_artifact_service.py tests/integration/test_task_artifacts_api.py
+        references:
+          - kind: test
+            path: tests/unit/test_artifact_service.py
+          - kind: test
+            path: tests/integration/test_task_artifacts_api.py
+      - environment_id: docker-compose
+        level: DOCKER
+        status: PENDING
+        command: uv run pytest tests/e2e/test_docker_runtime.py -m e2e
+        references:
+          - kind: test
+            path: tests/e2e/test_docker_runtime.py
+    known_limitations:
+      - Docker named-volume evidence does not prove multi-node Kubernetes artifact visibility.

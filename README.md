@@ -190,6 +190,7 @@ Kubernetes Pod、readiness、drain、恢复与 Kind 命令见 [Phase IV-A Kubern
 - [Phase IV-A 验证报告](docs/verification-report-phase4a-2026-08-24.md)
 - [PostgreSQL hot-path 实测审计](docs/sql-review.md)
 - [证据与能力声明规范](docs/claim-policy.md)
+- [机器可读 claims、invariants 与 environments 合同](evidence/README.md)
 - [版本、发布与弃用策略](docs/release-policy.md)
 - [建议的 GitHub 仓库元数据](docs/repository-metadata.md)
 

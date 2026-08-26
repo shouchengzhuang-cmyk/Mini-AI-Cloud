@@ -11,7 +11,7 @@ LOCAL_STACK_PROJECT ?= mini-ai-cloud
 SIMULATION_OUTPUT_DIR ?= build/scheduler-simulation
 BACKUP_OUTPUT_DIR ?= build/backups
 
-.PHONY: help install format lint typecheck test test-unit test-integration test-docker \
+.PHONY: help install format lint typecheck validate-evidence test test-unit test-integration test-docker \
 	test-e2e test-serving check config build up down ps logs migrate migrate-local run-api run-worker \
 	load-test dev observability test-chaos test-k8s kind-up kind-down kind-serving-up \
 	test-kind-serving kind-serving-down benchmark backup restore
@@ -33,6 +33,9 @@ lint: ## Run Ruff formatting and lint checks.
 
 typecheck: ## Run strict static type checking.
 	$(UV) run mypy .
+
+validate-evidence: ## Validate claims, invariants, environments, schema, and matrix.
+	$(UV) run python scripts/validate_evidence.py
 
 test: ## Run the complete pytest suite.
 	$(PYTEST)
@@ -56,7 +59,7 @@ test-serving: ## Run Phase III Fake Serving, tenant isolation, and placement tes
 		tests/integration/test_vllm_tensor_parallel_e2e.py \
 		tests/unit/test_serving_scheduler.py
 
-check: lint typecheck test-unit ## Run the fast local quality gate.
+check: lint typecheck validate-evidence test-unit ## Run the fast local quality gate.
 
 config: ## Validate the rendered Compose configuration.
 	$(COMPOSE) config --quiet
