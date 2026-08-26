@@ -1,15 +1,39 @@
+from collections.abc import Awaitable, Callable
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import Response, StreamingResponse
+from starlette.types import Send
 
 from api.dependencies import get_principal
 from api.errors import APIError
 from api.schemas.gateway import OpenAIModelList, OpenAIProxyRequest
-from api.services.gateway import GatewayForwardResult, GatewayService
+from api.services.gateway import GatewayForwardResult, GatewayService, _await_cancel_safe
 from core.rbac import Permission, Principal, PrincipalKind, require_permission
 
 router = APIRouter(tags=["openai-gateway"])
+
+
+class _GatewayStreamingResponse(StreamingResponse):
+    """Close the upstream iterator even when downstream ``send`` is cancelled."""
+
+    gateway_cleanup: Callable[[], Awaitable[None]] | None = None
+
+    async def stream_response(self, send: Send) -> None:
+        try:
+            await super().stream_response(send)
+        finally:
+
+            async def cleanup() -> None:
+                try:
+                    close = getattr(self.body_iterator, "aclose", None)
+                    if close is not None:
+                        await close()
+                finally:
+                    if self.gateway_cleanup is not None:
+                        await self.gateway_cleanup()
+
+            await _await_cancel_safe(cleanup())
 
 
 def get_gateway_service(request: Request) -> GatewayService:
@@ -100,11 +124,13 @@ async def _proxy(
 
 def _gateway_response(result: GatewayForwardResult) -> Response:
     if result.stream is not None:
-        return StreamingResponse(
+        response = _GatewayStreamingResponse(
             result.stream,
             status_code=result.status_code,
             headers=result.headers,
         )
+        response.gateway_cleanup = result.cleanup
+        return response
     return Response(
         content=result.body or b"",
         status_code=result.status_code,

@@ -9,6 +9,7 @@ from core.logging import get_logger
 from core.metrics import (
     OUTBOX_OLDEST_AGE,
     OUTBOX_PENDING,
+    REPLICA_HEALTH,
     SERVICE_REPLICAS,
     SERVICES_READY,
     TASKS_QUEUED,
@@ -36,6 +37,7 @@ class Reaper:
     def __init__(self, database: Database, settings: Settings) -> None:
         self.database = database
         self.settings = settings
+        self._replica_health_series: set[tuple[str, str, str]] = set()
         self.logger = get_logger("reaper")
 
     async def recover_startup(self) -> int:
@@ -134,6 +136,20 @@ class Reaper:
                     )
                 )
             )
+            replica_health_rows = list(
+                await session.execute(
+                    select(
+                        ServiceReplica.service_id,
+                        ServiceReplica.id,
+                        ServiceReplica.health,
+                    )
+                    .join(ModelService, ModelService.id == ServiceReplica.service_id)
+                    .where(
+                        ServiceReplica.generation == ModelService.generation,
+                        ServiceReplica.status == ReplicaStatus.RUNNING,
+                    )
+                )
+            )
             services_ready = int(
                 await session.scalar(
                     select(func.count(ModelService.id)).where(
@@ -177,6 +193,15 @@ class Reaper:
         replica_counts = {status: int(count) for status, count in replica_rows}
         for replica_status in ReplicaStatus:
             SERVICE_REPLICAS.labels(replica_status.value).set(replica_counts.get(replica_status, 0))
+        current_health_series = {
+            (str(service_id), str(replica_id), health.value)
+            for service_id, replica_id, health in replica_health_rows
+        }
+        for labels in self._replica_health_series - current_health_series:
+            REPLICA_HEALTH.remove(*labels)
+        for labels in current_health_series:
+            REPLICA_HEALTH.labels(*labels).set(1)
+        self._replica_health_series = current_health_series
         SERVICES_READY.set(services_ready)
         OUTBOX_PENDING.set(outbox_pending)
         OUTBOX_OLDEST_AGE.set(

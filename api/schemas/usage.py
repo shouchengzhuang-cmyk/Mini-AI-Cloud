@@ -90,6 +90,16 @@ class GPUUsageResponse(ResponseModel):
     gpu_seconds: Decimal = Field(ge=0)
 
 
+class ServingUsageResponse(ResponseModel):
+    request_count: int = Field(ge=0)
+    requests_with_reported_token_usage: int = Field(ge=0)
+    reported_input_tokens: int = Field(ge=0)
+    reported_output_tokens: int = Field(ge=0)
+    reported_total_tokens: int = Field(ge=0)
+    allocated_gpu_seconds: Decimal = Field(ge=0)
+    replica_gpu_seconds: Decimal = Field(ge=0)
+
+
 class UsageResponse(ResponseModel):
     project_id: uuid.UUID
     from_time: datetime
@@ -101,6 +111,7 @@ class UsageResponse(ResponseModel):
     gpu_seconds: Decimal = Field(ge=0)
     gpu_breakdown: list[GPUUsageResponse]
     costs: list[CurrencyCostResponse]
+    serving: ServingUsageResponse
 
 
 class CostResponse(ResponseModel):

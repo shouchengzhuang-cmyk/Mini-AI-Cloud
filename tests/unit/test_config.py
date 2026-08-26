@@ -119,9 +119,43 @@ def test_gateway_buffer_limit_has_safe_default_and_environment_override(
         Settings(_env_file=None, service_proxy_max_response_bytes=1023)
 
 
+def test_gateway_phase_timeouts_and_drain_timeout_accept_environment_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    defaults = Settings(_env_file=None)
+    assert defaults.service_proxy_connect_timeout == 5
+    assert defaults.service_proxy_first_token_timeout == 30
+    assert defaults.service_proxy_timeout == 120
+    assert defaults.service_drain_timeout == 30
+
+    monkeypatch.setenv("SERVICE_PROXY_CONNECT_TIMEOUT", "2")
+    monkeypatch.setenv("SERVICE_PROXY_FIRST_TOKEN_TIMEOUT", "3")
+    monkeypatch.setenv("SERVICE_PROXY_TIMEOUT", "4")
+    monkeypatch.setenv("SERVICE_DRAIN_TIMEOUT", "0")
+    configured = Settings(_env_file=None)
+    assert configured.service_proxy_connect_timeout == 2
+    assert configured.service_proxy_first_token_timeout == 3
+    assert configured.service_proxy_timeout == 4
+    assert configured.service_drain_timeout == 0
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, service_proxy_connect_timeout=0)
+
+
 def test_optional_vllm_worker_id_accepts_compose_empty_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("SERVICE_VLLM_WORKER_ID", "")
 
     assert Settings(_env_file=None).service_vllm_worker_id is None
+
+
+def test_optional_vllm_image_accepts_empty_or_pinned_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_IMAGE", "")
+    assert Settings(_env_file=None).vllm_image is None
+
+    pinned = "example/vllm@sha256:" + "a" * 64
+    monkeypatch.setenv("VLLM_IMAGE", pinned)
+    assert Settings(_env_file=None).vllm_image == pinned

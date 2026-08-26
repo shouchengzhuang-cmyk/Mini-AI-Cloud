@@ -13,6 +13,7 @@ from core.enums import RuntimeType, TaskStatus
 from core.rbac import ProjectStatus
 from models import Base
 from models.identity import Project
+from models.service import ServingRuntime
 from models.task import Task
 from models.usage import ProjectQuotaState, TaskExecution
 from repositories.quotas import (
@@ -20,6 +21,7 @@ from repositories.quotas import (
     QuotaInvariantViolation,
     QuotaRepository,
 )
+from repositories.services import ServiceRepository
 from repositories.usage import UsageInvariantViolation, UsageRepository
 
 
@@ -422,3 +424,119 @@ async def test_usage_identity_must_match_the_locked_execution(
                 gpu_seconds=Decimal("0"),
                 cost=Decimal("0"),
             )
+
+
+async def test_serving_usage_is_idempotent_and_aggregates_reported_tokens(
+    accounting_database: Database,
+) -> None:
+    project_id = await _project(accounting_database, "serving-usage")
+    other_project_id = await _project(accounting_database, "serving-usage-other")
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    request_id = uuid.uuid4()
+    async with accounting_database.session() as session, session.begin():
+        service = await ServiceRepository.create(
+            session,
+            project_id=project_id,
+            name="serving-usage-model",
+            model="org/serving-usage-model",
+            runtime=ServingRuntime.VLLM,
+            runtime_type=RuntimeType.DOCKER,
+            image="example/vllm:test",
+            cpu_millicores=1_000,
+            memory_mb=2_048,
+            gpu_count=2,
+            gpu_memory_mb=16_384,
+            desired_replicas=1,
+        )
+        await ServiceRepository.reconcile_locked(session, service)
+        replica = (await ServiceRepository.list_replicas(session, service.id))[0]
+        replica.container_started_at = base + timedelta(seconds=10)
+        replica.stopped_at = base + timedelta(seconds=40)
+        usage, created = await UsageRepository.record_serving_request(
+            session,
+            request_id=request_id,
+            project_id=project_id,
+            service_id=service.id,
+            replica_id=replica.id,
+            path="/v1/chat/completions",
+            outcome="success",
+            error_code=None,
+            streamed=True,
+            started_at=base,
+            finished_at=base + timedelta(seconds=1, microseconds=250_000),
+            request_duration_seconds=Decimal("1.25"),
+            time_to_first_token_seconds=Decimal("0.15"),
+            allocated_gpu_seconds=Decimal("2.50"),
+            prompt_tokens=7,
+            completion_tokens=3,
+            total_tokens=10,
+        )
+        repeated, created_again = await UsageRepository.record_serving_request(
+            session,
+            request_id=request_id,
+            project_id=project_id,
+            service_id=service.id,
+            replica_id=replica.id,
+            path="/v1/chat/completions",
+            outcome="success",
+            error_code=None,
+            streamed=True,
+            started_at=base,
+            finished_at=base + timedelta(seconds=1, microseconds=250_000),
+            request_duration_seconds=Decimal("1.25"),
+            time_to_first_token_seconds=Decimal("0.15"),
+            allocated_gpu_seconds=Decimal("2.50"),
+            prompt_tokens=7,
+            completion_tokens=3,
+            total_tokens=10,
+        )
+        assert created is True
+        assert created_again is False
+        assert repeated.id == usage.id
+
+        with pytest.raises(ValueError, match="entirely available"):
+            await UsageRepository.record_serving_request(
+                session,
+                request_id=uuid.uuid4(),
+                project_id=project_id,
+                service_id=service.id,
+                replica_id=replica.id,
+                path="/v1/completions",
+                outcome="success",
+                error_code=None,
+                streamed=False,
+                started_at=base,
+                finished_at=base,
+                request_duration_seconds=Decimal("0"),
+                time_to_first_token_seconds=None,
+                allocated_gpu_seconds=Decimal("0"),
+                prompt_tokens=1,
+                completion_tokens=None,
+                total_tokens=None,
+            )
+
+    async with accounting_database.session() as session:
+        aggregate = await UsageRepository.aggregate_settled(
+            session,
+            project_id=project_id,
+            from_time=base,
+            to_time=base + timedelta(hours=1),
+        )
+        isolated = await UsageRepository.aggregate_settled(
+            session,
+            project_id=other_project_id,
+            from_time=base,
+            to_time=base + timedelta(hours=1),
+        )
+
+    assert aggregate.serving_request_count == 1
+    assert aggregate.serving_requests_with_token_usage == 1
+    assert aggregate.input_tokens == 7
+    assert aggregate.output_tokens == 3
+    assert aggregate.total_tokens == 10
+    assert aggregate.serving_allocated_gpu_seconds == Decimal("2.500000")
+    assert aggregate.serving_replica_gpu_seconds == Decimal("60.000000")
+    assert isolated.serving_request_count == 0
+    assert isolated.input_tokens == 0
+    assert isolated.serving_allocated_gpu_seconds == Decimal("0.000000")
+    assert isolated.serving_replica_gpu_seconds == Decimal("0.000000")

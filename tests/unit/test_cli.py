@@ -142,6 +142,49 @@ def test_admin_doctor_is_read_only_by_default(
     assert '"repair_request"' not in result.output
 
 
+def test_service_deploy_can_use_registry_defaults_without_cli_shadowing(
+    monkeypatch: Any,
+) -> None:
+    calls: list[tuple[str, str, dict[str, object]]] = []
+
+    def request(method: str, path: str, **kwargs: object) -> object:
+        calls.append((method, path, kwargs))
+        return {"ok": True}
+
+    monkeypatch.setattr(cli, "_request", request)
+    model_id = "10000000-0000-0000-0000-000000000099"
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "service",
+            "deploy",
+            "--name",
+            "registry-backed",
+            "--registered-model-id",
+            model_id,
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [
+        (
+            "POST",
+            "/api/v1/services",
+            {
+                "json": {
+                    "name": "registry-backed",
+                    "registered_model_id": model_id,
+                    "image": None,
+                    "cpu_millicores": 1000,
+                    "memory_mb": 1024,
+                    "replicas": 1,
+                }
+            },
+        )
+    ]
+
+
 def test_admin_doctor_repair_calls_only_the_conservative_repair_endpoint(
     monkeypatch: Any,
 ) -> None:

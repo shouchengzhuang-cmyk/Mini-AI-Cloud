@@ -139,6 +139,15 @@ async def test_quota_usage_and_cost_endpoints_are_scoped_and_exact(
     assert usage_response.status_code == 200
     assert usage_response.json()["execution_count"] == 1
     assert Decimal(usage_response.json()["cpu_seconds"]) == Decimal("60")
+    assert usage_response.json()["serving"] == {
+        "request_count": 0,
+        "requests_with_reported_token_usage": 0,
+        "reported_input_tokens": 0,
+        "reported_output_tokens": 0,
+        "reported_total_tokens": 0,
+        "allocated_gpu_seconds": "0.000000",
+        "replica_gpu_seconds": "0.000000",
+    }
     assert cost_response.status_code == 200
     assert Decimal(cost_response.json()["costs"][0]["cost"]) == Decimal("0.01")
 

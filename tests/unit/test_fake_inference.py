@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -37,6 +39,16 @@ async def test_fake_inference_stream_is_openai_compatible_sse() -> None:
     assert response.headers["content-type"].startswith("text/event-stream")
     assert b'"object":"text_completion"' in response.content
     assert response.content.endswith(b"data: [DONE]\n\n")
+    events = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: {")
+    ]
+    usage_event = next(event for event in events if "usage" in event)
+    assert usage_event["choices"] == []
+    assert usage_event["usage"]["total_tokens"] == (
+        usage_event["usage"]["prompt_tokens"] + usage_event["usage"]["completion_tokens"]
+    )
 
 
 async def test_fake_inference_rejects_invalid_payload() -> None:

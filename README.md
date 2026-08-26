@@ -11,7 +11,7 @@ Mini AI Cloud（仓库名仍为 `mini-docker-cloud`）是一个面向 AI Infra �
 - Scheduler v2：CPU/RAM/GPU reservation、具体 GPU device、label/taint/toleration、priority/aging、binpack/spread、project fairness 和两阶段抢占。
 - Runtime：统一 `ComputeRuntime` 接口，提供 Docker、Kubernetes、Fake runtime；无 GPU 机器可使用仅限开发/测试的 Fake GPU inventory。
 - Artifact：Local/S3（含 MinIO）后端、流式上传下载、大小/配额/SHA-256 与 project isolation；Task input/output 经过 execution-fenced workspace，以单文件只读/可写 mount 交给 runtime，成功后先发布输出再提交终态。
-- AI Service：vLLM 规格、Fake inference 完整控制面、replica lease/health/reconciliation/autoscaling，以及 `/v1/models`、`/v1/chat/completions`、`/v1/completions` 代理；另有仅显式启用、面向专用 GPU serving node 的 Docker vLLM replica controller，按 Project/Service 隔离模型缓存并使用具体 GPU UUID。
+- AI Service：Registry→Service 快照、Replica `starting/loading/running/draining` 生命周期、真实 Fake HTTP/SSE、持久化 in-flight、round-robin、health/replacement、autoscaling、serving usage/TTFT/token metrics，以及 `/v1/models`、`/v1/chat/completions`、`/v1/completions`；另有仅显式启用、面向专用 GPU serving node 的 Docker vLLM controller，使用单节点 tensor-parallel gang placement 与具体 GPU UUID。
 - 平台资源：模型注册表、AES-256-GCM Secret、镜像策略、任务时间线、Job Group/DAG、Prometheus/Grafana、admin diagnostics 与保守 repair、备份恢复和调度模拟。
 
 实现、已验证项和环境受限项不混为一谈；逐项证据见 [验证矩阵](docs/verification-matrix.md)。
@@ -142,6 +142,7 @@ make lint
 make typecheck
 make test-unit
 make test-integration
+make test-serving
 make test
 make config
 
@@ -158,6 +159,15 @@ make kind-down
 
 `make test-k8s` 当前验证 Kubernetes runtime 构造与 Fake GPU inventory；只有本机具备 kind/k3d 及可用镜像时才能声称真实 Kubernetes E2E。`make down` 保留卷；`docker compose down --volumes` 会永久删除当前 Compose project 的数据。
 
+Phase III 的 Fake Serving E2E 会真实启动 HTTP inference 子进程，并经 Gateway 验证 non-streaming、SSE、RR、failure replacement、draining、Project API Key 隔离和 TP gang placement。要同时执行 live PostgreSQL 并发用例：
+
+```bash
+LIVE_DATABASE_URL=postgresql+asyncpg://task:local-dev-only@127.0.0.1:5432/task_platform \
+  make test-serving
+```
+
+完整说明与真实 vLLM 前置条件见 [Phase III AI Model Serving](docs/phase3-ai-serving.md)。
+
 ## 文档入口
 
 - [架构与一致性边界](docs/architecture.md)
@@ -165,6 +175,7 @@ make kind-down
 - [部署、回滚、备份恢复与排障](docs/operations.md)
 - [七个强制演示](docs/demos.md)
 - [Phase II 验证矩阵与缺口台账](docs/verification-matrix.md)
+- [Phase III AI Model Serving](docs/phase3-ai-serving.md)
 - [PostgreSQL hot-path 实测审计](docs/sql-review.md)
 
 FastAPI 交互文档位于 `http://localhost:8000/docs`，OpenAPI JSON 位于 `http://localhost:8000/openapi.json`。
@@ -190,4 +201,4 @@ Phase I 稳定恢复点是：
 c47702b feat: build distributed Docker task platform
 ```
 
-Phase II 在 `feat/mini-ai-cloud-v2` 上增量演进。不要 rebase、force reset 或覆盖该稳定提交。任务明确要求不 push；本地 commit、远端 push 和部署是三件不同的事。
+Phase II 在 `feat/mini-ai-cloud-v2` 上增量演进，Phase III 位于 `feat/ai-serving-v3`。不要 rebase、force reset 或覆盖稳定提交。任务明确要求不 push；本地 commit、远端 push 和部署是三件不同的事。

@@ -45,13 +45,24 @@ class RegisteredModelRepository:
         architecture: str | None,
         metadata: dict[str, object],
         created_by_user_id: uuid.UUID | None,
+        runtime: str = "vllm",
+        default_gpu_count: int = 0,
+        runtime_defaults: dict[str, object] | None = None,
     ) -> RegisteredModel:
+        normalized_runtime = runtime.strip().lower()
+        if normalized_runtime not in {"vllm", "fake"}:
+            raise ValueError("runtime must be 'vllm' or 'fake'")
+        if not 0 <= default_gpu_count <= 64:
+            raise ValueError("default_gpu_count must be between 0 and 64")
         model = RegisteredModel(
             project_id=project_id,
             name=_normalize_model_name(name),
             provider=_normalize_text(provider, "provider", 64),
             source=_normalize_text(source, "source", 1_024),
             revision=_normalize_optional_text(revision, "revision", 255),
+            runtime=normalized_runtime,
+            default_gpu_count=default_gpu_count,
+            runtime_defaults=dict(runtime_defaults or {}),
             size_bytes=size_bytes,
             gpu_memory_mb=gpu_memory_mb,
             architecture=_normalize_optional_text(architecture, "architecture", 255),

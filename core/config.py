@@ -144,6 +144,9 @@ class Settings(BaseSettings):
 
     service_reconcile_interval: float = Field(default=2.0, gt=0)
     service_health_interval: float = Field(default=5.0, gt=0)
+    service_drain_timeout: float = Field(default=30.0, ge=0)
+    service_proxy_connect_timeout: float = Field(default=5.0, gt=0)
+    service_proxy_first_token_timeout: float = Field(default=30.0, gt=0)
     service_proxy_timeout: float = Field(default=120.0, gt=0)
     service_proxy_max_response_bytes: int = Field(
         default=16 * 1024 * 1024,
@@ -153,6 +156,7 @@ class Settings(BaseSettings):
     service_endpoint_host_allowlist: str = ""
     service_autoscale_interval: float = Field(default=15.0, gt=0)
     service_scale_to_zero_enabled: bool = False
+    vllm_image: OptionalNonEmptyString = Field(default=None, min_length=1, max_length=512)
     service_vllm_docker_enabled: bool = False
     service_vllm_worker_id: OptionalNonEmptyString = Field(
         default=None, min_length=1, max_length=255

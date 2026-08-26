@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -18,6 +19,7 @@ from core.enums import RuntimeType, WorkerStatus
 from models.base import Base
 from models.identity import Project, User
 from models.outbox import OutboxEvent
+from models.registry import RegisteredModel
 from models.service import (
     ModelService,
     ReplicaHealth,
@@ -52,6 +54,7 @@ async def fake_runtime_database(tmp_path: Path) -> AsyncIterator[Database]:
                 cast(Table, ProjectQuota.__table__),
                 cast(Table, ProjectQuotaState.__table__),
                 cast(Table, Worker.__table__),
+                cast(Table, RegisteredModel.__table__),
                 cast(Table, ModelService.__table__),
                 cast(Table, ServiceReplica.__table__),
                 cast(Table, OutboxEvent.__table__),
@@ -170,6 +173,118 @@ async def test_fake_runtime_starts_ready_replica_and_stops_scale_down(
     assert worker.status == WorkerStatus.OFFLINE
 
 
+async def test_fake_runtime_waits_for_inflight_request_before_draining(
+    fake_runtime_database: Database,
+) -> None:
+    service_id = await _create_service(fake_runtime_database)
+    controller = FakeReplicaRuntimeController(
+        fake_runtime_database,
+        app_env="test",
+        ready_timeout_seconds=10,
+        stop_timeout_seconds=2,
+        probe_interval_seconds=0.05,
+    )
+    try:
+        assert (await controller.run_once()).started == 1
+        replica = await _replica(fake_runtime_database, service_id)
+        assert replica.execution_id is not None
+
+        async with fake_runtime_database.session() as session, session.begin():
+            selection = await ServiceRepository.choose_healthy_endpoint(
+                session,
+                service_id=service_id,
+                project_id=PROJECT_ID,
+            )
+            assert selection is not None
+            service = await ServiceRepository.set_desired_replicas(
+                session,
+                service_id=service_id,
+                project_id=PROJECT_ID,
+                desired_replicas=0,
+            )
+            assert service is not None
+            await ServiceRepository.reconcile_locked(
+                session,
+                service,
+                drain_timeout_seconds=30,
+            )
+
+        waiting = await controller.run_once()
+        replica = await _replica(fake_runtime_database, service_id)
+        assert waiting.stopped == 0
+        assert replica.status == ReplicaStatus.DRAINING
+        assert replica.active_requests == 1
+        assert controller.active_process_count == 1
+
+        async with fake_runtime_database.session() as session, session.begin():
+            assert await ServiceRepository.release_endpoint_request(
+                session,
+                replica_id=selection.replica_id,
+                generation=selection.generation,
+                execution_id=selection.execution_id,
+            )
+
+        stopped = await controller.run_once()
+        replica = await _replica(fake_runtime_database, service_id)
+        assert stopped.stopped == 1
+        assert replica.status == ReplicaStatus.STOPPED
+        assert replica.active_requests == 0
+        assert controller.active_process_count == 0
+    finally:
+        await controller.close()
+
+
+async def test_fake_runtime_forces_drain_after_deadline(
+    fake_runtime_database: Database,
+) -> None:
+    service_id = await _create_service(fake_runtime_database)
+    controller = FakeReplicaRuntimeController(
+        fake_runtime_database,
+        app_env="test",
+        ready_timeout_seconds=10,
+        stop_timeout_seconds=2,
+        probe_interval_seconds=0.05,
+    )
+    try:
+        assert (await controller.run_once()).started == 1
+        async with fake_runtime_database.session() as session, session.begin():
+            selection = await ServiceRepository.choose_healthy_endpoint(
+                session,
+                service_id=service_id,
+                project_id=PROJECT_ID,
+            )
+            assert selection is not None
+            service = await ServiceRepository.set_desired_replicas(
+                session,
+                service_id=service_id,
+                project_id=PROJECT_ID,
+                desired_replicas=0,
+            )
+            assert service is not None
+            await ServiceRepository.reconcile_locked(
+                session,
+                service,
+                drain_timeout_seconds=0,
+            )
+
+        stopped = await controller.run_once()
+        replica = await _replica(fake_runtime_database, service_id)
+        assert stopped.stopped == 1
+        assert replica.status == ReplicaStatus.STOPPED
+        assert replica.active_requests == 0
+        assert controller.active_process_count == 0
+
+        async with fake_runtime_database.session() as session, session.begin():
+            assert not await ServiceRepository.release_endpoint_request(
+                session,
+                replica_id=selection.replica_id,
+                generation=selection.generation,
+                execution_id=selection.execution_id,
+            )
+    finally:
+        await controller.close()
+
+
 async def test_fake_runtime_monitors_unexpected_process_exit(
     fake_runtime_database: Database,
 ) -> None:
@@ -274,11 +389,16 @@ async def test_fake_runtime_cancellation_stops_claimed_process(
             probe_interval_seconds=0.05,
         )
         run = asyncio.create_task(controller.run_once())
+        replica = await _replica(fake_runtime_database, service_id)
         for _ in range(100):
-            if controller.active_process_count == 1:
+            replica = await _replica(fake_runtime_database, service_id)
+            if controller.active_process_count == 1 and replica.status == ReplicaStatus.LOADING:
                 break
             await asyncio.sleep(0.02)
         assert controller.active_process_count == 1
+        assert replica.status == ReplicaStatus.LOADING
+        assert replica.container_started_at is not None
+        assert replica.ready_at is None
         process = next(iter(controller._handles.values())).process
 
         run.cancel()
@@ -320,6 +440,138 @@ async def test_fake_runtime_ignores_services_without_both_fake_runtime_types(
         await controller.close()
 
 
+async def test_fake_runtime_restart_cleans_owned_process_and_replaces_lost_replica(
+    fake_runtime_database: Database,
+) -> None:
+    service_id = await _create_service(fake_runtime_database)
+    worker_id = "stable-fake-worker"
+    old = FakeReplicaRuntimeController(
+        fake_runtime_database,
+        app_env="test",
+        worker_id=worker_id,
+        ready_timeout_seconds=10,
+        stop_timeout_seconds=2,
+        probe_interval_seconds=0.05,
+    )
+    replacement: FakeReplicaRuntimeController | None = None
+    try:
+        assert (await old.run_once()).started == 1
+        original = await _replica(fake_runtime_database, service_id)
+        original_execution_id = original.execution_id
+        old_process = old._handles[original.id].process
+
+        replacement = FakeReplicaRuntimeController(
+            fake_runtime_database,
+            app_env="test",
+            worker_id=worker_id,
+            ready_timeout_seconds=10,
+            stop_timeout_seconds=2,
+            probe_interval_seconds=0.05,
+        )
+        await replacement.run_once()
+        await asyncio.wait_for(old_process.wait(), timeout=3)
+        original = await _replica(fake_runtime_database, service_id)
+        assert original.status == ReplicaStatus.LOST
+        assert original.endpoint_url is None
+
+        with pytest.raises(RuntimeError, match="session is stale"):
+            await old.run_once()
+
+        async with fake_runtime_database.session() as session, session.begin():
+            service = await ServiceRepository.get(session, service_id, for_update=True)
+            assert service is not None
+            await ServiceRepository.reconcile_locked(session, service)
+
+        restarted = await replacement.run_once()
+        async with fake_runtime_database.session() as session:
+            replicas = await ServiceRepository.list_replicas(session, service_id)
+        current = replicas[-1]
+        assert restarted.started == 1
+        assert current.status == ReplicaStatus.RUNNING
+        assert current.health == ReplicaHealth.HEALTHY
+        assert current.execution_id is not None
+        assert current.execution_id != original_execution_id
+    finally:
+        if replacement is not None:
+            await replacement.close()
+        await old.close()
+
+
+async def test_fake_runtime_restart_recovers_process_spawned_before_loading_is_persisted(
+    fake_runtime_database: Database,
+) -> None:
+    service_id = await _create_service(fake_runtime_database)
+    worker_id = "stable-fake-worker-startup-crash"
+    old = FakeReplicaRuntimeController(
+        fake_runtime_database,
+        app_env="test",
+        worker_id=worker_id,
+        ready_timeout_seconds=10,
+        stop_timeout_seconds=2,
+        probe_interval_seconds=0.05,
+    )
+    replacement: FakeReplicaRuntimeController | None = None
+    process: asyncio.subprocess.Process | None = None
+    try:
+        await old._ensure_worker()
+        claims = await old._claim_pending_replicas()
+        assert len(claims) == 1
+        claim = claims[0]
+        replica = await _replica(fake_runtime_database, service_id)
+        assert replica.status == ReplicaStatus.STARTING
+        assert replica.endpoint_url is None
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = int(sock.getsockname()[1])
+        process = await asyncio.create_subprocess_exec(
+            old.python_executable,
+            str(old.script_path),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--model",
+            claim.model,
+            "--replica-id",
+            str(claim.replica_id),
+            "--execution-id",
+            str(claim.execution_id),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        assert process.returncode is None
+
+        replacement = FakeReplicaRuntimeController(
+            fake_runtime_database,
+            app_env="test",
+            worker_id=worker_id,
+            ready_timeout_seconds=10,
+            stop_timeout_seconds=2,
+            probe_interval_seconds=0.05,
+        )
+        await replacement.run_once()
+
+        await asyncio.wait_for(process.wait(), timeout=3)
+        replica = await _replica(fake_runtime_database, service_id)
+        assert replica.status == ReplicaStatus.LOST
+        assert replica.endpoint_url is None
+    finally:
+        if process is not None and process.returncode is None:
+            process.kill()
+            await process.wait()
+        if replacement is not None:
+            await replacement.close()
+        await old.close()
+
+
 def test_fake_runtime_is_prohibited_in_production() -> None:
     with pytest.raises(ValueError, match="prohibited"):
         FakeReplicaRuntimeController(cast(Database, object()), app_env="production")
+    with pytest.raises(ValueError, match="inference_delay_seconds"):
+        FakeReplicaRuntimeController(
+            cast(Database, object()),
+            app_env="test",
+            inference_delay_seconds=-0.01,
+        )

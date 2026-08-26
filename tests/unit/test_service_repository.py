@@ -14,6 +14,7 @@ from core.enums import RuntimeType
 from models.base import Base
 from models.identity import Project, User
 from models.outbox import OutboxEvent
+from models.registry import RegisteredModel
 from models.service import (
     ModelService,
     ReplicaHealth,
@@ -52,6 +53,7 @@ async def service_database(tmp_path: Any) -> AsyncIterator[Database]:
                 cast(Table, ProjectQuota.__table__),
                 cast(Table, ProjectQuotaState.__table__),
                 cast(Table, Worker.__table__),
+                cast(Table, RegisteredModel.__table__),
                 cast(Table, ModelService.__table__),
                 cast(Table, ServiceReplica.__table__),
                 cast(Table, OutboxEvent.__table__),
@@ -403,8 +405,118 @@ async def test_generation_fencing_health_and_round_robin_selection(
     ]
     assert [replica.status for replica in old] == [
         ReplicaStatus.STOPPED,
-        ReplicaStatus.STOPPING,
+        ReplicaStatus.DRAINING,
     ]
+
+
+async def test_replica_loading_and_fenced_request_drain_lifecycle(
+    service_database: Database,
+) -> None:
+    service_id = await _create_service(service_database, replicas=1)
+    await _register_worker(service_database, "worker-drain")
+    execution_id = uuid.uuid4()
+
+    async with service_database.session() as session, session.begin():
+        replica = (await ServiceRepository.list_replicas(session, service_id))[0]
+        assert await ServiceRepository.bind_replica_execution(
+            session,
+            replica_id=replica.id,
+            generation=replica.generation,
+            worker_id="worker-drain",
+            execution_id=execution_id,
+            lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+        )
+        assert await ServiceRepository.mark_replica_loading(
+            session,
+            replica_id=replica.id,
+            generation=replica.generation,
+            execution_id=execution_id,
+            endpoint_url="http://worker-drain:8000",
+        )
+        assert replica.status == ReplicaStatus.LOADING
+        assert replica.container_started_at is not None
+        assert replica.ready_at is None
+        assert await ServiceRepository.mark_replica_running(
+            session,
+            replica_id=replica.id,
+            generation=replica.generation,
+            execution_id=execution_id,
+            endpoint_url="http://worker-drain:8000",
+        )
+        assert await ServiceRepository.record_replica_health(
+            session,
+            replica_id=replica.id,
+            generation=replica.generation,
+            execution_id=execution_id,
+            health=ReplicaHealth.HEALTHY,
+        )
+        assert replica.ready_at is not None
+        assert replica.ready_at >= replica.container_started_at
+        replica_id = replica.id
+        generation = replica.generation
+
+    async with service_database.session() as session, session.begin():
+        selection = await ServiceRepository.choose_healthy_endpoint(
+            session,
+            service_id=service_id,
+            project_id=PROJECT_ID,
+        )
+        assert selection is not None
+        replica = await session.get(ServiceReplica, replica_id)
+        assert replica is not None and replica.active_requests == 1
+
+    async with service_database.session() as session, session.begin():
+        service = await ServiceRepository.set_desired_replicas(
+            session,
+            service_id=service_id,
+            project_id=PROJECT_ID,
+            desired_replicas=0,
+        )
+        assert service is not None
+        result = await ServiceRepository.reconcile_locked(
+            session,
+            service,
+            drain_timeout_seconds=30,
+        )
+        replica = await session.get(ServiceReplica, replica_id)
+        assert result.replicas_stopping == 1
+        assert replica is not None
+        assert replica.status == ReplicaStatus.DRAINING
+        assert replica.active_requests == 1
+        assert replica.endpoint_url == "http://worker-drain:8000"
+        assert replica.drain_started_at is not None
+        assert replica.drain_deadline is not None
+        assert replica.drain_deadline > replica.drain_started_at
+        assert (
+            await ServiceRepository.choose_healthy_endpoint(
+                session,
+                service_id=service_id,
+                project_id=PROJECT_ID,
+            )
+            is None
+        )
+
+    async with service_database.session() as session, session.begin():
+        assert not await ServiceRepository.release_endpoint_request(
+            session,
+            replica_id=replica_id,
+            generation=generation,
+            execution_id=uuid.uuid4(),
+        )
+        assert await ServiceRepository.release_endpoint_request(
+            session,
+            replica_id=replica_id,
+            generation=generation,
+            execution_id=execution_id,
+        )
+        assert not await ServiceRepository.release_endpoint_request(
+            session,
+            replica_id=replica_id,
+            generation=generation,
+            execution_id=execution_id,
+        )
+        replica = await session.get(ServiceReplica, replica_id)
+        assert replica is not None and replica.active_requests == 0
 
 
 async def test_expired_replica_lease_is_fenced_and_replaced(

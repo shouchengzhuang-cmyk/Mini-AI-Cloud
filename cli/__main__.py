@@ -372,14 +372,23 @@ def task_explain(task_id: str) -> None:
 @service_app.command("deploy")
 def service_deploy(
     name: Annotated[str, typer.Option(help="Service name")],
-    model: Annotated[str, typer.Option(help="Registered model or model reference")],
-    runtime: Annotated[str, typer.Option()] = "vllm",
-    runtime_type: Annotated[str, typer.Option()] = "docker",
+    model: Annotated[str | None, typer.Option(help="Model reference override")] = None,
+    registered_model_id: Annotated[
+        str | None, typer.Option(help="Project registered model UUID")
+    ] = None,
+    model_revision: Annotated[str | None, typer.Option()] = None,
+    runtime: Annotated[str | None, typer.Option()] = None,
+    runtime_type: Annotated[str | None, typer.Option()] = None,
     image: Annotated[str | None, typer.Option()] = None,
     cpu_millicores: Annotated[int, typer.Option(min=1)] = 1000,
     memory_mb: Annotated[int, typer.Option(min=16)] = 1024,
-    gpu_count: Annotated[int, typer.Option(min=0)] = 0,
-    gpu_memory_mb: Annotated[int, typer.Option(min=0)] = 0,
+    gpu_count: Annotated[int | None, typer.Option(min=0)] = None,
+    gpu_memory_mb: Annotated[int | None, typer.Option(min=0)] = None,
+    gpu_model: Annotated[str | None, typer.Option()] = None,
+    tensor_parallel_size: Annotated[int | None, typer.Option(min=1, max=64)] = None,
+    dtype: Annotated[str | None, typer.Option()] = None,
+    gpu_memory_utilization: Annotated[float | None, typer.Option(min=0.000001, max=1.0)] = None,
+    max_model_len: Annotated[int | None, typer.Option(min=1)] = None,
     replicas: Annotated[int, typer.Option(min=0, max=1000)] = 1,
     autoscaling: Annotated[bool, typer.Option()] = False,
     min_replicas: Annotated[int, typer.Option(min=0, max=1000)] = 1,
@@ -387,18 +396,34 @@ def service_deploy(
     target_concurrency: Annotated[int, typer.Option(min=1)] = 8,
     cooldown_seconds: Annotated[int, typer.Option(min=0)] = 60,
 ) -> None:
+    if model is None and registered_model_id is None:
+        raise typer.BadParameter("--model or --registered-model-id is required")
     payload: dict[str, object] = {
         "name": name,
-        "model": model,
-        "runtime": runtime,
-        "runtime_type": runtime_type,
         "image": image,
         "cpu_millicores": cpu_millicores,
         "memory_mb": memory_mb,
-        "gpu_count": gpu_count,
-        "gpu_memory_mb": gpu_memory_mb,
         "replicas": replicas,
     }
+    optional_registry_overrides: dict[str, object | None] = {
+        "model": model,
+        "registered_model_id": registered_model_id,
+        "model_revision": model_revision,
+        "runtime": runtime,
+        "runtime_type": runtime_type,
+        "gpu_count": gpu_count,
+        "gpu_memory_mb": gpu_memory_mb,
+        "gpu_model": gpu_model,
+        "dtype": dtype,
+        "gpu_memory_utilization": gpu_memory_utilization,
+    }
+    payload.update(
+        {key: value for key, value in optional_registry_overrides.items() if value is not None}
+    )
+    if tensor_parallel_size is not None:
+        payload["tensor_parallel_size"] = tensor_parallel_size
+    if max_model_len is not None:
+        payload["max_model_len"] = max_model_len
     if autoscaling:
         payload["autoscaling"] = {
             "enabled": True,

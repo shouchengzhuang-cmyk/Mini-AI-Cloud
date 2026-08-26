@@ -1,8 +1,9 @@
 import asyncio
 import json
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, MutableMapping
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any, cast
 
 import httpx
@@ -11,6 +12,7 @@ import pytest_asyncio
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import Table, event, select
+from starlette.types import Message, Scope
 
 from api.dependencies import get_principal
 from api.errors import APIError, register_exception_handlers
@@ -26,6 +28,7 @@ from core.rbac import Principal, PrincipalKind
 from models.base import Base
 from models.identity import Project, User
 from models.outbox import OutboxEvent
+from models.registry import RegisteredModel
 from models.service import (
     ModelService,
     ReplicaHealth,
@@ -34,7 +37,7 @@ from models.service import (
     ServiceStatus,
     ServingRuntime,
 )
-from models.usage import ProjectQuota, ProjectQuotaState
+from models.usage import ProjectQuota, ProjectQuotaState, ServingRequestUsage
 from models.worker import Worker
 from repositories.quotas import QuotaRepository
 from repositories.services import ServiceRepository
@@ -58,6 +61,37 @@ class ChunkStream(httpx.AsyncByteStream):
         self.closed = True
 
 
+class DelayedChunkStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[tuple[float, bytes]]) -> None:
+        self.chunks = chunks
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for delay, chunk in self.chunks:
+            if delay:
+                await asyncio.sleep(delay)
+            yield chunk
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class DisconnectChunkStream(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.waiting_for_next_chunk = asyncio.Event()
+        self.closed = False
+        self._never = asyncio.Event()
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield b'data: {"choices":[]}\n\n'
+        self.waiting_for_next_chunk.set()
+        await self._never.wait()
+
+    async def aclose(self) -> None:
+        await asyncio.sleep(0.01)
+        self.closed = True
+
+
 @pytest_asyncio.fixture
 async def gateway_database(tmp_path: Any) -> AsyncIterator[Database]:
     path = (tmp_path / "gateway.sqlite3").as_posix()
@@ -78,8 +112,10 @@ async def gateway_database(tmp_path: Any) -> AsyncIterator[Database]:
                 cast(Table, ProjectQuota.__table__),
                 cast(Table, ProjectQuotaState.__table__),
                 cast(Table, Worker.__table__),
+                cast(Table, RegisteredModel.__table__),
                 cast(Table, ModelService.__table__),
                 cast(Table, ServiceReplica.__table__),
+                cast(Table, ServingRequestUsage.__table__),
                 cast(Table, OutboxEvent.__table__),
             ],
         )
@@ -165,9 +201,10 @@ def _api_key_principal() -> Principal:
 async def test_gateway_routes_round_robin_filter_headers_and_stream(
     gateway_database: Database,
 ) -> None:
-    service_id, _replicas = await _ready_service(gateway_database)
+    service_id, replicas = await _ready_service(gateway_database)
     seen: list[httpx.Request] = []
     streams: list[ChunkStream] = []
+    routed_replica_ids: list[str] = []
 
     async def upstream(request: httpx.Request) -> httpx.Response:
         seen.append(request)
@@ -217,6 +254,7 @@ async def test_gateway_routes_round_robin_filter_headers_and_stream(
                     "Connection": "X-Remove",
                     "X-Remove": "remove-me",
                     "X-Custom": "kept",
+                    "X-Mini-AI-Replica-Id": "spoofed",
                 },
                 json={"model": "chat-main", "messages": [{"role": "user", "content": "hi"}]},
             )
@@ -224,6 +262,7 @@ async def test_gateway_routes_round_robin_filter_headers_and_stream(
             assert response.json()["model"] == "org/upstream-model"
             assert response.headers["x-upstream"] == "kept"
             assert "x-hop" not in response.headers
+            routed_replica_ids.append(response.headers["x-mini-ai-replica-id"])
 
         listed = await client.get("/v1/models")
         assert listed.status_code == 200
@@ -235,6 +274,7 @@ async def test_gateway_routes_round_robin_filter_headers_and_stream(
         )
         assert streamed.status_code == 200
         assert streamed.content.endswith(b"data: [DONE]\n\n")
+        routed_replica_ids.append(streamed.headers["x-mini-ai-replica-id"])
 
         disconnected = await gateway.forward(
             project_id=PROJECT_ID,
@@ -264,11 +304,22 @@ async def test_gateway_routes_round_robin_filter_headers_and_stream(
         "worker-b.test:8000",
     ]
     assert all(request.headers.get("x-remove") is None for request in seen)
+    assert all(request.headers.get("x-mini-ai-replica-id") is None for request in seen)
     assert all(request.headers["x-custom"] == "kept" for request in seen[:2])
+    assert routed_replica_ids[:2] == [str(replica.id) for replica in replicas]
+    assert routed_replica_ids[2] == routed_replica_ids[0]
     assert streams and streams[0].closed is True
     assert streams[1].closed is True
     load = await metrics.snapshot(service_id)
     assert load is not None and load.active_requests == 0
+    async with gateway_database.session() as session:
+        usages = list(await session.scalars(select(ServingRequestUsage)))
+        persisted_replicas = await ServiceRepository.list_replicas(session, service_id)
+    cancelled = [usage for usage in usages if usage.outcome == "client_disconnect"]
+    assert len(cancelled) == 1
+    assert cancelled[0].error_code == "CLIENT_DISCONNECTED"
+    assert cancelled[0].allocated_gpu_seconds is None
+    assert all(replica.active_requests == 0 for replica in persisted_replicas)
 
 
 async def test_gateway_bounds_buffered_responses_but_keeps_sse_streaming(
@@ -388,6 +439,381 @@ async def test_gateway_bounds_buffered_responses_but_keeps_sse_streaming(
     ]
 
 
+async def test_gateway_downstream_send_failure_closes_upstream_and_releases_request(
+    gateway_database: Database,
+) -> None:
+    service_id, _replicas = await _ready_service(gateway_database)
+    stream = ChunkStream([b'data: {"choices":[]}\n\n', b"data: [DONE]\n\n"])
+
+    async def upstream(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            stream=stream,
+        )
+
+    metrics = GatewayMetrics()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        gateway = GatewayService(
+            gateway_database,
+            client,
+            metrics,
+            request_timeout=1,
+            endpoint_host_allowlist="*.test",
+        )
+        result = await gateway.forward(
+            project_id=PROJECT_ID,
+            public_model="chat-main",
+            path="/v1/completions",
+            payload={"model": "chat-main", "prompt": "disconnect", "stream": True},
+            request_headers={},
+            stream_requested=True,
+            client_disconnected=lambda: _false(),
+        )
+        response = gateway_routes._gateway_response(result)
+        assert isinstance(response, gateway_routes._GatewayStreamingResponse)
+
+        async def broken_send(message: MutableMapping[str, Any]) -> None:
+            if message["type"] == "http.response.body":
+                raise ConnectionError("downstream closed")
+
+        with pytest.raises(ConnectionError, match="downstream closed"):
+            await response.stream_response(broken_send)
+
+    assert stream.closed is True
+    load = await metrics.snapshot(service_id)
+    assert load is not None and load.active_requests == 0
+    async with gateway_database.session() as session:
+        usage = await session.scalar(select(ServingRequestUsage))
+        replicas = await ServiceRepository.list_replicas(session, service_id)
+    assert usage is not None
+    assert usage.outcome == "client_disconnect"
+    assert usage.error_code == "CLIENT_DISCONNECTED"
+    assert all(replica.active_requests == 0 for replica in replicas)
+
+
+async def test_gateway_asgi_23_disconnect_completes_cancel_safe_cleanup(
+    gateway_database: Database,
+) -> None:
+    service_id, _replicas = await _ready_service(gateway_database)
+    stream = DisconnectChunkStream()
+
+    async def upstream(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            stream=stream,
+        )
+
+    metrics = GatewayMetrics()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        gateway = GatewayService(
+            gateway_database,
+            client,
+            metrics,
+            request_timeout=1,
+            endpoint_host_allowlist="*.test",
+        )
+        result = await gateway.forward(
+            project_id=PROJECT_ID,
+            public_model="chat-main",
+            path="/v1/completions",
+            payload={"model": "chat-main", "prompt": "disconnect", "stream": True},
+            request_headers={},
+            stream_requested=True,
+            client_disconnected=lambda: _false(),
+        )
+        response = gateway_routes._gateway_response(result)
+        assert isinstance(response, gateway_routes._GatewayStreamingResponse)
+
+        messages: list[Message] = []
+
+        async def receive() -> Message:
+            await stream.waiting_for_next_chunk.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message: Message) -> None:
+            messages.append(message)
+
+        scope: Scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+        }
+        await response(scope, receive, send)
+
+    assert any(message["type"] == "http.response.body" for message in messages)
+    assert stream.closed is True
+    load = await metrics.snapshot(service_id)
+    assert load is not None and load.active_requests == 0
+    async with gateway_database.session() as session:
+        usage = await session.scalar(select(ServingRequestUsage))
+        replicas = await ServiceRepository.list_replicas(session, service_id)
+    assert usage is not None
+    assert usage.outcome == "client_disconnect"
+    assert usage.error_code == "CLIENT_DISCONNECTED"
+    assert all(replica.active_requests == 0 for replica in replicas)
+
+
+async def test_cancel_safe_cleanup_survives_direct_asyncio_cancellation() -> None:
+    started = asyncio.Event()
+    completed = asyncio.Event()
+
+    async def cleanup() -> None:
+        started.set()
+        await asyncio.sleep(0.01)
+        completed.set()
+
+    task = asyncio.create_task(gateway_service_module._await_cancel_safe(cleanup()))
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert completed.is_set()
+
+
+async def test_gateway_records_only_reported_upstream_usage_and_releases_replicas(
+    gateway_database: Database,
+) -> None:
+    service_id, replicas = await _ready_service(gateway_database)
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        prompt = str(payload["prompt"])
+        if payload.get("stream") is True:
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                stream=ChunkStream(
+                    [
+                        b'data: {"choices":[]}\n\n',
+                        b'data: {"choices":[],"us',
+                        b'age":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}\n\n',
+                        b"data: [DONE]\n\n",
+                    ]
+                ),
+            )
+        if prompt == "reported":
+            usage = {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
+        elif prompt == "error-reported":
+            usage = {"prompt_tokens": 5, "completion_tokens": 0, "total_tokens": 5}
+        else:
+            usage = {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 99}
+        return httpx.Response(
+            429 if prompt == "error-reported" else 200,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            json={"choices": [], "usage": usage},
+        )
+
+    metrics = GatewayMetrics()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as upstream_client:
+        gateway = GatewayService(
+            gateway_database,
+            upstream_client,
+            metrics,
+            request_timeout=1,
+            endpoint_host_allowlist="*.test",
+        )
+        for prompt, expected_status in (
+            ("reported", 200),
+            ("malformed", 200),
+            ("error-reported", 429),
+        ):
+            result = await gateway.forward(
+                project_id=PROJECT_ID,
+                public_model="chat-main",
+                path="/v1/completions",
+                payload={"model": "chat-main", "prompt": prompt},
+                request_headers={},
+                stream_requested=False,
+                client_disconnected=lambda: _false(),
+            )
+            assert result.status_code == expected_status
+
+        streamed = await gateway.forward(
+            project_id=PROJECT_ID,
+            public_model="chat-main",
+            path="/v1/completions",
+            payload={"model": "chat-main", "prompt": "streamed", "stream": True},
+            request_headers={},
+            stream_requested=True,
+            client_disconnected=lambda: _false(),
+        )
+        assert streamed.stream is not None
+        assert b"".join([chunk async for chunk in streamed.stream]).endswith(b"data: [DONE]\n\n")
+
+    async with gateway_database.session() as session:
+        rows = list(
+            await session.scalars(
+                select(ServingRequestUsage).order_by(ServingRequestUsage.started_at)
+            )
+        )
+        persisted_replicas = await ServiceRepository.list_replicas(session, service_id)
+
+    assert len(rows) == 4
+    reported = next(row for row in rows if row.total_tokens == 3)
+    error_reported = next(row for row in rows if row.total_tokens == 5)
+    malformed = next(row for row in rows if not row.streamed and row.total_tokens is None)
+    streamed_usage = next(row for row in rows if row.streamed)
+    assert (reported.prompt_tokens, reported.completion_tokens) == (2, 1)
+    assert error_reported.outcome == "upstream_error"
+    assert error_reported.error_code == "UPSTREAM_HTTP_ERROR"
+    assert malformed.prompt_tokens is None
+    assert (
+        streamed_usage.prompt_tokens,
+        streamed_usage.completion_tokens,
+        streamed_usage.total_tokens,
+    ) == (4, 2, 6)
+    assert streamed_usage.time_to_first_token_seconds is not None
+    assert all(row.allocated_gpu_seconds == Decimal("0.000000") for row in rows)
+    assert all(
+        row.outcome == "success" and row.error_code is None
+        for row in rows
+        if row is not error_reported
+    )
+    assert all(replica.active_requests == 0 for replica in persisted_replicas)
+    for replica in replicas:
+        load = await metrics.replica_snapshot(service_id, replica.id)
+        assert load is not None and load.active_requests == 0
+
+
+async def test_gateway_enforces_connect_first_token_and_overall_deadlines(
+    gateway_database: Database,
+) -> None:
+    service_id, _replicas = await _ready_service(gateway_database)
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        prompt = str(json.loads(request.content)["prompt"])
+        if prompt == "connect":
+            raise httpx.ConnectTimeout("connect timeout", request=request)
+        if prompt == "first-token":
+            stream = DelayedChunkStream([(0.2, b"late")])
+        else:
+            stream = DelayedChunkStream(
+                [
+                    (0, b'data: {"choices":[]}\n\n'),
+                    (0.3, b"data: [DONE]\n\n"),
+                ]
+            )
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            stream=stream,
+        )
+
+    metrics = GatewayMetrics()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as upstream_client:
+        gateway = GatewayService(
+            gateway_database,
+            upstream_client,
+            metrics,
+            request_timeout=0.2,
+            connect_timeout=0.05,
+            first_token_timeout=0.1,
+            endpoint_host_allowlist="*.test",
+        )
+        with pytest.raises(APIError) as connect_error:
+            await gateway.forward(
+                project_id=PROJECT_ID,
+                public_model="chat-main",
+                path="/v1/completions",
+                payload={"model": "chat-main", "prompt": "connect"},
+                request_headers={},
+                stream_requested=False,
+                client_disconnected=lambda: _false(),
+            )
+        assert connect_error.value.code == "UPSTREAM_CONNECT_TIMEOUT"
+
+        with pytest.raises(APIError) as first_token_error:
+            await gateway.forward(
+                project_id=PROJECT_ID,
+                public_model="chat-main",
+                path="/v1/completions",
+                payload={"model": "chat-main", "prompt": "first-token", "stream": True},
+                request_headers={},
+                stream_requested=True,
+                client_disconnected=lambda: _false(),
+            )
+        assert first_token_error.value.code == "INFERENCE_REQUEST_TIMEOUT"
+
+        overall = await gateway.forward(
+            project_id=PROJECT_ID,
+            public_model="chat-main",
+            path="/v1/completions",
+            payload={"model": "chat-main", "prompt": "overall", "stream": True},
+            request_headers={},
+            stream_requested=True,
+            client_disconnected=lambda: _false(),
+        )
+        assert overall.stream is not None
+        chunks = [chunk async for chunk in overall.stream]
+        assert chunks == [b'data: {"choices":[]}\n\n']
+
+    async with gateway_database.session() as session:
+        rows = list(await session.scalars(select(ServingRequestUsage)))
+        persisted_replicas = await ServiceRepository.list_replicas(session, service_id)
+
+    assert {row.outcome for row in rows} == {
+        "connect_timeout",
+        "first_token_timeout",
+        "inference_timeout",
+    }
+    assert {row.error_code for row in rows} == {
+        "UPSTREAM_CONNECT_TIMEOUT",
+        "INFERENCE_REQUEST_TIMEOUT",
+    }
+    assert all(row.allocated_gpu_seconds is None for row in rows)
+    assert all(replica.active_requests == 0 for replica in persisted_replicas)
+    service_load = await metrics.snapshot(service_id)
+    assert service_load is not None and service_load.active_requests == 0
+
+
+async def test_gateway_returns_stable_no_healthy_replica_error(
+    gateway_database: Database,
+) -> None:
+    service_id, _replicas = await _ready_service(gateway_database)
+    async with gateway_database.session() as session, session.begin():
+        replicas = await ServiceRepository.list_replicas(session, service_id, for_update=True)
+        for replica in replicas:
+            replica.health = ReplicaHealth.UNHEALTHY
+
+    calls = 0
+
+    async def must_not_call(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"choices": []})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(must_not_call)) as client:
+        gateway = GatewayService(
+            gateway_database,
+            client,
+            GatewayMetrics(),
+            request_timeout=1,
+            endpoint_host_allowlist="*.test",
+        )
+        with pytest.raises(APIError) as error:
+            await gateway.forward(
+                project_id=PROJECT_ID,
+                public_model="chat-main",
+                path="/v1/completions",
+                payload={"model": "chat-main", "prompt": "hello"},
+                request_headers={},
+                stream_requested=False,
+                client_disconnected=lambda: _false(),
+            )
+
+    assert error.value.status_code == 503
+    assert error.value.code == "NO_HEALTHY_REPLICA"
+    assert calls == 0
+    async with gateway_database.session() as session:
+        usage = await session.scalar(select(ServingRequestUsage))
+    assert usage is not None
+    assert usage.outcome == "no_healthy_replica"
+    assert usage.error_code == "NO_HEALTHY_REPLICA"
+    assert usage.replica_id is None
+
+
 async def test_gateway_returns_stable_unavailable_and_requires_api_key(
     gateway_database: Database,
 ) -> None:
@@ -416,7 +842,7 @@ async def test_gateway_returns_stable_unavailable_and_requires_api_key(
         )
     await upstream_client.aclose()
     assert unavailable_error.value.status_code == 503
-    assert unavailable_error.value.code == "UPSTREAM_UNAVAILABLE"
+    assert unavailable_error.value.code == "UPSTREAM_DISCONNECTED"
 
     async def timed_out(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("slow upstream", request=request)
@@ -441,7 +867,7 @@ async def test_gateway_returns_stable_unavailable_and_requires_api_key(
         )
     await timeout_client.aclose()
     assert timeout_error.value.status_code == 503
-    assert timeout_error.value.code == "UPSTREAM_TIMEOUT"
+    assert timeout_error.value.code == "INFERENCE_REQUEST_TIMEOUT"
 
     legacy = Principal(kind=PrincipalKind.LEGACY, project_id=PROJECT_ID)
     with pytest.raises(APIError) as auth_error:
@@ -619,7 +1045,7 @@ async def test_health_threshold_marks_unhealthy_then_reconciles_replacements(
     original_ids = {replica.id for replica in original_replicas}
     original = [replica for replica in all_replicas if replica.id in original_ids]
     replacements = [replica for replica in all_replicas if replica.id not in original_ids]
-    assert all(replica.status == ReplicaStatus.STOPPING for replica in original)
+    assert all(replica.status == ReplicaStatus.DRAINING for replica in original)
     assert all(replica.status == ReplicaStatus.PENDING for replica in replacements)
 
 

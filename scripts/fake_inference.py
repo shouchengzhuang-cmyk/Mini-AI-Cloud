@@ -59,6 +59,7 @@ def create_app(*, model: str = "fake-model", delay_seconds: float = 0.0) -> Fast
                     created=created,
                     model=requested_model,
                     content=content,
+                    usage=_usage(prompt, content),
                     delay_seconds=delay_seconds,
                 ),
                 media_type="text/event-stream",
@@ -102,6 +103,7 @@ def create_app(*, model: str = "fake-model", delay_seconds: float = 0.0) -> Fast
                     created=created,
                     model=requested_model,
                     content=content,
+                    usage=_usage(prompt_value, content),
                     delay_seconds=delay_seconds,
                 ),
                 media_type="text/event-stream",
@@ -148,6 +150,7 @@ async def _chat_stream(
     created: int,
     model: str,
     content: str,
+    usage: dict[str, int],
     delay_seconds: float,
 ) -> AsyncIterator[bytes]:
     yield _sse(
@@ -180,6 +183,16 @@ async def _chat_stream(
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
         }
     )
+    yield _sse(
+        {
+            "id": request_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [],
+            "usage": usage,
+        }
+    )
     yield b"data: [DONE]\n\n"
 
 
@@ -189,6 +202,7 @@ async def _completion_stream(
     created: int,
     model: str,
     content: str,
+    usage: dict[str, int],
     delay_seconds: float,
 ) -> AsyncIterator[bytes]:
     for piece in _pieces(content):
@@ -210,6 +224,16 @@ async def _completion_stream(
             "created": created,
             "model": model,
             "choices": [{"index": 0, "text": "", "finish_reason": "stop"}],
+        }
+    )
+    yield _sse(
+        {
+            "id": request_id,
+            "object": "text_completion",
+            "created": created,
+            "model": model,
+            "choices": [],
+            "usage": usage,
         }
     )
     yield b"data: [DONE]\n\n"
@@ -252,6 +276,8 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18000)
     parser.add_argument("--model", default="fake-model")
+    parser.add_argument("--replica-id")
+    parser.add_argument("--execution-id")
     parser.add_argument("--delay-seconds", type=float, default=0.0)
     args = parser.parse_args()
     uvicorn.run(

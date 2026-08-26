@@ -12,7 +12,7 @@ SIMULATION_OUTPUT_DIR ?= build/scheduler-simulation
 BACKUP_OUTPUT_DIR ?= build/backups
 
 .PHONY: help install format lint typecheck test test-unit test-integration test-docker \
-	test-e2e check config build up down ps logs migrate migrate-local run-api run-worker \
+	test-e2e test-serving check config build up down ps logs migrate migrate-local run-api run-worker \
 	load-test dev observability test-chaos test-k8s kind-up kind-down benchmark backup restore
 
 help: ## Show available targets.
@@ -47,6 +47,13 @@ test-docker: ## Run Docker runtime tests.
 
 test-e2e: ## Run Docker Runtime end-to-end tests.
 	$(PYTEST) -m e2e
+
+test-serving: ## Run Phase III Fake Serving, tenant isolation, and placement tests.
+	$(PYTEST) tests/integration/test_fake_serving_e2e.py \
+		tests/integration/test_gateway_project_isolation.py \
+		tests/integration/test_service_reconcile_concurrency.py \
+		tests/integration/test_vllm_tensor_parallel_e2e.py \
+		tests/unit/test_serving_scheduler.py
 
 check: lint typecheck test-unit ## Run the fast local quality gate.
 

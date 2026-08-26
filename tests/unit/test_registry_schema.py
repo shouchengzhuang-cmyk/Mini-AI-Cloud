@@ -61,6 +61,8 @@ def test_registered_model_metadata_must_be_small_and_json_serializable() -> None
         metadata={"format": "safetensors"},
     )
     assert payload.metadata == {"format": "safetensors"}
+    assert payload.runtime.value == "vllm"
+    assert payload.runtime_defaults.tensor_parallel_size == 1
 
     with pytest.raises(ValidationError, match="JSON serializable"):
         RegisteredModelCreate(
@@ -68,4 +70,44 @@ def test_registered_model_metadata_must_be_small_and_json_serializable() -> None
             provider="local",
             source="local/model",
             metadata={"bad": object()},
+        )
+
+
+def test_registered_model_runtime_defaults_are_typed_and_gang_consistent() -> None:
+    payload = RegisteredModelCreate(
+        name="qwen-tp4",
+        provider="huggingface",
+        source="Qwen/Qwen2.5-7B-Instruct",
+        revision="main",
+        runtime="vllm",
+        default_gpu_count=4,
+        runtime_defaults={
+            "gpu_model": "NVIDIA A100",
+            "tensor_parallel_size": 4,
+            "dtype": "bfloat16",
+            "gpu_memory_utilization": 0.85,
+            "max_model_len": 8192,
+        },
+    )
+
+    assert payload.default_gpu_count == 4
+    assert payload.runtime_defaults.tensor_parallel_size == 4
+    assert payload.runtime_defaults.dtype == "bfloat16"
+
+    with pytest.raises(ValidationError, match="tensor_parallel_size"):
+        RegisteredModelCreate(
+            name="split-tp",
+            provider="huggingface",
+            source="org/model",
+            default_gpu_count=4,
+            runtime_defaults={"tensor_parallel_size": 2},
+        )
+
+    with pytest.raises(ValidationError, match="fake registered models"):
+        RegisteredModelCreate(
+            name="invalid-fake",
+            provider="local",
+            source="fake/model",
+            runtime="fake",
+            default_gpu_count=1,
         )

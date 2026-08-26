@@ -58,6 +58,9 @@ async def docker_harness() -> AsyncIterator[DockerHarness]:
     global _image_ready
 
     runtime = DockerRuntime(
+        # Keep synthetic test containers outside any concurrently running local
+        # stack's orphan-recovery domain.
+        cluster_id=f"mini-docker-cloud-e2e-{uuid.uuid4().hex}",
         pids_limit=PIDS_LIMIT,
         tmpfs_size_mb=16,
         stop_timeout=1,

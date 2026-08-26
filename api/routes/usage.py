@@ -14,6 +14,7 @@ from api.schemas.usage import (
     ProjectQuotaResponse,
     ProjectQuotaStateResponse,
     ProjectQuotaUpdate,
+    ServingUsageResponse,
     UsageResponse,
 )
 from core.database import Database
@@ -166,4 +167,13 @@ def _usage_response(aggregate: UsageAggregate) -> UsageResponse:
         gpu_seconds=aggregate.gpu_seconds,
         gpu_breakdown=[GPUUsageResponse.model_validate(item) for item in aggregate.gpu_breakdown],
         costs=[CurrencyCostResponse.model_validate(cost) for cost in aggregate.costs],
+        serving=ServingUsageResponse(
+            request_count=aggregate.serving_request_count,
+            requests_with_reported_token_usage=aggregate.serving_requests_with_token_usage,
+            reported_input_tokens=aggregate.input_tokens,
+            reported_output_tokens=aggregate.output_tokens,
+            reported_total_tokens=aggregate.total_tokens,
+            allocated_gpu_seconds=aggregate.serving_allocated_gpu_seconds,
+            replica_gpu_seconds=aggregate.serving_replica_gpu_seconds,
+        ),
     )

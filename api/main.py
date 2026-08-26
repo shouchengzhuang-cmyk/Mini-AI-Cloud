@@ -73,7 +73,9 @@ def create_app(
         else start_control_plane
     )
     service_reconciler = ServiceReconciler(
-        resolved_database, batch_size=resolved_settings.batch_size
+        resolved_database,
+        batch_size=resolved_settings.batch_size,
+        drain_timeout_seconds=resolved_settings.service_drain_timeout,
     )
     upstream_client = httpx.AsyncClient(
         follow_redirects=False,
@@ -86,6 +88,8 @@ def create_app(
         upstream_client,
         gateway_metrics,
         request_timeout=resolved_settings.service_proxy_timeout,
+        connect_timeout=resolved_settings.service_proxy_connect_timeout,
+        first_token_timeout=resolved_settings.service_proxy_first_token_timeout,
         max_response_bytes=resolved_settings.service_proxy_max_response_bytes,
         endpoint_host_allowlist=resolved_settings.service_endpoint_host_allowlist,
     )

@@ -15,11 +15,20 @@ class ServiceReconciler:
     runtimes; Workers will consume the persisted replica intent in a later slice.
     """
 
-    def __init__(self, database: Database, *, batch_size: int = 100) -> None:
+    def __init__(
+        self,
+        database: Database,
+        *,
+        batch_size: int = 100,
+        drain_timeout_seconds: float = 30.0,
+    ) -> None:
         if batch_size < 1:
             raise ValueError("batch_size must be at least one")
+        if drain_timeout_seconds < 0:
+            raise ValueError("drain_timeout_seconds must not be negative")
         self.database = database
         self.batch_size = batch_size
+        self.drain_timeout_seconds = drain_timeout_seconds
         self.logger = get_logger("service_reconciler")
 
     async def run_once(self) -> ReconcileResult:
@@ -27,7 +36,11 @@ class ServiceReconciler:
             recovery = await ServiceRepository.recover_expired_leases(
                 session, limit=self.batch_size
             )
-            result = await ServiceRepository.reconcile_batch(session, limit=self.batch_size)
+            result = await ServiceRepository.reconcile_batch(
+                session,
+                limit=self.batch_size,
+                drain_timeout_seconds=self.drain_timeout_seconds,
+            )
         if recovery.replicas_lost or recovery.replicas_stopped:
             self.logger.warning(
                 "expired service replica leases recovered",
@@ -61,7 +74,11 @@ class ServiceReconciler:
             )
             if service is None:
                 return None
-            return await ServiceRepository.reconcile_locked(session, service)
+            return await ServiceRepository.reconcile_locked(
+                session,
+                service,
+                drain_timeout_seconds=self.drain_timeout_seconds,
+            )
 
     async def choose_endpoint(
         self,
