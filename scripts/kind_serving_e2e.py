@@ -27,6 +27,7 @@ CLUSTER_ID_LABEL = "mini-ai-cloud/cluster-id"
 RUNTIME_LABEL = "mini-ai-cloud/runtime"
 POD_RESOURCE_KIND = "serving-pod"
 SERVICE_RESOURCE_KIND = "serving-service"
+HEADLESS_SERVICE_NAME = "mini-ai-cloud-serving-pods"
 
 
 class KindServingE2EError(RuntimeError):
@@ -375,9 +376,9 @@ async def _run_serving_scenario(
                 raise KindServingE2EError(
                     "ready Kubernetes Replica did not persist its resolved image digest"
                 )
-        if len(kube.serving_services(service_id)) != 2:
-            raise KindServingE2EError("expected one Kubernetes Service per ready Replica")
-        print("PASS: two real Kubernetes serving Pods reached ready with resolved image digests")
+        if kube.serving_services(service_id):
+            raise KindServingE2EError("controller created a forbidden per-Replica Service")
+        print("PASS: two real Kubernetes serving Pods reached ready behind static headless DNS")
 
         models = await api.json("GET", "/v1/models")
         model_rows = models.get("data")
@@ -443,8 +444,8 @@ async def _run_serving_scenario(
         await _scale(api, service_id, 4)
         _, scaled, _ = await _wait_service_ready(api, service_id, 4, timeout_seconds=90)
         scaled_pods = await _wait_pods(kube, service_id, expected=4, ready=True, timeout_seconds=60)
-        if len(kube.serving_services(service_id)) != 4:
-            raise KindServingE2EError("scale-up did not converge to four per-Replica Services")
+        if kube.serving_services(service_id):
+            raise KindServingE2EError("scale-up created a forbidden per-Replica Service")
         print("PASS: Kubernetes serving scaled from 2 to 4 ready Replicas")
 
         await _assert_scale_down_drain(
@@ -477,8 +478,8 @@ async def _run_serving_scenario(
             raise KindServingE2EError(
                 "controller restart replaced or duplicated a healthy execution"
             )
-        if len(kube.serving_services(service_id)) != 1:
-            raise KindServingE2EError("controller restart left duplicate per-Replica Services")
+        if kube.serving_services(service_id):
+            raise KindServingE2EError("controller restart created a forbidden per-Replica Service")
         print("PASS: controller rollout restart adopted the existing healthy Replica")
 
         bad_service_id = await _assert_bad_image_backoff(
@@ -711,8 +712,8 @@ async def _assert_scale_down_drain(
     final_pod_replica_id = _required_label(_labels(final_pods[0]), REPLICA_ID_LABEL)
     if final_ready_ids != {expected_survivor_id} or final_pod_replica_id != expected_survivor_id:
         raise KindServingE2EError("scale-down did not retain the expected healthy Replica")
-    if len(kube.serving_services(service_id)) != 1:
-        raise KindServingE2EError("scale-down left duplicate per-Replica Services")
+    if kube.serving_services(service_id):
+        raise KindServingE2EError("scale-down created a forbidden per-Replica Service")
 
 
 async def _wait_replica_status(
@@ -874,7 +875,7 @@ async def _cleanup_services(api: API, kube: Kubectl, service_ids: Sequence[str])
         except KindServingE2EError as exc:
             errors.append(f"resources {service_id}: {exc}")
     if not errors and service_ids:
-        print("PASS: stopped test services and removed their Kubernetes resources")
+        print("PASS: stopped test services and removed their Kubernetes serving Pods")
     return errors
 
 
@@ -891,7 +892,9 @@ async def _wait_kubernetes_resources_removed(
         if not pods and not services:
             return
         await asyncio.sleep(0.5)
-    raise KindServingE2EError(f"service {service_id} retained serving Pods or Services after stop")
+    raise KindServingE2EError(
+        f"service {service_id} retained serving Pods or forbidden per-Replica Services after stop"
+    )
 
 
 def _assert_pod_contract(
@@ -936,6 +939,8 @@ def _assert_pod_contract(
             raise KindServingE2EError("serving Pod labels do not match persisted ownership")
         if spec.get("automountServiceAccountToken") is not False:
             raise KindServingE2EError("inference Pod automounts a service account token")
+        if spec.get("hostname") != name or spec.get("subdomain") != HEADLESS_SERVICE_NAME:
+            raise KindServingE2EError("inference Pod is outside the static headless DNS contract")
         if any(spec.get(key) is True for key in ("hostNetwork", "hostPID", "hostIPC")):
             raise KindServingE2EError("inference Pod enables a host namespace")
         pod_security = spec.get("securityContext")

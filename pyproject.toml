@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mini-ai-cloud"
-version = "0.4.0.dev0"
+version = "0.4.0"
 description = "Evidence-driven control plane for reliable AI workload scheduling and serving"
 readme = "README.md"
 license = "MIT"
@@ -15,7 +15,7 @@ dependencies = [
   "argon2-cffi>=23.1,<26",
   "asyncpg>=0.30,<1",
   "boto3>=1.35,<2",
-  "cryptography>=44,<47",
+  "cryptography>=50,<51",
   "docker>=7.1,<8",
   "fastapi>=0.115,<1",
   "httpx>=0.28,<1",
