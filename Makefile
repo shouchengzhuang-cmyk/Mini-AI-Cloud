@@ -11,11 +11,11 @@ LOCAL_STACK_PROJECT ?= mini-ai-cloud
 SIMULATION_OUTPUT_DIR ?= build/scheduler-simulation
 BACKUP_OUTPUT_DIR ?= build/backups
 
-.PHONY: help install format lint typecheck validate-evidence test test-unit test-integration test-docker \
+.PHONY: help install format lint typecheck validate-evidence evidence test test-unit test-integration test-docker \
 	test-e2e test-serving check config build up down ps logs migrate migrate-local run-api run-worker \
 	load-test dev observability test-chaos test-k8s kind-up kind-down kind-serving-up \
 	test-kind-serving kind-serving-down demo-fencing demo-adoption demo-sse-drain demo-all \
-	test-dr benchmark backup restore
+	test-soak test-dr benchmark backup restore
 
 help: ## Show available targets.
 	@awk 'BEGIN {FS = ":.*## "; printf "Usage: make <target>\n\n"} \
@@ -37,6 +37,9 @@ typecheck: ## Run strict static type checking.
 
 validate-evidence: ## Validate claims, invariants, environments, schema, and matrix.
 	$(UV) run python scripts/validate_evidence.py
+
+evidence: ## Collect a credential-safe evidence bundle bound to the current commit.
+	$(UV) run mini-cloud evidence collect
 
 test: ## Run the complete pytest suite.
 	$(PYTEST)
@@ -134,6 +137,10 @@ demo-sse-drain: ## Run active SSE drain against an isolated Kind cluster.
 
 demo-all: ## Run all hero scenarios and clean the isolated Kind cluster.
 	$(UV) run mini-cloud demo all
+
+test-soak: ## Run bounded restart/fencing soak; requires CONFIRM_SOAK=YES.
+	@test "$(CONFIRM_SOAK)" = "YES" || { echo "CONFIRM_SOAK=YES is required" >&2; exit 2; }
+	$(UV) run python scripts/soak.py --rounds "$${SOAK_ROUNDS:-3}"
 
 benchmark: ## Compare binpack/spread on 100 workers, 4 GPUs each, and 10000 jobs.
 	$(UV) run python -m scripts.scheduler_simulation \

@@ -22,3 +22,6 @@ git diff -- evidence/schema.json evidence/matrix.md
 ```
 
 `PASS` requires an exact `verified_commit`. `PENDING` means a command is registered but has not been run for the contract commit. `NOT_RUN` records an unavailable environment explicitly. Evidence bundles produced by later release tooling may update execution status; this YAML never infers it from file presence.
+
+Generate a commit-bound projection with `make evidence`; bundle fields and security boundaries are
+documented in [`docs/evidence-bundles.md`](../docs/evidence-bundles.md).
