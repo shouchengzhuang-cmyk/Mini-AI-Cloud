@@ -6,8 +6,8 @@ COMPOSE ?= docker compose
 PYTEST ?= $(UV) run pytest
 POWERSHELL ?= pwsh
 KIND ?= kind
-KIND_CLUSTER_NAME ?= mini-docker-cloud-test
-LOCAL_STACK_PROJECT ?= mini-docker-cloud
+KIND_CLUSTER_NAME ?= mini-ai-cloud-test
+LOCAL_STACK_PROJECT ?= mini-ai-cloud
 SIMULATION_OUTPUT_DIR ?= build/scheduler-simulation
 BACKUP_OUTPUT_DIR ?= build/backups
 

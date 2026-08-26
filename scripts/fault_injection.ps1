@@ -227,7 +227,7 @@ function Find-TaskContainers {
             "ps",
             "-aq",
             "--filter",
-            "label=mini-docker-cloud.task_id=$TaskId"
+            "label=mini-ai-cloud.task_id=$TaskId"
         )
     ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
 }
@@ -332,7 +332,7 @@ function Test-PostgresUnavailable {
 function Test-ImagePullFailure {
     Write-Host "[Case 3] Docker image pull failure"
     $parameters = @{
-        Image = "python:mini-docker-cloud-image-does-not-exist"
+        Image = "python:mini-ai-cloud-image-does-not-exist"
         Command = @("python", "-c", "print('unreachable')")
     }
     $task = New-FaultTask @parameters
@@ -582,10 +582,10 @@ if ($Case -eq "List") {
 }
 
 $target = if ($script:UseWsl) {
-    "Compose project mini-docker-cloud through WSL"
+    "Compose project mini-ai-cloud through WSL"
 }
 else {
-    "Compose project mini-docker-cloud"
+    "Compose project mini-ai-cloud"
 }
 if (-not $PSCmdlet.ShouldProcess($target, "run destructive fault injection case $Case")) {
     return

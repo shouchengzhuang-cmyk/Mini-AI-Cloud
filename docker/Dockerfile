@@ -14,8 +14,8 @@ RUN --mount=type=cache,target=/root/.cache/pip python -m pip install .
 
 FROM python:3.12-slim-bookworm AS runtime
 
-LABEL org.opencontainers.image.title="Mini Distributed Docker Task Platform" \
-      org.opencontainers.image.description="API and worker runtime for mini-docker-cloud"
+LABEL org.opencontainers.image.title="Mini AI Cloud" \
+      org.opencontainers.image.description="API and worker runtime for Mini AI Cloud"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

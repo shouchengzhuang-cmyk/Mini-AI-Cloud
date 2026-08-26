@@ -1,1 +1,1 @@
-"""Command-line client for Mini Docker Cloud."""
+"""Command-line client for Mini AI Cloud."""

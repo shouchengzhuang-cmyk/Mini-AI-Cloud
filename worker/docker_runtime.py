@@ -74,7 +74,7 @@ class DockerRuntime:
         tmpfs_size_mb: int,
         stop_timeout: int,
         always_pull: bool = False,
-        cluster_id: str = "mini-docker-cloud-local",
+        cluster_id: str = "mini-ai-cloud-local",
         client: Any | None = None,
     ) -> None:
         self.client: Any = client or docker.from_env()  # type: ignore[attr-defined]
@@ -176,13 +176,13 @@ class DockerRuntime:
         device_requests = _gpu_device_requests(spec)
 
         labels = {
-            "mini-docker-cloud.task_id": str(spec.task_id),
-            "mini-docker-cloud.execution_id": str(spec.execution_id),
-            "mini-docker-cloud.managed": "true",
-            "mini-docker-cloud.cluster_id": self.cluster_id,
+            "mini-ai-cloud.task_id": str(spec.task_id),
+            "mini-ai-cloud.execution_id": str(spec.execution_id),
+            "mini-ai-cloud.managed": "true",
+            "mini-ai-cloud.cluster_id": self.cluster_id,
         }
         if include_worker_label:
-            labels["mini-docker-cloud.worker_id"] = spec.worker_id
+            labels["mini-ai-cloud.worker_id"] = spec.worker_id
 
         options: dict[str, Any] = {
             "image": spec.image,
@@ -412,9 +412,9 @@ class DockerRuntime:
                 all=True,
                 filters={
                     "label": [
-                        "mini-docker-cloud.managed=true",
-                        f"mini-docker-cloud.cluster_id={self.cluster_id}",
-                        "mini-docker-cloud.worker_id",
+                        "mini-ai-cloud.managed=true",
+                        f"mini-ai-cloud.cluster_id={self.cluster_id}",
+                        "mini-ai-cloud.worker_id",
                     ]
                 },
             )
