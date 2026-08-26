@@ -45,6 +45,8 @@ jobs:
         run: uv run mypy .
       - name: Unit tests
         run: uv run pytest -m "not integration and not docker and not e2e"
+      - name: Run local fencing hero demo
+        run: uv run mini-cloud demo fencing --output-dir build/hero-demo-ci
 
   integration:
     runs-on: ubuntu-latest

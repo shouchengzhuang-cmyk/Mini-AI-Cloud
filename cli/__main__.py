@@ -12,6 +12,8 @@ from typing import Annotated, Any
 import httpx
 import typer
 
+from cli.hero_demo import HeroDemoError, ScenarioName, run_hero_scenarios
+
 _DEFAULT_BASE_URL = "http://localhost:8000"
 _API_KEY = re.compile(r"^mkc_[a-f0-9]{16}_[A-Za-z0-9_-]{43}$")
 _CONFIG_ENV = "MINI_CLOUD_CONFIG"
@@ -31,12 +33,14 @@ task_app = typer.Typer(no_args_is_help=True, help="Submit and inspect tasks.")
 service_app = typer.Typer(no_args_is_help=True, help="Manage model services.")
 admin_app = typer.Typer(no_args_is_help=True, help="Run admin diagnostics and safe repairs.")
 worker_app = typer.Typer(no_args_is_help=True, help="Inspect and manage compute workers.")
+demo_app = typer.Typer(no_args_is_help=True, help="Run evidence-producing hero scenarios.")
 app.add_typer(auth_app, name="auth")
 app.add_typer(project_app, name="project")
 app.add_typer(task_app, name="task")
 app.add_typer(service_app, name="service")
 app.add_typer(admin_app, name="admin")
 app.add_typer(worker_app, name="worker")
+app.add_typer(demo_app, name="demo")
 
 
 class CLIConfigError(RuntimeError):
@@ -558,6 +562,51 @@ def admin_doctor(
             "result": repair_result,
         }
     _print_json(diagnostic)
+
+
+def _run_hero_demo(names: tuple[ScenarioName, ...], output_dir: Path) -> None:
+    try:
+        run_hero_scenarios(names, output_dir)
+    except HeroDemoError as exc:
+        if exc.artifact_dir is not None:
+            typer.echo(f"Diagnostics retained at {exc.artifact_dir}", err=True)
+        raise typer.Exit(1) from exc
+
+
+@demo_app.command("fencing")
+def demo_fencing(
+    output_dir: Annotated[Path, typer.Option(help="Evidence artifact root")] = Path(
+        "build/hero-demo"
+    ),
+) -> None:
+    _run_hero_demo(("fencing",), output_dir)
+
+
+@demo_app.command("controller-adoption")
+def demo_controller_adoption(
+    output_dir: Annotated[Path, typer.Option(help="Evidence artifact root")] = Path(
+        "build/hero-demo"
+    ),
+) -> None:
+    _run_hero_demo(("controller-adoption",), output_dir)
+
+
+@demo_app.command("sse-drain")
+def demo_sse_drain(
+    output_dir: Annotated[Path, typer.Option(help="Evidence artifact root")] = Path(
+        "build/hero-demo"
+    ),
+) -> None:
+    _run_hero_demo(("sse-drain",), output_dir)
+
+
+@demo_app.command("all")
+def demo_all(
+    output_dir: Annotated[Path, typer.Option(help="Evidence artifact root")] = Path(
+        "build/hero-demo"
+    ),
+) -> None:
+    _run_hero_demo(("fencing", "controller-adoption", "sse-drain"), output_dir)
 
 
 def main() -> None:
