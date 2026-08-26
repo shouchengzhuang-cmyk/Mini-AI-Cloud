@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly DEFAULT_LOCAL_PROJECT="mini-docker-cloud"
-readonly LOCAL_PROJECT_PREFIX="mini-docker-cloud-local"
+readonly DEFAULT_LOCAL_PROJECT="mini-ai-cloud"
+readonly LOCAL_PROJECT_PREFIX="mini-ai-cloud-local"
 readonly ARCHIVE_IMAGE="alpine:3.21"
 
 usage() {

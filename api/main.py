@@ -45,6 +45,7 @@ from core.config import Settings, get_settings
 from core.database import Database
 from core.logging import configure_logging, get_logger
 from core.metrics import API_REQUEST_DURATION, API_REQUESTS
+from core.project_identity import PROJECT_VERSION
 from core.redis import RedisQueue
 from scheduler.global_scheduler import GlobalScheduler
 from worker.kubernetes_serving_runtime import KubernetesServingRuntimeAdapter
@@ -284,7 +285,7 @@ def create_app(
 
     app = FastAPI(
         title="Mini AI Cloud",
-        version="0.2.0",
+        version=PROJECT_VERSION,
         lifespan=lifespan,
     )
     app.state.settings = resolved_settings

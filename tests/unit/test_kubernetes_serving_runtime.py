@@ -46,7 +46,7 @@ def _spec() -> KubernetesServingLaunchSpec:
         project_id=PROJECT_ID,
         generation=7,
         execution_id=EXECUTION_ID,
-        image="mini-docker-cloud:kind-test",
+        image="mini-ai-cloud:kind-test",
         model="fake-model",
         cpu_millicores=250,
         memory_mb=256,
@@ -198,7 +198,7 @@ async def test_prepare_builds_secure_fenced_pod_and_exact_cluster_ip_service() -
     assert pod.spec.volumes[0].empty_dir.size_limit == "64Mi"
 
     container = pod.spec.containers[0]
-    assert container.image == "mini-docker-cloud:kind-test"
+    assert container.image == "mini-ai-cloud:kind-test"
     assert container.image_pull_policy == "IfNotPresent"
     assert container.command[-4:] == [
         "--startup-delay-seconds",
@@ -280,7 +280,7 @@ async def test_prepare_rejects_pod_with_exact_labels_but_drifted_workload(
     pod = runtime._build_pod(spec, selector)
     container = pod.spec.containers[0]
     if drift == "image":
-        container.image = "mini-docker-cloud:wrong-image"
+        container.image = "mini-ai-cloud:wrong-image"
     elif drift == "command":
         container.command[0] = "sh"
     elif drift == "args":
@@ -623,7 +623,7 @@ async def test_list_managed_isolates_one_drifted_pair_and_recovers_other_resourc
 
     drifted_pod, drifted_service = pairs[2]
     if drifted_kind == "pod":
-        drifted_pod.spec.containers[0].image = "mini-docker-cloud:drifted-image"
+        drifted_pod.spec.containers[0].image = "mini-ai-cloud:drifted-image"
     else:
         drifted_service.spec.selector[PROJECT_ID_LABEL] = str(uuid.uuid4())
 

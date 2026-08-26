@@ -336,12 +336,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url", default="http://localhost:8000")
     parser.add_argument(
         "--api-key",
-        default=os.getenv("MINI_DOCKER_CLOUD_API_KEY"),
-        help="Owner/admin project API key (prefer MINI_DOCKER_CLOUD_API_KEY to shell history)",
+        default=os.getenv("MINI_CLOUD_API_KEY"),
+        help="Owner/admin project API key (prefer MINI_CLOUD_API_KEY to shell history)",
     )
     parser.add_argument(
         "--other-project-api-key",
-        default=os.getenv("MINI_DOCKER_CLOUD_OTHER_PROJECT_API_KEY"),
+        default=os.getenv("MINI_CLOUD_OTHER_PROJECT_API_KEY"),
         help="Optional key from another project to verify not-found isolation",
     )
     parser.add_argument("--timeout", type=float, default=180.0)
@@ -360,7 +360,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if not args.api_key:
         print(
-            "phase2_demo: set MINI_DOCKER_CLOUD_API_KEY or pass --api-key",
+            "phase2_demo: set MINI_CLOUD_API_KEY or pass --api-key",
             file=sys.stderr,
         )
         return 2

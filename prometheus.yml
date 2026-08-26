@@ -7,9 +7,9 @@ scrape_configs:
     static_configs:
       - targets: ["127.0.0.1:9090"]
 
-  - job_name: mini-docker-cloud-api
+  - job_name: mini-ai-cloud-api
     metrics_path: /metrics
     static_configs:
       - targets: ["api:8000"]
         labels:
-          cluster: mini-docker-cloud-local
+          cluster: mini-ai-cloud-local

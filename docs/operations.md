@@ -2,6 +2,8 @@
 
 本手册针对一次性/本地 Compose 与受控测试环境。它不把单机 Compose 描述成生产 HA 部署。
 
+当前默认 Compose project 为 `mini-ai-cloud`。Docker Compose 不会自动重命名旧的 `mini-docker-cloud` project 或 volume；如需迁移已有本地栈，先完成备份，再用 `docker compose --project-name mini-docker-cloud down` 显式停止旧栈，并人工确认新栈应连接的数据。不要在未核对 volume 的情况下删除旧 project。
+
 ## 部署模式
 
 | 模式 | 用途 | 关键边界 |
@@ -102,7 +104,7 @@ Phase I 稳定代码恢复点为 `c47702b`，但“代码能切回”不等于�
 `scripts/backup.sh` 只接受受限的本地 Compose project 名，并备份 PostgreSQL custom dump、Local Artifact volume 和可选 MinIO volume。为了得到一致 snapshot，postgres 保持运行，API、Worker、migrate 和 MinIO 必须停止：
 
 ```bash
-docker compose --project-name mini-docker-cloud stop api worker minio
+docker compose --project-name mini-ai-cloud stop api worker minio
 make backup
 ```
 
@@ -119,7 +121,7 @@ SHA256SUMS
 脚本拒绝空 dump、多重匹配 volume 和不受支持的 project 名。备份成功后才能恢复服务：
 
 ```bash
-docker compose --project-name mini-docker-cloud up -d api worker
+docker compose --project-name mini-ai-cloud up -d api worker
 ```
 
 ## Local restore
@@ -127,9 +129,9 @@ docker compose --project-name mini-docker-cloud up -d api worker
 Restore 会覆盖目标测试栈的数据库与 artifact volume，必须显式确认：
 
 ```bash
-docker compose --project-name mini-docker-cloud stop
+docker compose --project-name mini-ai-cloud stop
 make restore BACKUP=/absolute/path/to/backup CONFIRM_RESTORE=YES
-docker compose --project-name mini-docker-cloud up -d
+docker compose --project-name mini-ai-cloud up -d
 curl -fsS http://localhost:8000/readyz
 ```
 
@@ -144,7 +146,7 @@ curl -fsS http://localhost:8000/readyz
 
 ## Disaster rehearsal
 
-只在全新、专用 project（例如 `mini-docker-cloud-local-dr-<run-id>`）演练。不可对日常开发栈或未知 volume 执行删除。
+只在全新、专用 project（例如 `mini-ai-cloud-local-dr-<run-id>`）演练。不可对日常开发栈或未知 volume 执行删除。
 
 1. 启动专用栈，创建并完成带唯一 marker 的 task/artifact。
 2. 停 API/Worker/MinIO，运行 `backup.sh`。
@@ -246,7 +248,7 @@ docker compose ps
 docker compose logs --tail=200 api worker migrate postgres redis
 curl -fsS http://localhost:8000/metrics
 uv run mini-cloud admin doctor
-docker ps -a --filter label=mini-docker-cloud.managed=true
+docker ps -a --filter label=mini-ai-cloud.managed=true
 ```
 
 不要在故障报告中复制 API Key、Secret、cookie、数据库密码、presigned URL 或完整环境变量。

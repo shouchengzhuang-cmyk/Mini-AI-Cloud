@@ -317,9 +317,9 @@ class WorkerService:
         cleanup_failures: list[str] = []
         for container in containers:
             labels = container.labels or {}
-            raw_task_id = labels.get("mini-docker-cloud.task_id")
-            raw_execution_id = labels.get("mini-docker-cloud.execution_id")
-            container_worker_id = labels.get("mini-docker-cloud.worker_id")
+            raw_task_id = labels.get("mini-ai-cloud.task_id")
+            raw_execution_id = labels.get("mini-ai-cloud.execution_id")
+            container_worker_id = labels.get("mini-ai-cloud.worker_id")
             stale = True
             try:
                 task_id = uuid.UUID(raw_task_id or "")

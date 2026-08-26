@@ -226,7 +226,7 @@ Fake runtime 只允许 development/test。Docker vLLM replica controller 默认�
 
 ## CLI
 
-Phase II 推荐短命令 `mini-cloud`；Phase I 名称 `mini-docker-cloud` 保留为指向同一个 Typer app 的兼容入口：
+`mini-cloud` 是主命令；Phase I 名称 `mini-docker-cloud` 保留一个开发版本作为兼容入口，并在 stderr 输出弃用提示：
 
 ```bash
 uv run mini-cloud auth login --url http://localhost:8000
@@ -259,4 +259,4 @@ uv run mini-cloud admin doctor --repair
 
 `admin doctor` 默认只读。`--repair` 只在一个数据库事务中幂等释放 terminal-task reservation 和清除 terminal-task lease；无法证明安全的候选会跳过，不会停止容器/Pod、修负容量或删除 runtime orphan。跨节点 runtime inventory 当前不可见，因此 orphan container/pod 会显式报告 `not_observable`。
 
-不带 `--api-key` 的 `auth login` 使用隐藏 prompt。也可用 `MINI_DOCKER_CLOUD_URL`、`MINI_DOCKER_CLOUD_API_KEY` 和 `MINI_DOCKER_CLOUD_CONFIG`；环境变量适合一次性 CI，配置文件适合本地交互。不要在 CI 日志打印 key。
+不带 `--api-key` 的 `auth login` 使用隐藏 prompt。主环境变量为 `MINI_CLOUD_URL`、`MINI_CLOUD_API_KEY` 和 `MINI_CLOUD_CONFIG`；旧的 `MINI_DOCKER_CLOUD_*` 前缀在本开发版本仍作为低优先级兼容读取。环境变量适合一次性 CI，配置文件适合本地交互。不要在 CI 日志打印 key。

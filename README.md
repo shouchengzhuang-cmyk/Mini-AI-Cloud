@@ -2,6 +2,8 @@
 
 *An evidence-driven experimental control plane for reliable AI workload scheduling and model serving.*
 
+Python distribution、CLI、Compose project 与默认镜像统一使用 `mini-ai-cloud` / `mini-cloud` 身份；当前开发版本为 `0.4.0.dev0`。
+
 Mini AI Cloud 是一个面向 AI 工作负载控制面正确性的轻量级实验平台。它重点研究在并发调度、Worker、Pod、Controller 故障和在线请求缩容时，如何依靠 PostgreSQL 这一状态真相源、lease、execution fencing 与 reconciliation，让任务和模型服务状态收敛。
 
 项目定位是 **production-minded experimental system**。代码按生产系统会遇到的并发、故障和权限边界来设计，能力声明则以可复现证据为准。它不是 production-ready cloud、KServe replacement、AWS replacement，也不是 production-grade Kubernetes operator。
@@ -77,7 +79,9 @@ uv run mini-cloud task list
 uv run mini-cloud admin doctor
 ```
 
-`mini-cloud` 是 Phase II 的短命令；兼容入口 `mini-docker-cloud` 指向同一个 CLI，Phase I 脚本无需改名。
+`mini-cloud` 是唯一主 CLI。兼容入口 `mini-docker-cloud` 暂时保留一个开发版本，功能不变，但会向 stderr 输出弃用提示；新脚本不要继续使用旧入口。
+
+CLI 会优先读取 `MINI_CLOUD_*` 环境变量和 `~/.config/mini-ai-cloud/config.json`，并在一个开发版本内兼容旧的 `MINI_DOCKER_CLOUD_*` 变量与 `~/.config/mini-docker-cloud/config.json`。Compose project 默认名也已改为 `mini-ai-cloud`；Docker Compose 不会自动重命名既有 `mini-docker-cloud` 栈或 volume，迁移前请先备份数据，并用旧 project name 显式停止旧栈。
 
 新项目的默认镜像策略是 deny 且要求 digest。开发演示如需使用 tag，必须由 owner/admin 显式放宽到最小范围：
 
@@ -104,11 +108,11 @@ curl -fsS -X PUT "http://localhost:8000/api/v1/projects/$PROJECT_ID/image-policy
 然后可运行 Phase II 认证任务、timeline、usage/cost 与 artifact 真实 API 演示：
 
 ```bash
-export MINI_DOCKER_CLOUD_API_KEY="$API_KEY"
+export MINI_CLOUD_API_KEY="$API_KEY"
 uv run python scripts/phase2_demo.py --base-url http://localhost:8000
 ```
 
-若再设置 `MINI_DOCKER_CLOUD_OTHER_PROJECT_API_KEY`（来自另一个 Project），脚本还会断言跨项目读取返回 404，不泄露资源是否存在。
+若再设置 `MINI_CLOUD_OTHER_PROJECT_API_KEY`（来自另一个 Project），脚本还会断言跨项目读取返回 404，不泄露资源是否存在。CLI 在本开发版本仍读取旧的 `MINI_DOCKER_CLOUD_CONFIG`、`MINI_DOCKER_CLOUD_URL` 和 `MINI_DOCKER_CLOUD_API_KEY`，但新配置必须使用 `MINI_CLOUD_*`。
 
 ## 架构
 
