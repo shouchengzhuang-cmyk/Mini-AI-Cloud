@@ -1057,6 +1057,11 @@ class StaticMetrics:
         return self.loads.get(service_id)
 
 
+class MutableKubernetesAdmission:
+    def __init__(self, *, ready: bool) -> None:
+        self.admission_ready = ready
+
+
 async def _make_health_due(database: Database, service_id: uuid.UUID) -> None:
     async with database.session() as session, session.begin():
         replicas = await ServiceRepository.list_replicas(session, service_id, for_update=True)
@@ -1149,6 +1154,78 @@ async def test_autoscaler_changes_only_desired_and_holds_on_missing_or_cooldown(
     assert service is not None and service.desired_replicas == 1
     assert replica_count == 1
     assert len(reconcile_events) == 3
+
+
+async def test_kubernetes_autoscaler_gates_only_scale_up_on_runtime_admission(
+    gateway_database: Database,
+) -> None:
+    async with gateway_database.session() as session, session.begin():
+        created_service = await ServiceRepository.create(
+            session,
+            project_id=PROJECT_ID,
+            name="kubernetes-autoscaled",
+            model="fake/kind-model",
+            runtime=ServingRuntime.FAKE,
+            runtime_type=RuntimeType.KUBERNETES,
+            image="mini-ai-cloud:kind-serving-v4a",
+            cpu_millicores=250,
+            memory_mb=128,
+            gpu_count=0,
+            gpu_memory_mb=0,
+            desired_replicas=1,
+            autoscaling_enabled=True,
+            autoscaling_min_replicas=1,
+            autoscaling_max_replicas=4,
+            autoscaling_target_concurrency=2,
+            autoscaling_cooldown_seconds=0,
+        )
+        await ServiceRepository.reconcile_locked(session, created_service)
+        service_id = created_service.id
+
+    metrics = StaticMetrics()
+    metrics.loads[service_id] = ServiceLoad(
+        active_requests=5,
+        observed_at=datetime.now(UTC),
+    )
+    unavailable = await ServiceAutoscaler(gateway_database, metrics).run_once()
+    assert unavailable.scaled == 0
+    assert unavailable.held == 1
+
+    admission = MutableKubernetesAdmission(ready=False)
+    autoscaler = ServiceAutoscaler(
+        gateway_database,
+        metrics,
+        kubernetes_runtime=admission,
+    )
+    still_unavailable = await autoscaler.run_once()
+    assert still_unavailable.scaled == 0
+    assert still_unavailable.held == 1
+    async with gateway_database.session() as session:
+        service = await ServiceRepository.get(session, service_id)
+        replicas = await ServiceRepository.list_replicas(session, service_id)
+        quota_state = await session.get(ProjectQuotaState, PROJECT_ID)
+    assert service is not None and service.desired_replicas == 1
+    assert len(replicas) == 1
+    assert quota_state is not None and quota_state.service_replicas == 1
+
+    admission.admission_ready = True
+    recovered = await autoscaler.run_once()
+    assert recovered.scaled == 1
+    async with gateway_database.session() as session, session.begin():
+        service = await ServiceRepository.get(session, service_id, for_update=True)
+        assert service is not None and service.desired_replicas == 3
+        service.last_scaled_at = datetime(2000, 1, 1, tzinfo=UTC)
+
+    admission.admission_ready = False
+    metrics.loads[service_id] = ServiceLoad(
+        active_requests=0,
+        observed_at=datetime.now(UTC),
+    )
+    scaled_down = await autoscaler.run_once()
+    assert scaled_down.scaled == 1
+    async with gateway_database.session() as session:
+        service = await ServiceRepository.get(session, service_id)
+    assert service is not None and service.desired_replicas == 1
 
 
 async def test_autoscaler_holds_when_scale_up_would_exceed_project_quota(

@@ -159,3 +159,44 @@ def test_optional_vllm_image_accepts_empty_or_pinned_environment(
     pinned = "example/vllm@sha256:" + "a" * 64
     monkeypatch.setenv("VLLM_IMAGE", pinned)
     assert Settings(_env_file=None).vllm_image == pinned
+
+
+def test_kubernetes_serving_is_safe_by_default_and_accepts_explicit_test_configuration() -> None:
+    defaults = Settings(_env_file=None)
+    assert defaults.kubernetes_serving_enabled is False
+    assert defaults.kubernetes_serving_fake_enabled is False
+
+    configured = Settings(
+        _env_file=None,
+        app_env="test",
+        kubernetes_serving_enabled=True,
+        kubernetes_serving_fake_enabled=True,
+        kubernetes_serving_namespace="model-serving",
+        kubernetes_serving_cluster_id="kind.phase4-a",
+        kubernetes_serving_image="mini-ai-cloud:kind-serving-v4a",
+    )
+    assert configured.kubernetes_serving_namespace == "model-serving"
+    assert configured.kubernetes_serving_cluster_id == "kind.phase4-a"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"kubernetes_serving_fake_enabled": True},
+        {
+            "app_env": "production",
+            "legacy_anonymous_enabled": False,
+            "bootstrap_enabled": False,
+            "api_key_pepper": "p" * 32,
+            "worker_auth_token": "w" * 32,
+            "kubernetes_serving_enabled": True,
+            "kubernetes_serving_fake_enabled": True,
+        },
+        {"kubernetes_serving_namespace": "Uppercase"},
+        {"kubernetes_serving_cluster_id": "trailing-"},
+        {"kubernetes_serving_lease_seconds": 6, "kubernetes_serving_probe_timeout": 3},
+    ],
+)
+def test_kubernetes_serving_rejects_unsafe_configuration(overrides: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **overrides)

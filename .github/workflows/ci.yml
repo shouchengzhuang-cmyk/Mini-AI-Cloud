@@ -81,3 +81,86 @@ jobs:
         run: uv run alembic upgrade head
       - name: Integration tests
         run: uv run pytest -m integration
+
+  kind-serving-e2e:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      KIND_VERSION: v0.27.0
+      KUBECTL_VERSION: v1.32.2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+      - name: Install locked dependencies
+        run: uv sync --frozen --all-groups
+      - name: Install pinned Kind and kubectl
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          tool_dir="${RUNNER_TEMP}/kind-serving-tools"
+          mkdir -p "${tool_dir}"
+          case "$(dpkg --print-architecture)" in
+            amd64) tool_arch=amd64 ;;
+            arm64) tool_arch=arm64 ;;
+            *) echo "Unsupported runner architecture" >&2; exit 1 ;;
+          esac
+
+          kind_asset="kind-linux-${tool_arch}"
+          kind_url="https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output "${tool_dir}/${kind_asset}" "${kind_url}/${kind_asset}"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output "${tool_dir}/${kind_asset}.sha256sum" \
+            "${kind_url}/${kind_asset}.sha256sum"
+          (cd "${tool_dir}" && sha256sum --check "${kind_asset}.sha256sum")
+          mv "${tool_dir}/${kind_asset}" "${tool_dir}/kind"
+
+          kubectl_url="https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${tool_arch}"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output "${tool_dir}/kubectl" "${kubectl_url}/kubectl"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output "${tool_dir}/kubectl.sha256" "${kubectl_url}/kubectl.sha256"
+          echo "$(cat "${tool_dir}/kubectl.sha256")  ${tool_dir}/kubectl" \
+            | sha256sum --check
+
+          chmod 0755 "${tool_dir}/kind" "${tool_dir}/kubectl"
+          echo "${tool_dir}" >>"${GITHUB_PATH}"
+      - name: Validate Kind acceptance harness
+        shell: bash
+        run: |
+          bash -n scripts/kind_serving.sh
+          shellcheck scripts/kind_serving.sh
+          uv run python - <<'PY'
+          from pathlib import Path
+
+          import yaml
+
+          paths = [Path(".github/workflows/ci.yml"), *Path("deploy/kind-serving").glob("*.yaml")]
+          for path in paths:
+              documents = list(yaml.safe_load_all(path.read_text(encoding="utf-8")))
+              if not documents or any(document is None for document in documents):
+                  raise SystemExit(f"empty YAML document in {path}")
+              print(f"validated {path}: {len(documents)} document(s)")
+          PY
+      - name: Report pinned client versions
+        shell: bash
+        run: |
+          kind version
+          kubectl version --client=true
+          docker version
+      - name: Start real Kind serving stack
+        run: make kind-serving-up
+      - name: Run mandatory real Kind serving E2E
+        run: make test-kind-serving
+      - name: Collect credential-safe Kind diagnostics
+        if: always()
+        run: bash scripts/kind_serving.sh diagnostics
+      - name: Delete Kind cluster and local credentials
+        if: always()
+        run: make kind-serving-down

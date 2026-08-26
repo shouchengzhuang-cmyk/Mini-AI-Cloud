@@ -13,7 +13,8 @@ BACKUP_OUTPUT_DIR ?= build/backups
 
 .PHONY: help install format lint typecheck test test-unit test-integration test-docker \
 	test-e2e test-serving check config build up down ps logs migrate migrate-local run-api run-worker \
-	load-test dev observability test-chaos test-k8s kind-up kind-down benchmark backup restore
+	load-test dev observability test-chaos test-k8s kind-up kind-down kind-serving-up \
+	test-kind-serving kind-serving-down benchmark backup restore
 
 help: ## Show available targets.
 	@awk 'BEGIN {FS = ":.*## "; printf "Usage: make <target>\n\n"} \
@@ -108,6 +109,15 @@ kind-up: ## Create the isolated Kind cluster used for local runtime testing.
 
 kind-down: ## Delete only the isolated Kind test cluster.
 	$(KIND) delete cluster --name $(KIND_CLUSTER_NAME)
+
+kind-serving-up: ## Build and deploy the isolated Phase IV-A Kind serving stack.
+	bash scripts/kind_serving.sh up
+
+test-kind-serving: ## Run the mandatory real Kubernetes serving E2E against Kind.
+	bash scripts/kind_serving.sh test
+
+kind-serving-down: ## Delete only the Phase IV-A Kind cluster and local credentials.
+	bash scripts/kind_serving.sh down
 
 benchmark: ## Compare binpack/spread on 100 workers, 4 GPUs each, and 10000 jobs.
 	$(UV) run python -m scripts.scheduler_simulation \

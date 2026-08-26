@@ -1,0 +1,182 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mini-ai-cloud-api
+  namespace: mini-ai-cloud-serving
+  labels:
+    app.kubernetes.io/name: mini-ai-cloud-api
+    app.kubernetes.io/part-of: kind-serving-e2e
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mini-ai-cloud-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mini-ai-cloud-api
+        app.kubernetes.io/part-of: kind-serving-e2e
+    spec:
+      serviceAccountName: mini-ai-cloud-controller
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: mini-ai-cloud:kind-serving-v4a
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "api.main"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: mini-ai-cloud-kind-secrets
+                  key: database-url
+            - name: REDIS_URL
+              value: redis://redis:6379/0
+            - name: APP_ENV
+              value: test
+            - name: API_HOST
+              value: 0.0.0.0
+            - name: API_PORT
+              value: "8000"
+            - name: LOG_LEVEL
+              value: INFO
+            - name: ARTIFACT_LOCAL_ROOT
+              value: /tmp/mini-ai-cloud/artifacts
+            - name: CONTROL_PLANE_ENABLED
+              value: "true"
+            - name: LEGACY_ANONYMOUS_ENABLED
+              value: "false"
+            - name: BOOTSTRAP_ENABLED
+              value: "true"
+            - name: BOOTSTRAP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: mini-ai-cloud-kind-secrets
+                  key: bootstrap-token
+            - name: API_KEY_PEPPER
+              valueFrom:
+                secretKeyRef:
+                  name: mini-ai-cloud-kind-secrets
+                  key: api-key-pepper
+            - name: WORKER_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: mini-ai-cloud-kind-secrets
+                  key: worker-auth-token
+            - name: SCHEDULER_MODE
+              value: pull
+            - name: OUTBOX_POLL_INTERVAL
+              value: "0.1"
+            - name: SERVICE_RECONCILE_INTERVAL
+              value: "0.25"
+            - name: SERVICE_HEALTH_INTERVAL
+              value: "0.5"
+            - name: SERVICE_DRAIN_TIMEOUT
+              value: "8"
+            - name: HEALTH_CHECK_TIMEOUT
+              value: "1"
+            - name: SERVICE_PROXY_CONNECT_TIMEOUT
+              value: "2"
+            - name: SERVICE_PROXY_FIRST_TOKEN_TIMEOUT
+              value: "10"
+            - name: SERVICE_PROXY_TIMEOUT
+              value: "60"
+            - name: SERVICE_ENDPOINT_HOST_ALLOWLIST
+              value: "*.mini-ai-cloud-serving.svc.cluster.local"
+            - name: KUBERNETES_IN_CLUSTER
+              value: "true"
+            - name: KUBERNETES_NAMESPACE
+              value: mini-ai-cloud-serving
+            - name: KUBERNETES_SERVING_ENABLED
+              value: "true"
+            - name: KUBERNETES_SERVING_FAKE_ENABLED
+              value: "true"
+            - name: KUBERNETES_SERVING_NAMESPACE
+              value: mini-ai-cloud-serving
+            - name: KUBERNETES_SERVING_CLUSTER_ID
+              value: mini-ai-cloud-kind-v4a
+            - name: KUBERNETES_SERVING_IMAGE
+              value: mini-ai-cloud:kind-serving-v4a
+            - name: KUBERNETES_SERVING_STARTUP_TIMEOUT
+              value: "45"
+            - name: KUBERNETES_SERVING_DRAIN_TIMEOUT
+              value: "8"
+            - name: KUBERNETES_SERVING_POLL_INTERVAL
+              value: "0.25"
+            - name: KUBERNETES_SERVING_PROBE_TIMEOUT
+              value: "1"
+            - name: KUBERNETES_SERVING_LEASE_SECONDS
+              value: "60"
+            - name: KUBERNETES_SERVING_FAILURE_BACKOFF
+              value: "3"
+            - name: KUBERNETES_SERVING_TERMINATION_GRACE_SECONDS
+              value: "5"
+            - name: KUBERNETES_SERVING_FAKE_STARTUP_DELAY
+              value: "2"
+            - name: KUBERNETES_SERVING_FAKE_CHUNK_DELAY
+              value: "0.05"
+          ports:
+            - name: http
+              containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              cpu: "1"
+              memory: 768Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            privileged: false
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mini-ai-cloud-api
+  namespace: mini-ai-cloud-serving
+  labels:
+    app.kubernetes.io/name: mini-ai-cloud-api
+    app.kubernetes.io/part-of: kind-serving-e2e
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: mini-ai-cloud-api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      nodePort: 30080

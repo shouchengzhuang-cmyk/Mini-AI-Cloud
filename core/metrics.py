@@ -180,6 +180,36 @@ SERVICE_REQUEST_DURATION = Histogram(
     buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600),
     registry=REGISTRY,
 )
+K8S_SERVING_PODS = Gauge(
+    "k8s_serving_pods",
+    "Tracked Kubernetes serving Pods by bounded controller observation state",
+    ("state",),
+    registry=REGISTRY,
+)
+K8S_SERVING_LAUNCHES = Counter(
+    "k8s_serving_launch_total",
+    "Initial Kubernetes serving execution launch-cycle outcomes",
+    ("outcome",),
+    registry=REGISTRY,
+)
+K8S_SERVING_LAUNCH_FAILURES = Counter(
+    "k8s_serving_launch_failures_total",
+    "Kubernetes serving Pods that failed before first readiness by bounded reason",
+    ("reason",),
+    registry=REGISTRY,
+)
+K8S_SERVING_REPLACEMENTS = Counter(
+    "k8s_serving_replacements_total",
+    "Kubernetes serving replacement execution claims by bounded reason",
+    ("reason",),
+    registry=REGISTRY,
+)
+K8S_SERVING_RECONCILE_DURATION = Histogram(
+    "k8s_serving_reconcile_duration_seconds",
+    "Kubernetes serving controller reconciliation latency",
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10),
+    registry=REGISTRY,
+)
 PROJECT_CPU_SECONDS = Counter(
     "project_cpu_seconds_total",
     "Settled CPU seconds across all projects",

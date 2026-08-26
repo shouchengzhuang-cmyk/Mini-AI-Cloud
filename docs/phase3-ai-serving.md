@@ -231,8 +231,8 @@ Content-Type: application/json
 
 - 只实现单节点 tensor parallel，不支持跨节点 TP、NVLink/PCIe 拓扑评分、MIG production policy。
 - 每个 vLLM controller 只对本节点 inventory 做 gang placement；多节点 controller 可通过数据库锁竞争领取 Replica，但没有全局最优 serving placement。
-- Kubernetes runtime 仍用于 Batch spec/unit 验证；没有 Kubernetes Model Serving controller/operator。
+- Phase IV-A 已增加 Kubernetes Fake Model Serving controller 和 Kind E2E 工具，详情见 [Phase IV-A Kubernetes 原生模型服务](phase4-kubernetes-serving.md)。它不是 Operator，也不运行 Kubernetes vLLM/GPU workload。
 - Service 默认 private；没有 public model marketplace。
 - Gateway 不是 OpenAI API 100% feature parity，也没有自研 tokenizer 或推理引擎。
 - process-local autoscaling metrics 尚未做跨 API 实例聚合。
-- 没有真实 NVIDIA/vLLM、Kind serving、HA 数据层或公网安全部署证据。
+- 没有真实 NVIDIA/vLLM、HA 数据层或公网安全部署证据。Kind serving 是否在当前机器实际执行，以 [Phase IV-A 验证报告](verification-report-phase4a-2026-08-24.md) 为准。

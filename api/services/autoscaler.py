@@ -3,11 +3,13 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Protocol
 
 from sqlalchemy import select
 
 from api.services.gateway import ServiceLoad, ServiceMetricsSource
 from core.database import Database
+from core.enums import RuntimeType
 from core.logging import get_logger
 from models.service import ModelService
 from repositories.clock import database_utcnow
@@ -24,6 +26,11 @@ class AutoscaleRunResult:
     cooling_down: int = 0
 
 
+class KubernetesRuntimeAdmission(Protocol):
+    @property
+    def admission_ready(self) -> bool: ...
+
+
 class ServiceAutoscaler:
     """Adjust service desired replicas from live concurrency observations only."""
 
@@ -35,6 +42,7 @@ class ServiceAutoscaler:
         batch_size: int = 100,
         metric_max_age_seconds: float = 30.0,
         scale_to_zero_enabled: bool = False,
+        kubernetes_runtime: KubernetesRuntimeAdmission | None = None,
     ) -> None:
         if batch_size < 1:
             raise ValueError("batch_size must be at least one")
@@ -45,6 +53,7 @@ class ServiceAutoscaler:
         self.batch_size = batch_size
         self.metric_max_age_seconds = metric_max_age_seconds
         self.scale_to_zero_enabled = scale_to_zero_enabled
+        self.kubernetes_runtime = kubernetes_runtime
         self.logger = get_logger("service_autoscaler")
 
     async def run_once(self) -> AutoscaleRunResult:
@@ -91,6 +100,13 @@ class ServiceAutoscaler:
                 if target == service.desired_replicas:
                     held += 1
                     continue
+                if (
+                    service.runtime_type == RuntimeType.KUBERNETES
+                    and target > service.desired_replicas
+                    and not self._kubernetes_admission_ready()
+                ):
+                    held += 1
+                    continue
                 try:
                     updated = await ServiceRepository.set_desired_replicas(
                         session,
@@ -122,6 +138,10 @@ class ServiceAutoscaler:
                 cooling_down=result.cooling_down,
             )
         return result
+
+    def _kubernetes_admission_ready(self) -> bool:
+        runtime = self.kubernetes_runtime
+        return runtime is not None and runtime.admission_ready is True
 
 
 def _target_replicas(

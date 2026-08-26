@@ -1,20 +1,19 @@
 # Mini AI Cloud
 
-Mini AI Cloud（仓库名仍为 `mini-docker-cloud`）是一个面向 AI Infra 学习、架构验证和本地演示的多租户计算平台雏形。它在 Phase I 的 Docker 分布式任务链路上增量加入项目/API Key、配额与用量、GPU 感知全局调度、Docker/Kubernetes 运行时、对象存储、DAG、Model Service、OpenAI-compatible Gateway、审计与诊断能力。
+*An evidence-driven experimental control plane for reliable AI workload scheduling and model serving.*
 
-这是一套“生产思维的可运行原型”，不是可直接暴露到公网的托管云。Worker 仍是可信基础设施，Docker Worker 挂载 Docker socket，该权限通常等价于宿主机 root。生产部署还需要独立节点身份、mTLS、网络隔离、镜像签名/扫描、HA 数据层和更强沙箱。
+Mini AI Cloud 是一个面向 AI 工作负载控制面正确性的轻量级实验平台。它重点研究在并发调度、Worker、Pod、Controller 故障和在线请求缩容时，如何依靠 PostgreSQL 这一状态真相源、lease、execution fencing 与 reconciliation，让任务和模型服务状态收敛。
 
-## 当前能力
+项目定位是 **production-minded experimental system**。代码按生产系统会遇到的并发、故障和权限边界来设计，能力声明则以可复现证据为准。它不是 production-ready cloud、KServe replacement、AWS replacement，也不是 production-grade Kubernetes operator。
 
-- Batch Job：Phase I 的 `/api/v1/tasks` 保持兼容，支持持久日志、SSE、lease、`execution_id` fencing、重试、取消、超时和恢复。
-- 多租户控制面：User、Project、Membership、RBAC、一次性展示的 API Key、并发安全 Project Quota、Usage Ledger 与模拟成本。
-- Scheduler v2：CPU/RAM/GPU reservation、具体 GPU device、label/taint/toleration、priority/aging、binpack/spread、project fairness 和两阶段抢占。
-- Runtime：统一 `ComputeRuntime` 接口，提供 Docker、Kubernetes、Fake runtime；无 GPU 机器可使用仅限开发/测试的 Fake GPU inventory。
-- Artifact：Local/S3（含 MinIO）后端、流式上传下载、大小/配额/SHA-256 与 project isolation；Task input/output 经过 execution-fenced workspace，以单文件只读/可写 mount 交给 runtime，成功后先发布输出再提交终态。
-- AI Service：Registry→Service 快照、Replica `starting/loading/running/draining` 生命周期、真实 Fake HTTP/SSE、持久化 in-flight、round-robin、health/replacement、autoscaling、serving usage/TTFT/token metrics，以及 `/v1/models`、`/v1/chat/completions`、`/v1/completions`；另有仅显式启用、面向专用 GPU serving node 的 Docker vLLM controller，使用单节点 tensor-parallel gang placement 与具体 GPU UUID。
-- 平台资源：模型注册表、AES-256-GCM Secret、镜像策略、任务时间线、Job Group/DAG、Prometheus/Grafana、admin diagnostics 与保守 repair、备份恢复和调度模拟。
+## 它在研究什么
 
-实现、已验证项和环境受限项不混为一谈；逐项证据见 [验证矩阵](docs/verification-matrix.md)。
+- **Scheduling**：CPU、内存和具体 GPU device 如何在配额、公平性、优先级、污点与容忍度约束下分配。
+- **Ownership and fencing**：Worker session、lease 和 `execution_id` 如何阻止旧进程继续续租、写回终态或删除新执行的资源。
+- **Failure recovery**：API、Worker、Controller 或 Pod 重启和丢失后，reconciliation 如何从 PostgreSQL desired state 恢复，并隔离单个漂移资源。
+- **Model serving lifecycle**：Replica 如何经过 starting、loading、running、draining，Gateway 如何避开不健康或正在排空的副本，以及活跃 SSE 请求结束后如何完成缩容。
+
+功能存在、自动化测试通过和真实外部运行是三种不同证据。逐项状态见 [验证证据矩阵](docs/verification-matrix.md)，Phase IV-A.1 的实时验收状态见 [Kubernetes Serving 验证报告](docs/verification-report-phase4a-2026-08-24.md)。
 
 ## 最短启动路径
 
@@ -155,9 +154,15 @@ CONFIRM_CHAOS=YES make test-chaos
 make kind-up
 make test-k8s
 make kind-down
+
+make kind-serving-up
+make test-kind-serving
+make kind-serving-down
 ```
 
-`make test-k8s` 当前验证 Kubernetes runtime 构造与 Fake GPU inventory；只有本机具备 kind/k3d 及可用镜像时才能声称真实 Kubernetes E2E。`make down` 保留卷；`docker compose down --volumes` 会永久删除当前 Compose project 的数据。
+`make test-k8s` 验证 batch Kubernetes runtime 构造与 Fake GPU inventory。`kind-serving-*` 是独立的 Phase IV-A 真实 serving E2E，kubeconfig 与临时凭据保存在当前用户私有的 runtime state 目录，不切换用户默认 context；可用 `KIND_SERVING_STATE_DIR` 指定其他私有绝对路径。缺少 Docker、Kind 或 kubectl 时会明确返回 `NOT RUN` 和非零退出码。`make down` 保留卷；`docker compose down --volumes` 会永久删除当前 Compose project 的数据。
+
+已有 Kubernetes-backed Service 在当前 API 进程无法提供对应 controller 时，正向 scale 会在修改 desired state 前 fail closed。Scale-to-zero 和 stop 仍会把 desired state 改为 0，但 Service 保持 `stopping`，Replica 保持 `draining`，不会伪装成 Kubernetes 资源已经删除。Controller 重新启用后从 PostgreSQL 和 managed resource labels 恢复 reconciliation，再完成 fenced cleanup；Controller 一直关闭时，资源不会自动清理。
 
 Phase III 的 Fake Serving E2E 会真实启动 HTTP inference 子进程，并经 Gateway 验证 non-streaming、SSE、RR、failure replacement、draining、Project API Key 隔离和 TP gang placement。要同时执行 live PostgreSQL 并发用例：
 
@@ -167,6 +172,7 @@ LIVE_DATABASE_URL=postgresql+asyncpg://task:local-dev-only@127.0.0.1:5432/task_p
 ```
 
 完整说明与真实 vLLM 前置条件见 [Phase III AI Model Serving](docs/phase3-ai-serving.md)。
+Kubernetes Pod、readiness、drain、恢复与 Kind 命令见 [Phase IV-A Kubernetes 原生模型服务](docs/phase4-kubernetes-serving.md)。
 
 ## 文档入口
 
@@ -174,8 +180,10 @@ LIVE_DATABASE_URL=postgresql+asyncpg://task:local-dev-only@127.0.0.1:5432/task_p
 - [API 与 CLI 示例](docs/api-cli.md)
 - [部署、回滚、备份恢复与排障](docs/operations.md)
 - [七个强制演示](docs/demos.md)
-- [Phase II 验证矩阵与缺口台账](docs/verification-matrix.md)
+- [验证证据矩阵与缺口台账](docs/verification-matrix.md)
 - [Phase III AI Model Serving](docs/phase3-ai-serving.md)
+- [Phase IV-A Kubernetes 原生模型服务](docs/phase4-kubernetes-serving.md)
+- [Phase IV-A 验证报告](docs/verification-report-phase4a-2026-08-24.md)
 - [PostgreSQL hot-path 实测审计](docs/sql-review.md)
 
 FastAPI 交互文档位于 `http://localhost:8000/docs`，OpenAPI JSON 位于 `http://localhost:8000/openapi.json`。
@@ -189,6 +197,7 @@ FastAPI 交互文档位于 `http://localhost:8000/docs`，OpenAPI JSON 位于 `h
 - Docker Worker 的 socket 权限是明确 trust boundary；Kubernetes Worker 也必须使用最小 RBAC。当前 Worker 直接连接 PostgreSQL/Redis，`WORKER_AUTH_TOKEN` 只是未来 internal worker API 的保留配置，不会认证这些直连；共享环境必须依靠独立凭据、网络 ACL，并最终引入节点 mTLS。
 - 默认 Compose 给 Worker 挂载随 `COMPOSE_PROJECT_NAME` 派生的 `artifact-workspace-data` 卷，任务容器只通过 Docker `VolumeOptions.Subpath` 获取声明的单个 input/output 文件；这避免 sibling Worker 路径误映射，也避免专用 DR stack 与日常栈共享 execution workspace。裸机 Worker 与 daemon 共享宿主路径时仍使用单文件 bind。两种模式都不暴露整个 workspace；真实 Docker named-volume Subpath input→container→output E2E 已执行通过。
 - Kubernetes task Pod 已固定非 root UID/GID 65532、`RuntimeDefault` seccomp、只读 rootfs 与丢弃全部 capabilities。Artifact mount 当前仍是 pinned node 上的单文件 `hostPath(type=File)`；只有 Worker workspace 与该 node 共享同一路径时才成立。仓库已有 Pod spec/mock 测试，但尚未在 Kind 做真实文件可见性 E2E，生产多节点应采用受控 object-store/PVC/CSI 数据面。
+- Kubernetes serving Pod 使用非 root UID/GID 10001、只读 rootfs、受限 `/tmp`、drop ALL、`RuntimeDefault` seccomp、requests=limits，并关闭 token automount 和 host namespace。它不会挂载 Docker socket、kubeconfig 或 `hostPath`。Controller 的 namespace RBAC 仍是高权限基础设施边界，生产环境应使用独立 namespace 和 ServiceAccount。
 - Artifact grant 为 presigned URL 时，客户端不得转发平台 API Key。仓库演示脚本已把对象存储请求与平台认证头隔离。
 
 更多生产前检查、Secret key rotation 和灾备边界见 [运维手册](docs/operations.md)。
@@ -201,4 +210,4 @@ Phase I 稳定恢复点是：
 c47702b feat: build distributed Docker task platform
 ```
 
-Phase II 在 `feat/mini-ai-cloud-v2` 上增量演进，Phase III 位于 `feat/ai-serving-v3`。不要 rebase、force reset 或覆盖稳定提交。任务明确要求不 push；本地 commit、远端 push 和部署是三件不同的事。
+Phase II 在 `feat/mini-ai-cloud-v2` 上增量演进，Phase III 位于 `feat/ai-serving-v3`，Phase IV-A 位于 `feat/k8s-serving-v4a`。不要 rebase、force reset 或覆盖稳定提交。本地 commit、远端 push、PR 和部署是四件不同的事，验证报告会分别记录。

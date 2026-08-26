@@ -390,20 +390,29 @@ class ServiceRepository:
         *,
         limit: int,
         drain_timeout_seconds: float = 30.0,
+        kubernetes_drain_timeout_seconds: float | None = None,
     ) -> ReconcileResult:
         if drain_timeout_seconds < 0:
             raise ValueError("drain_timeout_seconds must not be negative")
+        if kubernetes_drain_timeout_seconds is not None and kubernetes_drain_timeout_seconds < 0:
+            raise ValueError("kubernetes_drain_timeout_seconds must not be negative")
         services = list(await session.scalars(ServiceRepository.reconcile_candidates_query(limit)))
         if not services:
             return ReconcileResult()
         now = await database_utcnow(session)
         result = ReconcileResult()
         for service in services:
+            resolved_drain_timeout = (
+                kubernetes_drain_timeout_seconds
+                if service.runtime_type == RuntimeType.KUBERNETES
+                and kubernetes_drain_timeout_seconds is not None
+                else drain_timeout_seconds
+            )
             result += await ServiceRepository.reconcile_locked(
                 session,
                 service,
                 now=now,
-                drain_timeout_seconds=drain_timeout_seconds,
+                drain_timeout_seconds=resolved_drain_timeout,
             )
         return result
 
@@ -659,6 +668,7 @@ class ServiceRepository:
             or (replica.worker_id is not None and replica.worker_id != worker_id)
         ):
             return False
+        first_claim = replica.execution_id is None
         now = await database_utcnow(session)
         if lease_expires_at.tzinfo is None:
             raise ValueError("lease_expires_at must include a timezone")
@@ -676,6 +686,8 @@ class ServiceRepository:
         replica.drain_deadline = None
         replica.error_code = None
         replica.error_message = None
+        if first_claim:
+            replica.started_at = now
         replica.updated_at = now
         replica.version += 1
         return True
