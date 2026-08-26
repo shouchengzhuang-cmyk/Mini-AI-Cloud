@@ -1,0 +1,78 @@
+name: Bounded soak
+
+on:
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: Bounded soak rounds (1-10)
+        required: true
+        default: "2"
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bounded-soak
+  cancel-in-progress: false
+
+jobs:
+  soak:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CONFIRM_SOAK: YES
+      SOAK_ROUNDS: ${{ github.event.inputs.rounds || '2' }}
+      KIND_VERSION: v0.27.0
+      KUBECTL_VERSION: v1.32.2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+      - name: Install locked dependencies
+        run: uv sync --frozen --all-groups
+      - name: Install pinned Kind and kubectl
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          case "$(dpkg --print-architecture)" in
+            amd64) tool_arch=amd64 ;;
+            arm64) tool_arch=arm64 ;;
+            *) echo "Unsupported runner architecture" >&2; exit 1 ;;
+          esac
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output "${RUNNER_TEMP}/kind" \
+            "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-${tool_arch}"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output "${RUNNER_TEMP}/kind.sha256" \
+            "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-${tool_arch}.sha256sum"
+          sed "s#kind-linux-${tool_arch}#${RUNNER_TEMP}/kind#" "${RUNNER_TEMP}/kind.sha256" \
+            | sha256sum --check
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output "${RUNNER_TEMP}/kubectl" \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${tool_arch}/kubectl"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output "${RUNNER_TEMP}/kubectl.sha256" \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${tool_arch}/kubectl.sha256"
+          echo "$(cat "${RUNNER_TEMP}/kubectl.sha256")  ${RUNNER_TEMP}/kubectl" \
+            | sha256sum --check
+          chmod 0755 "${RUNNER_TEMP}/kind" "${RUNNER_TEMP}/kubectl"
+          echo "${RUNNER_TEMP}" >>"${GITHUB_PATH}"
+      - name: Run bounded soak
+        run: make test-soak
+      - name: Upload redacted soak evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bounded-soak-${{ github.run_id }}
+          path: build/soak
+          if-no-files-found: error
+          retention-days: 14
+      - name: Ensure dedicated cluster and credentials are absent
+        if: always()
+        run: make kind-serving-down
