@@ -795,55 +795,34 @@ async def _assert_bad_image_backoff(
     retry_not_before = (
         scheduling_details.get("retry_not_before") if isinstance(scheduling_details, dict) else None
     )
-    try:
-        retry_at = (
-            datetime.fromisoformat(retry_not_before) if isinstance(retry_not_before, str) else None
-        )
-    except ValueError as exc:
-        raise KindServingE2EError("bad-image backoff has an invalid retry timestamp") from exc
-    if retry_at is not None and retry_at.tzinfo is None:
-        retry_at = retry_at.replace(tzinfo=UTC)
-    now = datetime.now(UTC)
-    if retry_at is None or retry_at.astimezone(UTC) <= now:
-        raise KindServingE2EError("bad-image backoff was not future-bounded when observed")
-    retry_at = retry_at.astimezone(UTC)
-    if retry_at > now + timedelta(seconds=10):
-        raise KindServingE2EError("bad-image backoff exceeded the bounded E2E retry window")
+    retry_at, retry_delay = _bounded_backoff_window(
+        updated_at=service_state.get("updated_at"),
+        retry_not_before=retry_not_before,
+    )
 
     failed_ids = {_required_string(row, "id") for row in failed}
-    initial_execution_ids = {
-        execution_id
-        for row in all_rows
-        if isinstance((execution_id := row.get("execution_id")), str)
-    }
-    while (retry_at - datetime.now(UTC)).total_seconds() > 0.1:
-        pre_retry_document = await api.json("GET", f"/api/v1/services/{service_id}/replicas")
-        pre_retry_rows = _object_items(pre_retry_document)
-        observed_execution_ids = {
-            execution_id
-            for row in pre_retry_rows
-            if isinstance((execution_id := row.get("execution_id")), str)
-        }
-        if not observed_execution_ids.issubset(initial_execution_ids):
-            raise KindServingE2EError("bad-image replacement launched before retry_not_before")
-        await asyncio.sleep(0.1)
-
     count_before = len(all_rows)
-    replacement_deadline = time.monotonic() + 15
-    replacement_seen = False
+    replacement_deadline = time.monotonic() + max(15, retry_delay.total_seconds() + 10)
+    replacement_rows: list[dict[str, Any]] = []
     later_rows = all_rows
     while time.monotonic() < replacement_deadline:
         later_document = await api.json("GET", f"/api/v1/services/{service_id}/replicas")
         later_rows = _object_items(later_document)
-        replacement_seen = any(
-            row.get("id") not in failed_ids and isinstance(row.get("execution_id"), str)
+        replacement_rows = [
+            row
             for row in later_rows
-        )
-        if replacement_seen:
+            if row.get("id") not in failed_ids and isinstance(row.get("execution_id"), str)
+        ]
+        if replacement_rows:
             break
         await asyncio.sleep(0.25)
-    if not replacement_seen:
+    if not replacement_rows:
         raise KindServingE2EError("bad-image failure did not launch a replacement after backoff")
+    if any(
+        _required_utc_timestamp(row.get("started_at"), "replacement started_at") < retry_at
+        for row in replacement_rows
+    ):
+        raise KindServingE2EError("bad-image replacement launched before retry_not_before")
 
     await asyncio.sleep(7)
     later_document = await api.json("GET", f"/api/v1/services/{service_id}/replicas")
@@ -856,6 +835,33 @@ async def _assert_bad_image_backoff(
     if len(active_pods) > 1:
         raise KindServingE2EError("bad image backoff left multiple active Pods")
     return service_id
+
+
+def _bounded_backoff_window(
+    *,
+    updated_at: object,
+    retry_not_before: object,
+) -> tuple[datetime, timedelta]:
+    backoff_set_at = _required_utc_timestamp(updated_at, "service updated_at")
+    retry_at = _required_utc_timestamp(retry_not_before, "bad-image retry_not_before")
+    retry_delay = retry_at - backoff_set_at
+    if retry_delay <= timedelta(0):
+        raise KindServingE2EError("bad-image backoff was not future-bounded when persisted")
+    if retry_delay > timedelta(seconds=10):
+        raise KindServingE2EError("bad-image backoff exceeded the bounded E2E retry window")
+    return retry_at, retry_delay
+
+
+def _required_utc_timestamp(value: object, label: str) -> datetime:
+    if not isinstance(value, str):
+        raise KindServingE2EError(f"{label} is missing")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise KindServingE2EError(f"{label} is invalid") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 async def _cleanup_services(api: API, kube: Kubectl, service_ids: Sequence[str]) -> list[str]:
