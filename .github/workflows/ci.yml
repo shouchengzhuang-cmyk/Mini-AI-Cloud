@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push: {}
+  pull_request: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+      - name: Install locked dependencies
+        run: uv sync --frozen --all-groups
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+      - name: Ruff format
+        run: uv run ruff format --check .
+      - name: Ruff lint
+        run: uv run ruff check .
+      - name: Mypy
+        run: uv run mypy .
+      - name: Unit tests
+        run: uv run pytest -m "not integration and not docker and not e2e"
+
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: task_platform
+          POSTGRES_USER: task
+          POSTGRES_PASSWORD: local-dev-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U task -d task_platform"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+    env:
+      DATABASE_URL: postgresql+asyncpg://task:local-dev-only@127.0.0.1:5432/task_platform
+      REDIS_URL: redis://127.0.0.1:6379/0
+      LIVE_DATABASE_URL: postgresql+asyncpg://task:local-dev-only@127.0.0.1:5432/task_platform
+      LIVE_REDIS_URL: redis://127.0.0.1:6379/0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+      - name: Install locked dependencies
+        run: uv sync --frozen --all-groups
+      - name: Apply database migrations
+        run: uv run alembic upgrade head
+      - name: Integration tests
+        run: uv run pytest -m integration

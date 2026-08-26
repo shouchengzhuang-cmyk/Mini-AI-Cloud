@@ -8,7 +8,7 @@ import pytest_asyncio
 from fakeredis.aioredis import FakeRedis
 from redis.asyncio import Redis
 
-from core.redis import RedisQueue
+from core.redis import READINESS_WRITE_KEY, RedisQueue
 
 
 @pytest_asyncio.fixture
@@ -97,6 +97,15 @@ async def test_delete_log_stream_removes_only_requested_task(redis_queue: RedisQ
 
     assert await redis_queue.client.exists(redis_queue.log_stream_key(deleted_task_id)) == 0
     assert await redis_queue.client.exists(redis_queue.log_stream_key(retained_task_id)) == 1
+
+
+async def test_rate_limit_readiness_exercises_a_bounded_redis_write(
+    redis_queue: RedisQueue,
+) -> None:
+    assert await redis_queue.rate_limit_backend_ready() is True
+    assert await redis_queue.client.get(READINESS_WRITE_KEY) == "1"
+    ttl = await redis_queue.client.ttl(READINESS_WRITE_KEY)
+    assert 0 < ttl <= 30
 
 
 @pytest.mark.parametrize("ttl", [0, -1])

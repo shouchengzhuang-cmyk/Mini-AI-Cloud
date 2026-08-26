@@ -3,17 +3,44 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
+from sqlalchemy.sql.elements import ColumnElement
 
-from core.enums import ACTIVE_TASK_STATUSES, LogStream, TaskStatus, WorkerStatus
+from api.pagination import CursorKey
+from core.enums import (
+    ACTIVE_TASK_STATUSES,
+    FINAL_TASK_STATUSES,
+    ErrorCategory,
+    ErrorCode,
+    LogStream,
+    RetryBackoff,
+    TaskStatus,
+    WorkerStatus,
+    WorkloadType,
+)
 from core.state_machine import ensure_transition
+from models.artifact import TaskDependency
 from models.base import utcnow
-from models.task import Task, TaskLog
+from models.scheduling import (
+    GPUDevice,
+    PreemptionPlan,
+    ReservationGPUDevice,
+    ResourceReservation,
+)
+from models.task import Task, TaskEvent, TaskLog
+from models.usage import ProjectQuotaState, TaskExecution
 from models.worker import Worker
 from repositories.clock import database_utcnow
 from repositories.outbox import OutboxRepository
+from repositories.quotas import QuotaExceededError, QuotaRepository
+from repositories.reservations import ReservationRepository
+
+LEGACY_PROJECT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
 
 class ClaimRejected(RuntimeError):
@@ -24,6 +51,10 @@ class StaleExecutionError(RuntimeError):
     """A worker attempted to update a task with an expired execution token."""
 
 
+class DependencyValidationError(ValueError):
+    """A submitted dependency is missing, cross-project, or otherwise invalid."""
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionResult:
     accepted: bool
@@ -31,13 +62,66 @@ class ExecutionResult:
     retry_scheduled: bool = False
 
 
-def retry_delay_seconds(retry_count: int, maximum: float = 60.0) -> float:
+def retry_delay_seconds(
+    retry_count: int,
+    maximum: float = 60.0,
+    *,
+    backoff: RetryBackoff | str = RetryBackoff.EXPONENTIAL,
+    base_seconds: float = 1.0,
+) -> float:
     if retry_count < 1:
         raise ValueError("retry_count must be at least 1")
-    return min(float(2 ** (retry_count - 1)), maximum)
+    if base_seconds <= 0:
+        raise ValueError("base_seconds must be greater than zero")
+    if maximum <= 0:
+        raise ValueError("maximum must be greater than zero")
+    mode = RetryBackoff(backoff)
+    if mode == RetryBackoff.FIXED:
+        delay = base_seconds
+    elif mode == RetryBackoff.LINEAR:
+        delay = base_seconds * retry_count
+    else:
+        delay = base_seconds * (2 ** (retry_count - 1))
+    return min(float(delay), maximum)
 
 
-def _transition(task: Task, target: TaskStatus, now: datetime | None = None) -> None:
+def should_retry_failure(
+    *,
+    error_category: ErrorCategory | str | None,
+    exit_code: int | None,
+    retry_on_exit_codes: list[int],
+) -> bool:
+    """Apply retry semantics without consuming or mutating an attempt counter.
+
+    Infrastructure, internal, and timeout failures are assumed transient. User
+    and resource failures require an explicit exit-code match. Cancellation and
+    preemption are handled outside the user retry budget.
+    """
+
+    if error_category is None:
+        # Phase I callers did not submit a taxonomy; preserve their retry behavior.
+        return True
+    category = ErrorCategory(error_category)
+    if category in {
+        ErrorCategory.INFRA_ERROR,
+        ErrorCategory.INTERNAL_ERROR,
+        ErrorCategory.TIMEOUT,
+    }:
+        return True
+    if category in {ErrorCategory.USER_ERROR, ErrorCategory.RESOURCE_ERROR}:
+        return exit_code is not None and exit_code in retry_on_exit_codes
+    return False
+
+
+def _transition(
+    session: AsyncSession,
+    task: Task,
+    target: TaskStatus,
+    now: datetime | None = None,
+    *,
+    event_type: str = "task.status_changed",
+) -> None:
+    previous = task.status
     ensure_transition(task.status, target)
     changed_at = now or utcnow()
     task.status = target
@@ -54,10 +138,52 @@ def _transition(task: Task, target: TaskStatus, now: datetime | None = None) -> 
         TaskStatus.FAILED,
         TaskStatus.CANCELLED,
         TaskStatus.TIMED_OUT,
+        TaskStatus.PREEMPTED,
     }:
         task.finished_at = changed_at
     elif target == TaskStatus.RETRYING:
         task.finished_at = None
+    session.add(
+        TaskEvent(
+            project_id=task.project_id,
+            task_id=task.id,
+            event_type=event_type,
+            sequence=task.version,
+            from_status=previous.value,
+            status=target.value,
+            execution_id=task.execution_id,
+            worker_id=task.worker_id,
+            details={},
+            created_at=changed_at,
+        )
+    )
+
+
+def _prepare_for_assignment(task: Task) -> None:
+    """Clear per-attempt state before minting a new execution token.
+
+    Historical attempt data remains in ``TaskExecution`` and ``UsageLedger``.
+    Reusing these fields would make a failure before runtime start inherit the
+    previous attempt's usage window and settle it a second time.
+    """
+
+    task.started_at = None
+    task.finished_at = None
+    task.exit_code = None
+    task.error_message = None
+    task.failure_category = None
+    task.error_category = None
+    task.error_code = None
+    task.duration_ms = None
+    task.cpu_seconds = None
+    task.gpu_seconds = None
+    task.wall_time_seconds = None
+    task.estimated_cost = None
+    task.runtime_handle = None
+    task.gpu_device_ids = []
+    task.cancel_requested = False
+    task.next_attempt_at = None
+    task.unschedulable_reason = None
 
 
 class TaskRepository:
@@ -71,8 +197,31 @@ class TaskRepository:
         return await session.scalar(query)
 
     @staticmethod
-    async def get_by_idempotency_key(session: AsyncSession, idempotency_key: str) -> Task | None:
-        return await session.scalar(select(Task).where(Task.idempotency_key == idempotency_key))
+    async def get_by_idempotency_key(
+        session: AsyncSession,
+        idempotency_key: str,
+        *,
+        project_id: uuid.UUID = LEGACY_PROJECT_ID,
+    ) -> Task | None:
+        return await session.scalar(
+            select(Task).where(
+                Task.project_id == project_id,
+                Task.idempotency_key == idempotency_key,
+            )
+        )
+
+    @staticmethod
+    async def get_for_project(
+        session: AsyncSession,
+        *,
+        project_id: uuid.UUID,
+        task_id: uuid.UUID,
+        for_update: bool = False,
+    ) -> Task | None:
+        query = select(Task).where(Task.project_id == project_id, Task.id == task_id)
+        if for_update:
+            query = query.with_for_update()
+        return await session.scalar(query)
 
     @staticmethod
     async def create_queued(
@@ -90,19 +239,79 @@ class TaskRepository:
         gpu_count: int,
         idempotency_key: str | None,
         request_hash: str | None,
+        project_id: uuid.UUID = LEGACY_PROJECT_ID,
+        submitted_by_user_id: uuid.UUID | None = None,
+        created_by_api_key_id: uuid.UUID | None = None,
+        runtime_type: str = "docker",
+        workload_type: str = WorkloadType.BATCH_JOB.value,
+        priority: int = 50,
+        preemptible: bool = False,
+        gpu_memory_mb: int = 0,
+        gpu_model: str | None = None,
+        tolerations: list[dict[str, str]] | None = None,
+        depends_on: list[uuid.UUID] | None = None,
+        dependency_failure_policy: str = "cancel",
+        retry_backoff: str = RetryBackoff.EXPONENTIAL.value,
+        retry_base_seconds: float = 1.0,
+        retry_max_seconds: float = 60.0,
+        retry_on_exit_codes: list[int] | None = None,
     ) -> Task:
+        dependency_ids = tuple(depends_on or ())
+        if len(dependency_ids) != len(set(dependency_ids)):
+            raise DependencyValidationError("depends_on task IDs must be unique")
+        if dependency_failure_policy not in {"block", "cancel"}:
+            raise DependencyValidationError("unsupported dependency failure policy")
+        dependency_tasks = list(
+            await session.scalars(
+                select(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.id.in_(dependency_ids),
+                )
+                .order_by(Task.id)
+                .with_for_update()
+            )
+        )
+        if len(dependency_tasks) != len(dependency_ids):
+            raise DependencyValidationError("every dependency must exist in the submitting project")
+        quota = await QuotaRepository.initialize(session, project_id=project_id)
+        QuotaRepository.ensure_task_can_fit(
+            quota,
+            cpu_millicores=round(cpu_limit * 1000),
+            memory_mb=memory_limit_mb,
+            gpu_count=gpu_count,
+        )
+        await QuotaRepository.admit_queued(session, project_id=project_id)
         now = await database_utcnow(session)
         task = Task(
+            project_id=project_id,
+            submitted_by_user_id=submitted_by_user_id,
+            created_by_api_key_id=created_by_api_key_id,
             image=image,
+            workload_type=WorkloadType(workload_type),
             command=command,
             environment=environment,
             timeout_seconds=timeout_seconds,
             max_retries=max_retries,
+            retry_backoff=RetryBackoff(retry_backoff).value,
+            retry_base_seconds=retry_base_seconds,
+            retry_max_seconds=retry_max_seconds,
+            retry_on_exit_codes=list(
+                [1, 137] if retry_on_exit_codes is None else retry_on_exit_codes
+            ),
             cpu_limit=cpu_limit,
+            cpu_millicores=round(cpu_limit * 1000),
             memory_limit_mb=memory_limit_mb,
             labels=labels,
             network_enabled=network_enabled,
             gpu_count=gpu_count,
+            gpu_memory_mb=gpu_memory_mb,
+            gpu_model=gpu_model,
+            runtime_type=runtime_type,
+            priority=priority,
+            preemptible=preemptible,
+            tolerations=tolerations or [],
+            network_mode="internet" if network_enabled else "none",
             idempotency_key=idempotency_key,
             request_hash=request_hash,
             status=TaskStatus.PENDING,
@@ -110,14 +319,62 @@ class TaskRepository:
         )
         session.add(task)
         await session.flush()
-        _transition(task, TaskStatus.QUEUED, now)
-        OutboxRepository.add(
-            session,
-            aggregate_id=task.id,
-            event_type="task.ready",
-            payload={"task_id": str(task.id)},
-            available_at=now,
+        for dependency_id in dependency_ids:
+            session.add(
+                TaskDependency(
+                    task_id=task.id,
+                    depends_on_task_id=dependency_id,
+                    job_group_id=None,
+                    failure_policy=dependency_failure_policy,
+                )
+            )
+        session.add(
+            TaskEvent(
+                project_id=task.project_id,
+                task_id=task.id,
+                event_type="task.created",
+                sequence=0,
+                from_status=None,
+                status=TaskStatus.PENDING.value,
+                details={},
+                created_at=now,
+            )
         )
+        dependency_failed = any(
+            dependency.status in FINAL_TASK_STATUSES and dependency.status != TaskStatus.SUCCEEDED
+            for dependency in dependency_tasks
+        )
+        dependencies_succeeded = all(
+            dependency.status == TaskStatus.SUCCEEDED for dependency in dependency_tasks
+        )
+        if dependency_failed and dependency_failure_policy == "cancel":
+            _transition(
+                session,
+                task,
+                TaskStatus.CANCELLED,
+                now,
+                event_type="task.dependency_cancelled",
+            )
+            task.error_message = "a prerequisite task did not succeed"
+            task.failure_category = ErrorCategory.CANCELLED.value
+            task.error_category = ErrorCategory.CANCELLED.value
+            await QuotaRepository.release_queued(session, project_id=project_id)
+            OutboxRepository.add(
+                session,
+                aggregate_id=task.id,
+                event_type="task.terminal",
+                payload={"task_id": str(task.id), "status": TaskStatus.CANCELLED.value},
+                available_at=now,
+            )
+        elif dependencies_succeeded:
+            _transition(session, task, TaskStatus.QUEUED, now, event_type="task.queued")
+            OutboxRepository.add(
+                session,
+                aggregate_id=task.id,
+                event_type="task.ready",
+                payload={"task_id": str(task.id)},
+                available_at=now,
+            )
         return task
 
     @staticmethod
@@ -137,15 +394,161 @@ class TaskRepository:
         return list(await session.scalars(query))
 
     @staticmethod
+    async def list_for_project(
+        session: AsyncSession,
+        *,
+        project_id: uuid.UUID,
+        status: TaskStatus | None,
+        worker_id: str | None,
+        limit: int,
+        offset: int,
+        after: CursorKey | None = None,
+    ) -> list[Task]:
+        query = select(Task).where(Task.project_id == project_id)
+        if status is not None:
+            query = query.where(Task.status == status)
+        if worker_id is not None:
+            query = query.where(Task.worker_id == worker_id)
+        if after is not None:
+            query = query.where(
+                or_(
+                    Task.created_at < after.created_at,
+                    (Task.created_at == after.created_at) & (Task.id < after.item_id),
+                )
+            )
+        return list(
+            await session.scalars(
+                query.order_by(Task.created_at.desc(), Task.id.desc())
+                .limit(limit)
+                .offset(0 if after is not None else offset)
+            )
+        )
+
+    @staticmethod
     async def list_queued_ids(session: AsyncSession, limit: int) -> list[uuid.UUID]:
         return list(
             await session.scalars(
                 select(Task.id)
-                .where(Task.status == TaskStatus.QUEUED)
+                .where(
+                    Task.status == TaskStatus.QUEUED,
+                    ~_unsatisfied_dependencies(Task.id),
+                )
                 .order_by(Task.queued_at)
                 .limit(limit)
             )
         )
+
+    @staticmethod
+    async def dependencies_ready(session: AsyncSession, task_id: uuid.UUID) -> bool:
+        return not bool(await session.scalar(select(_unsatisfied_dependencies(task_id))))
+
+    @staticmethod
+    async def resolve_dependency_readiness(
+        session: AsyncSession,
+        *,
+        limit: int,
+    ) -> list[uuid.UUID]:
+        """Promote ready DAG tasks and cancel dependants according to edge policy.
+
+        The scan is PostgreSQL-fenced and safe to run from every API replica. Queued
+        tasks are included because a dependency may have been attached through the
+        JobGroup API after the task was originally submitted.
+        """
+
+        dependent_ids = select(TaskDependency.task_id).distinct()
+        tasks = list(
+            await session.scalars(
+                select(Task)
+                .where(
+                    Task.id.in_(dependent_ids),
+                    Task.status.in_({TaskStatus.PENDING, TaskStatus.QUEUED}),
+                )
+                .order_by(Task.created_at, Task.id)
+                .limit(limit)
+                .with_for_update(skip_locked=True)
+            )
+        )
+        if not tasks:
+            return []
+
+        dependency_task = aliased(Task)
+        dependency_rows = (
+            await session.execute(
+                select(
+                    TaskDependency.task_id,
+                    TaskDependency.failure_policy,
+                    dependency_task.status,
+                )
+                .join(
+                    dependency_task,
+                    dependency_task.id == TaskDependency.depends_on_task_id,
+                )
+                .where(TaskDependency.task_id.in_([task.id for task in tasks]))
+                .order_by(TaskDependency.task_id, TaskDependency.depends_on_task_id)
+            )
+        ).all()
+        rows_by_task: dict[uuid.UUID, list[tuple[str, TaskStatus]]] = {
+            task.id: [] for task in tasks
+        }
+        for task_id, failure_policy, dependency_status in dependency_rows:
+            rows_by_task[task_id].append((failure_policy, dependency_status))
+
+        changed: list[uuid.UUID] = []
+        resolved_at: datetime | None = None
+        for task in tasks:
+            rows = rows_by_task[task.id]
+            if not rows:
+                continue
+            if all(status == TaskStatus.SUCCEEDED for _policy, status in rows):
+                if task.status == TaskStatus.PENDING:
+                    if resolved_at is None:
+                        resolved_at = await database_utcnow(session)
+                    _transition(
+                        session,
+                        task,
+                        TaskStatus.QUEUED,
+                        resolved_at,
+                        event_type="task.dependencies_satisfied",
+                    )
+                    OutboxRepository.add(
+                        session,
+                        aggregate_id=task.id,
+                        event_type="task.ready",
+                        payload={"task_id": str(task.id)},
+                        available_at=resolved_at,
+                    )
+                    changed.append(task.id)
+                continue
+
+            failed_rows = [
+                (policy, status)
+                for policy, status in rows
+                if status in FINAL_TASK_STATUSES and status != TaskStatus.SUCCEEDED
+            ]
+            if failed_rows and any(policy == "cancel" for policy, _status in failed_rows):
+                if resolved_at is None:
+                    resolved_at = await database_utcnow(session)
+                _transition(
+                    session,
+                    task,
+                    TaskStatus.CANCELLED,
+                    resolved_at,
+                    event_type="task.dependency_cancelled",
+                )
+                task.cancel_requested = True
+                task.error_message = "a prerequisite task did not succeed"
+                task.failure_category = ErrorCategory.CANCELLED.value
+                task.error_category = ErrorCategory.CANCELLED.value
+                await QuotaRepository.release_queued(session, project_id=task.project_id)
+                OutboxRepository.add(
+                    session,
+                    aggregate_id=task.id,
+                    event_type="task.terminal",
+                    payload={"task_id": str(task.id), "status": TaskStatus.CANCELLED.value},
+                    available_at=resolved_at,
+                )
+                changed.append(task.id)
+        return changed
 
     @staticmethod
     async def list_queued_candidates_for_worker(
@@ -155,8 +558,14 @@ class TaskRepository:
         limit: int,
         offset: int,
     ) -> tuple[list[uuid.UUID], int]:
-        available_cpu = max(0.0, worker.cpu_count - worker.reserved_cpu)
-        available_memory = max(0, worker.memory_total_mb - worker.reserved_memory_mb)
+        available_cpu = max(
+            0.0,
+            worker.cpu_allocatable_millicores / 1000 - worker.reserved_cpu,
+        )
+        available_memory = max(
+            0,
+            worker.memory_allocatable_mb - worker.reserved_memory_mb,
+        )
         available_gpus = max(0, worker.gpu_count - worker.reserved_gpus)
         page = list(
             await session.scalars(
@@ -167,6 +576,7 @@ class TaskRepository:
                     Task.cpu_limit <= available_cpu,
                     Task.memory_limit_mb <= available_memory,
                     Task.gpu_count <= available_gpus,
+                    ~_unsatisfied_dependencies(Task.id),
                 )
                 .order_by(Task.queued_at, Task.id)
                 .offset(offset)
@@ -174,7 +584,7 @@ class TaskRepository:
             )
         )
         return (
-            [task.id for task in page if _labels_match(task.labels, worker.labels)],
+            [task.id for task in page if _worker_can_run_task(worker, task)],
             len(page),
         )
 
@@ -192,6 +602,49 @@ class TaskRepository:
         )
 
     @staticmethod
+    async def list_logs_for_project(
+        session: AsyncSession,
+        *,
+        project_id: uuid.UUID,
+        task_id: uuid.UUID,
+        offset: int,
+        limit: int,
+    ) -> list[TaskLog]:
+        return list(
+            await session.scalars(
+                select(TaskLog)
+                .join(Task, Task.id == TaskLog.task_id)
+                .where(
+                    Task.project_id == project_id,
+                    TaskLog.task_id == task_id,
+                    TaskLog.sequence > offset,
+                )
+                .order_by(TaskLog.sequence)
+                .limit(limit)
+            )
+        )
+
+    @staticmethod
+    async def list_events_for_project(
+        session: AsyncSession,
+        *,
+        project_id: uuid.UUID,
+        task_id: uuid.UUID,
+        limit: int = 1000,
+    ) -> list[TaskEvent]:
+        return list(
+            await session.scalars(
+                select(TaskEvent)
+                .where(
+                    TaskEvent.project_id == project_id,
+                    TaskEvent.task_id == task_id,
+                )
+                .order_by(TaskEvent.sequence)
+                .limit(limit)
+            )
+        )
+
+    @staticmethod
     async def append_log(
         session: AsyncSession,
         *,
@@ -199,8 +652,22 @@ class TaskRepository:
         execution_id: uuid.UUID | None,
         stream: LogStream,
         content: str,
+        worker_id: str | None = None,
+        worker_session_id: uuid.UUID | None = None,
     ) -> TaskLog:
-        task = await TaskRepository.get(session, task_id, for_update=True)
+        task: Task | None
+        if worker_session_id is not None:
+            if worker_id is None or execution_id is None:
+                raise ValueError("worker_id and execution_id are required with worker_session_id")
+            task = await TaskRepository._owned_task(
+                session,
+                task_id=task_id,
+                worker_id=worker_id,
+                execution_id=execution_id,
+                worker_session_id=worker_session_id,
+            )
+        else:
+            task = await TaskRepository.get(session, task_id, for_update=True)
         if task is None:
             raise LookupError(f"task {task_id} does not exist")
         if execution_id is not None and (
@@ -230,14 +697,11 @@ class TaskRepository:
                 .where(
                     Worker.status == WorkerStatus.ONLINE,
                     Worker.running_tasks < Worker.concurrency,
-                    Worker.reserved_cpu + task.cpu_limit <= Worker.cpu_count,
-                    Worker.reserved_memory_mb + task.memory_limit_mb <= Worker.memory_total_mb,
-                    Worker.reserved_gpus + task.gpu_count <= Worker.gpu_count,
                 )
                 .order_by(Worker.running_tasks, Worker.last_heartbeat_at.desc())
             )
         )
-        return [worker for worker in workers if _labels_match(task.labels, worker.labels)]
+        return [worker for worker in workers if _worker_can_run_task(worker, task)]
 
     @staticmethod
     async def claim(
@@ -246,31 +710,128 @@ class TaskRepository:
         task_id: uuid.UUID,
         worker_id: str,
         lease_seconds: float,
+        worker_session_id: uuid.UUID | None = None,
+        cpu_price_per_hour: float = 0.05,
+        memory_price_per_gb_hour: float = 0.005,
+        gpu_price_per_hour: float = 1.0,
     ) -> tuple[Task, uuid.UUID]:
         task = await TaskRepository.get(session, task_id, for_update=True)
         if task is None or task.status != TaskStatus.QUEUED or task.cancel_requested:
             raise ClaimRejected("task is no longer queued")
-        worker = await session.get(Worker, worker_id, with_for_update=True)
+        if not await TaskRepository.dependencies_ready(session, task.id):
+            raise ClaimRejected("task dependencies are not ready")
+        worker = await session.scalar(
+            select(Worker)
+            .where(Worker.id == worker_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
         if worker is None or worker.status != WorkerStatus.ONLINE:
             raise ClaimRejected("worker is not online")
+        if worker_session_id is not None and worker.worker_session_id != worker_session_id:
+            raise ClaimRejected("worker session is stale")
         if worker.running_tasks >= worker.concurrency:
             raise ClaimRejected("worker has no free concurrency slot")
         if not _worker_can_run_task(worker, task):
             raise ClaimRejected("worker does not satisfy task requirements")
 
+        devices: list[GPUDevice] = []
+        if task.gpu_count:
+            allocated_ids = select(ReservationGPUDevice.gpu_device_id).where(
+                ReservationGPUDevice.released_at.is_(None)
+            )
+            device_query = (
+                select(GPUDevice)
+                .where(
+                    GPUDevice.worker_id == worker.id,
+                    GPUDevice.health == "healthy",
+                    GPUDevice.memory_free_mb >= task.gpu_memory_mb,
+                    ~GPUDevice.id.in_(allocated_ids),
+                )
+                .order_by(
+                    GPUDevice.memory_free_mb,
+                    GPUDevice.memory_total_mb,
+                    GPUDevice.device_uuid,
+                )
+                .limit(task.gpu_count)
+                .with_for_update(skip_locked=True)
+            )
+            if task.gpu_model is not None:
+                device_query = device_query.where(GPUDevice.model == task.gpu_model)
+            devices = list(await session.scalars(device_query))
+            if len(devices) != task.gpu_count:
+                raise ClaimRejected("worker concrete GPU inventory is insufficient")
+
         execution_id = uuid.uuid4()
         now = await database_utcnow(session)
-        _transition(task, TaskStatus.ASSIGNED, now)
+        _prepare_for_assignment(task)
+        _transition(session, task, TaskStatus.ASSIGNED, now, event_type="task.assigned")
         task.worker_id = worker.id
         task.execution_id = execution_id
         task.lease_expires_at = now + timedelta(seconds=lease_seconds)
-        task.cancel_requested = False
-        task.error_message = None
         worker.running_tasks += 1
         worker.reserved_cpu += task.cpu_limit
         worker.reserved_memory_mb += task.memory_limit_mb
         worker.reserved_gpus += task.gpu_count
         worker.version += 1
+        if devices:
+            task.gpu_device_ids = [device.device_uuid for device in devices]
+
+        previous_attempt = int(
+            await session.scalar(
+                select(func.max(TaskExecution.attempt)).where(TaskExecution.task_id == task.id)
+            )
+            or 0
+        )
+        execution = TaskExecution(
+            id=execution_id,
+            task_id=task.id,
+            project_id=task.project_id,
+            worker_id=worker.id,
+            worker_session_id=worker.worker_session_id,
+            attempt=previous_attempt + 1,
+            status=TaskStatus.ASSIGNED.value,
+            cpu_millicores=task.cpu_millicores,
+            memory_mb=task.memory_limit_mb,
+            gpu_count=task.gpu_count,
+            gpu_model=task.gpu_model,
+            cpu_price_per_hour=Decimal(str(cpu_price_per_hour)),
+            memory_price_per_gb_hour=Decimal(str(memory_price_per_gb_hour)),
+            gpu_price_per_hour=Decimal(str(gpu_price_per_hour)),
+            assigned_at=now,
+            runtime_type=task.runtime_type.value,
+        )
+        session.add(execution)
+        await session.flush()
+        reservation = ResourceReservation(
+            project_id=task.project_id,
+            task_id=task.id,
+            execution_id=execution_id,
+            worker_id=worker.id,
+            worker_session_id=worker.worker_session_id,
+            cpu_millicores=task.cpu_millicores,
+            memory_mb=task.memory_limit_mb,
+            gpu_count=task.gpu_count,
+            legacy_unbound=False,
+            created_at=now,
+        )
+        session.add(reservation)
+        await session.flush()
+        for device in devices:
+            session.add(
+                ReservationGPUDevice(
+                    reservation_id=reservation.id,
+                    gpu_device_id=device.id,
+                    created_at=now,
+                )
+            )
+        await QuotaRepository.reserve_execution(
+            session,
+            project_id=task.project_id,
+            cpu_millicores=task.cpu_millicores,
+            memory_mb=task.memory_limit_mb,
+            gpu_count=task.gpu_count,
+        )
         OutboxRepository.add(
             session,
             aggregate_id=task.id,
@@ -291,6 +852,50 @@ class TaskRepository:
         return task, execution_id
 
     @staticmethod
+    async def take_global_assignment(
+        session: AsyncSession,
+        *,
+        worker_id: str,
+        worker_session_id: uuid.UUID,
+        lease_seconds: float,
+    ) -> Task | None:
+        active_device_count = (
+            select(func.count(ReservationGPUDevice.id))
+            .where(
+                ReservationGPUDevice.reservation_id == ResourceReservation.id,
+                ReservationGPUDevice.released_at.is_(None),
+            )
+            .correlate(ResourceReservation)
+            .scalar_subquery()
+        )
+        task = await session.scalar(
+            select(Task)
+            .join(
+                ResourceReservation,
+                ResourceReservation.execution_id == Task.execution_id,
+            )
+            .join(Worker, Worker.id == Task.worker_id)
+            .where(
+                Task.worker_id == worker_id,
+                Task.status == TaskStatus.ASSIGNED,
+                ResourceReservation.worker_session_id == worker_session_id,
+                ResourceReservation.released_at.is_(None),
+                ResourceReservation.gpu_count == Task.gpu_count,
+                or_(Task.gpu_count == 0, active_device_count == Task.gpu_count),
+                Worker.worker_session_id == worker_session_id,
+            )
+            .order_by(Task.assigned_at, Task.id)
+            .limit(1)
+            .with_for_update(skip_locked=True)
+        )
+        if task is None:
+            return None
+        now = await database_utcnow(session)
+        _transition(session, task, TaskStatus.PREPARING, now)
+        task.lease_expires_at = now + timedelta(seconds=lease_seconds)
+        return task
+
+    @staticmethod
     async def mark_pulling(
         session: AsyncSession,
         *,
@@ -298,14 +903,19 @@ class TaskRepository:
         worker_id: str,
         execution_id: uuid.UUID,
         lease_seconds: float,
+        worker_session_id: uuid.UUID | None = None,
     ) -> Task:
         task = await TaskRepository._owned_task(
-            session, task_id=task_id, worker_id=worker_id, execution_id=execution_id
+            session,
+            task_id=task_id,
+            worker_id=worker_id,
+            execution_id=execution_id,
+            worker_session_id=worker_session_id,
         )
-        if task.status != TaskStatus.ASSIGNED:
+        if task.status not in {TaskStatus.ASSIGNED, TaskStatus.PREPARING}:
             raise StaleExecutionError("task is no longer assigned to this execution")
         now = await database_utcnow(session)
-        _transition(task, TaskStatus.PULLING, now)
+        _transition(session, task, TaskStatus.PULLING, now)
         task.lease_expires_at = now + timedelta(seconds=lease_seconds)
         return task
 
@@ -317,14 +927,43 @@ class TaskRepository:
         worker_id: str,
         execution_id: uuid.UUID,
         lease_seconds: float,
+        worker_session_id: uuid.UUID | None = None,
     ) -> Task:
         task = await TaskRepository._owned_task(
-            session, task_id=task_id, worker_id=worker_id, execution_id=execution_id
+            session,
+            task_id=task_id,
+            worker_id=worker_id,
+            execution_id=execution_id,
+            worker_session_id=worker_session_id,
+        )
+        if task.status not in {TaskStatus.PULLING, TaskStatus.STARTING}:
+            raise StaleExecutionError("task is no longer starting for this execution")
+        now = await database_utcnow(session)
+        _transition(session, task, TaskStatus.RUNNING, now)
+        task.lease_expires_at = now + timedelta(seconds=lease_seconds)
+        return task
+
+    @staticmethod
+    async def mark_starting(
+        session: AsyncSession,
+        *,
+        task_id: uuid.UUID,
+        worker_id: str,
+        execution_id: uuid.UUID,
+        lease_seconds: float,
+        worker_session_id: uuid.UUID | None = None,
+    ) -> Task:
+        task = await TaskRepository._owned_task(
+            session,
+            task_id=task_id,
+            worker_id=worker_id,
+            execution_id=execution_id,
+            worker_session_id=worker_session_id,
         )
         if task.status != TaskStatus.PULLING:
             raise StaleExecutionError("task is no longer pulling for this execution")
         now = await database_utcnow(session)
-        _transition(task, TaskStatus.RUNNING, now)
+        _transition(session, task, TaskStatus.STARTING, now)
         task.lease_expires_at = now + timedelta(seconds=lease_seconds)
         return task
 
@@ -336,6 +975,7 @@ class TaskRepository:
         worker_id: str,
         execution_id: uuid.UUID,
         lease_seconds: float,
+        worker_session_id: uuid.UUID | None = None,
     ) -> bool:
         task = await TaskRepository.get(session, task_id, for_update=True)
         if (
@@ -345,6 +985,14 @@ class TaskRepository:
             or task.status not in ACTIVE_TASK_STATUSES
         ):
             return False
+        if worker_session_id is not None:
+            if not await TaskRepository._session_owns_execution(
+                session,
+                worker_id=worker_id,
+                execution_id=execution_id,
+                worker_session_id=worker_session_id,
+            ):
+                return False
         now = await database_utcnow(session)
         task.lease_expires_at = now + timedelta(seconds=lease_seconds)
         task.version += 1
@@ -357,10 +1005,15 @@ class TaskRepository:
         task_id: uuid.UUID,
         worker_id: str,
         execution_id: uuid.UUID,
+        worker_session_id: uuid.UUID | None = None,
     ) -> bool:
-        task = await TaskRepository.get(session, task_id)
-        if task is None or task.worker_id != worker_id or task.execution_id != execution_id:
-            raise StaleExecutionError("execution token is stale")
+        task = await TaskRepository._owned_task(
+            session,
+            task_id=task_id,
+            worker_id=worker_id,
+            execution_id=execution_id,
+            worker_session_id=worker_session_id,
+        )
         return task.cancel_requested or task.status == TaskStatus.CANCELLED
 
     @staticmethod
@@ -376,21 +1029,64 @@ class TaskRepository:
         retry_max_backoff_seconds: float,
         cpu_price_per_hour: float,
         gpu_price_per_hour: float,
+        memory_price_per_gb_hour: float = 0.005,
+        error_category: ErrorCategory | str | None = None,
+        error_code: ErrorCode | str | None = None,
+        worker_session_id: uuid.UUID | None = None,
     ) -> ExecutionResult:
         task = await TaskRepository.get(session, task_id, for_update=True)
         if task is None or task.worker_id != worker_id or task.execution_id != execution_id:
             return ExecutionResult(accepted=False, status=None)
+        if worker_session_id is not None and not await TaskRepository._session_owns_execution(
+            session,
+            worker_id=worker_id,
+            execution_id=execution_id,
+            worker_session_id=worker_session_id,
+        ):
+            return ExecutionResult(accepted=False, status=None)
         if task.status not in ACTIVE_TASK_STATUSES:
             return ExecutionResult(accepted=False, status=task.status)
 
-        worker = await session.get(Worker, worker_id, with_for_update=True)
+        worker = await session.scalar(
+            select(Worker)
+            .where(Worker.id == worker_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
         now = await database_utcnow(session)
-        if task.cancel_requested:
+        preemption_requested = task.status == TaskStatus.PREEMPTING
+        user_cancelled_preemption = preemption_requested and task.failure_category == "CANCELLED"
+        if task.cancel_requested and (not preemption_requested or user_cancelled_preemption):
             target = TaskStatus.CANCELLED
             error_message = "task was cancelled by user request"
-        _transition(task, target, now)
+            error_category = ErrorCategory.CANCELLED
+            error_code = None
+        elif preemption_requested:
+            target = TaskStatus.PREEMPTED
+            error_message = "task was stopped to admit a higher-priority workload"
+            error_category = ErrorCategory.PREEMPTED
+            error_code = None
+        elif error_category is None:
+            if target == TaskStatus.TIMED_OUT:
+                error_category = ErrorCategory.TIMEOUT
+            elif target == TaskStatus.CANCELLED:
+                error_category = ErrorCategory.CANCELLED
+            elif target == TaskStatus.PREEMPTED:
+                error_category = ErrorCategory.PREEMPTED
+            elif target == TaskStatus.FAILED:
+                error_category = (
+                    ErrorCategory.USER_ERROR
+                    if exit_code is not None
+                    else ErrorCategory.INTERNAL_ERROR
+                )
+        _transition(session, task, target, now, event_type=f"task.{target.value}")
         task.exit_code = exit_code
         task.error_message = error_message
+        category_value = _enum_value(error_category)
+        code_value = _enum_value(error_code)
+        task.failure_category = category_value
+        task.error_category = category_value
+        task.error_code = code_value
         task.lease_expires_at = None
         if task.started_at is not None:
             start = _as_utc(task.started_at)
@@ -404,19 +1100,68 @@ class TaskRepository:
                 + task.gpu_seconds * gpu_price_per_hour / 3600
             )
 
-        if worker is not None:
+        released = await ReservationRepository.release_and_settle(
+            session,
+            task=task,
+            execution_id=execution_id,
+            final_status=target.value,
+            now=now,
+            release_reason=target.value,
+        )
+        if not released and worker is not None:
+            # Compatibility for an in-flight Phase I execution encountered
+            # before the reservation backfill migration completed.
             _release_worker_capacity(worker, task)
+        execution = await session.get(TaskExecution, execution_id, with_for_update=True)
+        if execution is not None:
+            execution.error_category = category_value
+            execution.error_code = code_value
+            execution.error_message = error_message
+
+        if preemption_requested:
+            await _complete_preemption_plans(session, task_id=task.id, now=now)
 
         retry_scheduled = False
+        retry_admitted = False
+        if target == TaskStatus.PREEMPTED and task.requeue_on_preempt:
+            retry_admitted = await _admit_retry(session, task.project_id)
+        elif (
+            target in {TaskStatus.FAILED, TaskStatus.TIMED_OUT}
+            and task.retry_count < task.max_retries
+            and should_retry_failure(
+                error_category=error_category,
+                exit_code=exit_code,
+                retry_on_exit_codes=task.retry_on_exit_codes,
+            )
+        ):
+            retry_admitted = await _admit_retry(session, task.project_id)
         if (
             target in {TaskStatus.FAILED, TaskStatus.TIMED_OUT}
             and task.retry_count < task.max_retries
+            and should_retry_failure(
+                error_category=error_category,
+                exit_code=exit_code,
+                retry_on_exit_codes=task.retry_on_exit_codes,
+            )
+            and retry_admitted
         ):
             task.retry_count += 1
-            _transition(task, TaskStatus.RETRYING, now)
+            _transition(session, task, TaskStatus.RETRYING, now)
             task.next_attempt_at = now + timedelta(
-                seconds=retry_delay_seconds(task.retry_count, retry_max_backoff_seconds)
+                seconds=retry_delay_seconds(
+                    task.retry_count,
+                    min(task.retry_max_seconds, retry_max_backoff_seconds),
+                    backoff=task.retry_backoff,
+                    base_seconds=task.retry_base_seconds,
+                )
             )
+            task.worker_id = None
+            task.execution_id = None
+            task.cancel_requested = False
+            retry_scheduled = True
+        elif target == TaskStatus.PREEMPTED and task.requeue_on_preempt and retry_admitted:
+            _transition(session, task, TaskStatus.RETRYING, now)
+            task.next_attempt_at = now
             task.worker_id = None
             task.execution_id = None
             task.cancel_requested = False
@@ -430,6 +1175,8 @@ class TaskRepository:
                     "task_id": str(task.id),
                     "status": task.status.value,
                     "duration_seconds": task.wall_time_seconds,
+                    "cpu_seconds": task.cpu_seconds,
+                    "gpu_seconds": task.gpu_seconds,
                 },
                 available_at=now,
             )
@@ -445,19 +1192,48 @@ class TaskRepository:
             TaskStatus.FAILED,
             TaskStatus.CANCELLED,
             TaskStatus.TIMED_OUT,
+            TaskStatus.PREEMPTED,
         }:
             return task
-        if task.status == TaskStatus.RUNNING:
+        if task.status == TaskStatus.PREEMPTING:
             task.cancel_requested = True
+            task.requeue_on_preempt = False
+            task.failure_category = ErrorCategory.CANCELLED.value
+            task.error_category = ErrorCategory.CANCELLED.value
+            task.error_code = None
             task.version += 1
             return task
+        if task.status in ACTIVE_TASK_STATUSES and task.execution_id is not None:
+            task.cancel_requested = True
+            if task.status != TaskStatus.STOPPING:
+                _transition(
+                    session,
+                    task,
+                    TaskStatus.STOPPING,
+                    await database_utcnow(session),
+                    event_type="task.stop_requested",
+                )
+            return task
 
+        previous_status = task.status
         previous_worker_id = task.worker_id
         now = await database_utcnow(session)
-        _transition(task, TaskStatus.CANCELLED, now)
+        _transition(session, task, TaskStatus.CANCELLED, now)
         task.cancel_requested = True
+        task.failure_category = ErrorCategory.CANCELLED.value
+        task.error_category = ErrorCategory.CANCELLED.value
+        task.error_code = None
         task.lease_expires_at = None
         task.execution_id = None
+        if previous_status in {
+            TaskStatus.PENDING,
+            TaskStatus.QUEUED,
+            TaskStatus.SCHEDULING,
+            TaskStatus.RETRYING,
+        }:
+            quota_state = await session.get(ProjectQuotaState, task.project_id)
+            if quota_state is not None:
+                await QuotaRepository.release_queued(session, project_id=task.project_id)
         if previous_worker_id is not None:
             worker = await session.get(Worker, previous_worker_id, with_for_update=True)
             if worker is not None:
@@ -470,6 +1246,22 @@ class TaskRepository:
             available_at=now,
         )
         return task
+
+    @staticmethod
+    async def cancel_for_project(
+        session: AsyncSession,
+        *,
+        project_id: uuid.UUID,
+        task_id: uuid.UUID,
+    ) -> Task | None:
+        task = await TaskRepository.get_for_project(
+            session, project_id=project_id, task_id=task_id, for_update=True
+        )
+        if task is None:
+            return None
+        # ``cancel`` locks the same row again in the current transaction and
+        # then applies the single authoritative state transition.
+        return await TaskRepository.cancel(session, task_id)
 
     @staticmethod
     async def release_due_retries(session: AsyncSession, limit: int) -> list[uuid.UUID]:
@@ -488,8 +1280,11 @@ class TaskRepository:
         )
         for task in tasks:
             if task.cancel_requested:
-                _transition(task, TaskStatus.CANCELLED, now)
+                _transition(session, task, TaskStatus.CANCELLED, now)
                 task.next_attempt_at = None
+                task.failure_category = ErrorCategory.CANCELLED.value
+                task.error_category = ErrorCategory.CANCELLED.value
+                task.error_code = None
                 OutboxRepository.add(
                     session,
                     aggregate_id=task.id,
@@ -498,7 +1293,7 @@ class TaskRepository:
                     available_at=now,
                 )
                 continue
-            _transition(task, TaskStatus.QUEUED, now)
+            _transition(session, task, TaskStatus.QUEUED, now)
             task.next_attempt_at = None
             task.cancel_requested = False
             OutboxRepository.add(
@@ -535,16 +1330,61 @@ class TaskRepository:
         recovered: list[uuid.UUID] = []
         for task in tasks:
             worker_id = task.worker_id
+            execution_id = task.execution_id
+            preemption_requested = task.status == TaskStatus.PREEMPTING
+            user_cancelled_preemption = (
+                preemption_requested and task.failure_category == ErrorCategory.CANCELLED.value
+            )
+            cancellation_requested = task.cancel_requested and (
+                not preemption_requested or user_cancelled_preemption
+            )
+            if cancellation_requested:
+                recovered_status = TaskStatus.CANCELLED
+            elif preemption_requested:
+                recovered_status = TaskStatus.PREEMPTED
+            else:
+                recovered_status = TaskStatus.FAILED
+            worker = (
+                await session.get(Worker, worker_id, with_for_update=True)
+                if worker_id is not None
+                else None
+            )
+            recovery_code = (
+                ErrorCode.WORKER_LOST
+                if worker is None or worker.status == WorkerStatus.OFFLINE
+                else ErrorCode.LEASE_EXPIRED
+            )
             task.lease_expires_at = None
-            task.execution_id = None
-            if worker_id is not None:
+            released = False
+            if execution_id is not None:
+                released = await ReservationRepository.release_and_settle(
+                    session,
+                    task=task,
+                    execution_id=execution_id,
+                    final_status=recovered_status.value,
+                    now=now,
+                    release_reason="execution_lease_expired",
+                )
+            if not released and worker_id is not None:
                 worker = await session.get(Worker, worker_id, with_for_update=True)
                 if worker is not None:
                     _release_worker_capacity(worker, task)
+            task.execution_id = None
             task.worker_id = None
-            if task.cancel_requested:
-                _transition(task, TaskStatus.CANCELLED, now)
+            if preemption_requested:
+                await _complete_preemption_plans(session, task_id=task.id, now=now)
+            if cancellation_requested:
+                _transition(session, task, TaskStatus.CANCELLED, now)
                 task.error_message = "task was cancelled before its execution lease expired"
+                task.failure_category = ErrorCategory.CANCELLED.value
+                task.error_category = ErrorCategory.CANCELLED.value
+                task.error_code = None
+                if execution_id is not None:
+                    execution = await session.get(TaskExecution, execution_id, with_for_update=True)
+                    if execution is not None:
+                        execution.error_category = ErrorCategory.CANCELLED.value
+                        execution.error_code = None
+                        execution.error_message = task.error_message
                 OutboxRepository.add(
                     session,
                     aggregate_id=task.id,
@@ -555,14 +1395,73 @@ class TaskRepository:
                 recovered.append(task.id)
                 continue
 
-            _transition(task, TaskStatus.FAILED, now)
+            if preemption_requested:
+                _transition(
+                    session,
+                    task,
+                    TaskStatus.PREEMPTED,
+                    now,
+                    event_type="task.preempted",
+                )
+                task.error_message = (
+                    "preempted execution lease expired; worker ownership was revoked"
+                )
+                task.failure_category = ErrorCategory.PREEMPTED.value
+                task.error_category = ErrorCategory.PREEMPTED.value
+                task.error_code = None
+                if execution_id is not None:
+                    execution = await session.get(TaskExecution, execution_id, with_for_update=True)
+                    if execution is not None:
+                        execution.error_category = ErrorCategory.PREEMPTED.value
+                        execution.error_code = None
+                        execution.error_message = task.error_message
+                if task.requeue_on_preempt and await _admit_retry(session, task.project_id):
+                    _transition(session, task, TaskStatus.RETRYING, now)
+                    task.next_attempt_at = now + timedelta(seconds=recovery_cleanup_grace_seconds)
+                    task.cancel_requested = False
+                    recovered.append(task.id)
+                else:
+                    if task.requeue_on_preempt:
+                        task.error_message += "; retry suppressed by project queue quota"
+                    OutboxRepository.add(
+                        session,
+                        aggregate_id=task.id,
+                        event_type="task.terminal",
+                        payload={
+                            "task_id": str(task.id),
+                            "status": TaskStatus.PREEMPTED.value,
+                        },
+                        available_at=now,
+                    )
+                continue
+
+            _transition(session, task, TaskStatus.FAILED, now)
             task.error_message = "execution lease expired; worker ownership was revoked"
+            task.failure_category = ErrorCategory.INFRA_ERROR.value
+            task.error_category = ErrorCategory.INFRA_ERROR.value
+            task.error_code = recovery_code.value
+            if execution_id is not None:
+                execution = await session.get(TaskExecution, execution_id, with_for_update=True)
+                if execution is not None:
+                    execution.error_category = ErrorCategory.INFRA_ERROR.value
+                    execution.error_code = recovery_code.value
+                    execution.error_message = task.error_message
             if task.recovery_count < max_recovery_attempts:
-                task.recovery_count += 1
-                _transition(task, TaskStatus.RETRYING, now)
-                task.next_attempt_at = now + timedelta(seconds=recovery_cleanup_grace_seconds)
-                task.cancel_requested = False
-                recovered.append(task.id)
+                if await _admit_retry(session, task.project_id):
+                    task.recovery_count += 1
+                    _transition(session, task, TaskStatus.RETRYING, now)
+                    task.next_attempt_at = now + timedelta(seconds=recovery_cleanup_grace_seconds)
+                    task.cancel_requested = False
+                    recovered.append(task.id)
+                else:
+                    task.error_message += "; retry suppressed by project queue quota"
+                    OutboxRepository.add(
+                        session,
+                        aggregate_id=task.id,
+                        event_type="task.terminal",
+                        payload={"task_id": str(task.id), "status": TaskStatus.FAILED.value},
+                        available_at=now,
+                    )
             else:
                 OutboxRepository.add(
                     session,
@@ -585,19 +1484,76 @@ class TaskRepository:
         task_id: uuid.UUID,
         worker_id: str,
         execution_id: uuid.UUID,
+        worker_session_id: uuid.UUID | None = None,
     ) -> Task:
         task = await TaskRepository.get(session, task_id, for_update=True)
         if task is None or task.worker_id != worker_id or task.execution_id != execution_id:
             raise StaleExecutionError("execution token is stale")
+        if worker_session_id is not None and not await TaskRepository._session_owns_execution(
+            session,
+            worker_id=worker_id,
+            execution_id=execution_id,
+            worker_session_id=worker_session_id,
+        ):
+            raise StaleExecutionError("worker session is stale")
         return task
+
+    @staticmethod
+    async def _session_owns_execution(
+        session: AsyncSession,
+        *,
+        worker_id: str,
+        execution_id: uuid.UUID,
+        worker_session_id: uuid.UUID,
+    ) -> bool:
+        worker = await session.scalar(
+            select(Worker)
+            .where(Worker.id == worker_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        if worker is None or worker.worker_session_id != worker_session_id:
+            return False
+        reservation = await session.scalar(
+            select(ResourceReservation)
+            .where(
+                ResourceReservation.execution_id == execution_id,
+                ResourceReservation.worker_id == worker_id,
+                ResourceReservation.worker_session_id == worker_session_id,
+                ResourceReservation.released_at.is_(None),
+            )
+            .with_for_update()
+        )
+        return reservation is not None
+
+
+def _unsatisfied_dependencies(task_id: Any) -> ColumnElement[bool]:
+    dependency_task = aliased(Task)
+    return (
+        select(TaskDependency.task_id)
+        .join(
+            dependency_task,
+            dependency_task.id == TaskDependency.depends_on_task_id,
+        )
+        .where(
+            TaskDependency.task_id == task_id,
+            dependency_task.status != TaskStatus.SUCCEEDED,
+        )
+        .exists()
+    )
 
 
 def _worker_can_run_task(worker: Worker, task: Task) -> bool:
     return (
-        worker.reserved_cpu + task.cpu_limit <= worker.cpu_count
-        and worker.reserved_memory_mb + task.memory_limit_mb <= worker.memory_total_mb
+        worker.status == WorkerStatus.ONLINE
+        and not worker.overcommitted
+        and task.runtime_type.value in worker.runtime_types
+        and round(worker.reserved_cpu * 1000) + task.cpu_millicores
+        <= worker.cpu_allocatable_millicores
+        and worker.reserved_memory_mb + task.memory_limit_mb <= worker.memory_allocatable_mb
         and worker.reserved_gpus + task.gpu_count <= worker.gpu_count
         and _labels_match(task.labels, worker.labels)
+        and _taints_tolerated(worker.taints, task.tolerations)
     )
 
 
@@ -613,7 +1569,63 @@ def _labels_match(required: dict[str, str], offered: dict[str, str]) -> bool:
     return all(offered.get(key) == value for key, value in required.items())
 
 
+def _taints_tolerated(
+    taints: list[dict[str, str]],
+    tolerations: list[dict[str, str]],
+) -> bool:
+    for taint in taints:
+        if taint.get("effect", "NoSchedule") != "NoSchedule":
+            continue
+        if not any(
+            tolerance.get("key") == taint.get("key")
+            and tolerance.get("value", taint.get("value")) == taint.get("value")
+            for tolerance in tolerations
+        ):
+            return False
+    return True
+
+
 def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _enum_value(value: ErrorCategory | ErrorCode | str | None) -> str | None:
+    if isinstance(value, ErrorCategory | ErrorCode):
+        return value.value
+    return value
+
+
+async def _admit_retry(session: AsyncSession, project_id: uuid.UUID) -> bool:
+    state = await session.get(ProjectQuotaState, project_id)
+    if state is None:
+        # Compatibility with an execution created before the Phase II quota
+        # migration. New tasks always initialize quota state transactionally.
+        return True
+    try:
+        await QuotaRepository.admit_queued(session, project_id=project_id)
+    except QuotaExceededError:
+        return False
+    return True
+
+
+async def _complete_preemption_plans(
+    session: AsyncSession,
+    *,
+    task_id: uuid.UUID,
+    now: datetime,
+) -> None:
+    plans = list(
+        await session.scalars(
+            select(PreemptionPlan)
+            .where(
+                PreemptionPlan.victim_task_id == task_id,
+                PreemptionPlan.state == "requested",
+            )
+            .with_for_update()
+        )
+    )
+    for plan in plans:
+        plan.state = "completed"
+        plan.completed_at = now

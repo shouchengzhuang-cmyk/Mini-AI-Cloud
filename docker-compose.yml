@@ -10,8 +10,16 @@ x-app-service: &app-service
 x-app-environment: &app-environment
   DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://task:local-dev-only@postgres:5432/task_platform}
   REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+  APP_ENV: ${APP_ENV:-development}
   LOG_LEVEL: ${LOG_LEVEL:-INFO}
   CONTROL_PLANE_ENABLED: "${CONTROL_PLANE_ENABLED:-true}"
+  LEGACY_ANONYMOUS_ENABLED: "${LEGACY_ANONYMOUS_ENABLED:-true}"
+  BOOTSTRAP_ENABLED: "${BOOTSTRAP_ENABLED:-true}"
+  BOOTSTRAP_TOKEN: ${BOOTSTRAP_TOKEN:-}
+  LEGACY_PROJECT_ID: ${LEGACY_PROJECT_ID:-00000000-0000-0000-0000-000000000001}
+  API_KEY_PEPPER: ${API_KEY_PEPPER:-}
+  SECRET_MASTER_KEY: ${SECRET_MASTER_KEY:-}
+  WORKER_AUTH_TOKEN: ${WORKER_AUTH_TOKEN:-}
   CLUSTER_ID: ${CLUSTER_ID:-mini-docker-cloud-local}
   DEFAULT_TASK_TIMEOUT: "${DEFAULT_TASK_TIMEOUT:-60}"
   MAX_TASK_TIMEOUT: "${MAX_TASK_TIMEOUT:-86400}"
@@ -23,6 +31,11 @@ x-app-environment: &app-environment
   LEASE_RENEW_INTERVAL: "${LEASE_RENEW_INTERVAL:-5}"
   OUTBOX_POLL_INTERVAL: "${OUTBOX_POLL_INTERVAL:-0.25}"
   SCHEDULER_POLL_INTERVAL: "${SCHEDULER_POLL_INTERVAL:-1}"
+  SCHEDULER_MODE: ${SCHEDULER_MODE:-global}
+  SCHEDULING_POLICY: ${SCHEDULING_POLICY:-binpack}
+  SCHEDULER_AGING_INTERVAL_SECONDS: "${SCHEDULER_AGING_INTERVAL_SECONDS:-60}"
+  SCHEDULER_PREEMPTION_ENABLED: "${SCHEDULER_PREEMPTION_ENABLED:-false}"
+  SCHEDULER_PREEMPTION_MIN_DELTA: "${SCHEDULER_PREEMPTION_MIN_DELTA:-10}"
   REAPER_INTERVAL: "${REAPER_INTERVAL:-5}"
   CONTROL_OPERATION_TIMEOUT: "${CONTROL_OPERATION_TIMEOUT:-30}"
   CONTROL_SHUTDOWN_TIMEOUT: "${CONTROL_SHUTDOWN_TIMEOUT:-10}"
@@ -33,8 +46,41 @@ x-app-environment: &app-environment
   READY_STREAM_MAXLEN: "${READY_STREAM_MAXLEN:-100000}"
   REDIS_SOCKET_TIMEOUT: "${REDIS_SOCKET_TIMEOUT:-5}"
   SSE_HEARTBEAT_SECONDS: "${SSE_HEARTBEAT_SECONDS:-10}"
+  API_REQUEST_MAX_BYTES: "${API_REQUEST_MAX_BYTES:-1048576}"
+  WEBSOCKET_QUEUE_SIZE: "${WEBSOCKET_QUEUE_SIZE:-1000}"
+  API_KEY_RATE_LIMIT_PER_MINUTE: "${API_KEY_RATE_LIMIT_PER_MINUTE:-600}"
+  RATE_LIMIT_FAIL_OPEN: "${RATE_LIMIT_FAIL_OPEN:-false}"
   CPU_PRICE_PER_HOUR: "${CPU_PRICE_PER_HOUR:-0.05}"
   GPU_PRICE_PER_HOUR: "${GPU_PRICE_PER_HOUR:-1.0}"
+  MEMORY_PRICE_PER_GB_HOUR: "${MEMORY_PRICE_PER_GB_HOUR:-0.005}"
+  ARTIFACT_BACKEND: ${ARTIFACT_BACKEND:-local}
+  ARTIFACT_LOCAL_ROOT: ${ARTIFACT_LOCAL_ROOT:-/var/lib/mini-ai-cloud/artifacts}
+  ARTIFACT_WORKSPACE_ROOT: ${ARTIFACT_WORKSPACE_ROOT:-/var/lib/mini-ai-cloud/workspaces}
+  ARTIFACT_S3_BUCKET: ${ARTIFACT_S3_BUCKET:-mini-ai-cloud}
+  ARTIFACT_S3_ENDPOINT_URL: ${ARTIFACT_S3_ENDPOINT_URL:-http://minio:9000}
+  ARTIFACT_MAX_BYTES: "${ARTIFACT_MAX_BYTES:-10737418240}"
+  ARTIFACT_SIGNED_URL_TTL_SECONDS: "${ARTIFACT_SIGNED_URL_TTL_SECONDS:-900}"
+  SERVICE_RECONCILE_INTERVAL: "${SERVICE_RECONCILE_INTERVAL:-2}"
+  SERVICE_HEALTH_INTERVAL: "${SERVICE_HEALTH_INTERVAL:-5}"
+  SERVICE_PROXY_TIMEOUT: "${SERVICE_PROXY_TIMEOUT:-120}"
+  SERVICE_PROXY_MAX_RESPONSE_BYTES: "${SERVICE_PROXY_MAX_RESPONSE_BYTES:-16777216}"
+  SERVICE_ENDPOINT_HOST_ALLOWLIST: ${SERVICE_ENDPOINT_HOST_ALLOWLIST:-}
+  SERVICE_AUTOSCALE_INTERVAL: "${SERVICE_AUTOSCALE_INTERVAL:-15}"
+  SERVICE_SCALE_TO_ZERO_ENABLED: "${SERVICE_SCALE_TO_ZERO_ENABLED:-false}"
+  # Explicit opt-in only. The API service intentionally has no Docker socket by default.
+  SERVICE_VLLM_DOCKER_ENABLED: "${SERVICE_VLLM_DOCKER_ENABLED:-false}"
+  SERVICE_VLLM_WORKER_ID: ${SERVICE_VLLM_WORKER_ID:-}
+  SERVICE_VLLM_ENDPOINT_HOST: ${SERVICE_VLLM_ENDPOINT_HOST:-127.0.0.1}
+  SERVICE_VLLM_PUBLISH_ADDRESS: ${SERVICE_VLLM_PUBLISH_ADDRESS:-127.0.0.1}
+  SERVICE_VLLM_CACHE_VOLUME: ${SERVICE_VLLM_CACHE_VOLUME:-mini-ai-cloud-vllm-cache}
+  SERVICE_VLLM_READY_TIMEOUT: "${SERVICE_VLLM_READY_TIMEOUT:-600}"
+  SERVICE_VLLM_PROBE_TIMEOUT: "${SERVICE_VLLM_PROBE_TIMEOUT:-3}"
+  SERVICE_VLLM_LEASE_SECONDS: "${SERVICE_VLLM_LEASE_SECONDS:-900}"
+  CLEANUP_INTERVAL_SECONDS: "${CLEANUP_INTERVAL_SECONDS:-3600}"
+  TASK_RETENTION_DAYS: "${TASK_RETENTION_DAYS:-30}"
+  LOG_RETENTION_DAYS: "${LOG_RETENTION_DAYS:-14}"
+  AUDIT_RETENTION_DAYS: "${AUDIT_RETENTION_DAYS:-365}"
+  ARTIFACT_RETENTION_DAYS: "${ARTIFACT_RETENTION_DAYS:-30}"
 
 services:
   postgres:
@@ -74,6 +120,68 @@ services:
     security_opt:
       - no-new-privileges=true
 
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    profiles: ["artifacts"]
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio-local}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minio-local-only}
+    ports:
+      - "127.0.0.1:${MINIO_API_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges=true
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    profiles: ["artifacts"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio-local}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minio-local-only}
+      ARTIFACT_S3_BUCKET: ${ARTIFACT_S3_BUCKET:-mini-ai-cloud}
+      MC_CONFIG_DIR: /tmp/.mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"
+        mc mb --ignore-existing "local/$${ARTIFACT_S3_BUCKET}"
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges=true
+
+  artifact-init:
+    image: alpine:3.21
+    command: ["sh", "-ec", "mkdir -p /artifacts && chown 10001:10001 /artifacts"]
+    user: "0:0"
+    network_mode: none
+    volumes:
+      - artifact-data:/artifacts
+    restart: "no"
+    read_only: true
+    security_opt:
+      - no-new-privileges=true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+
   migrate:
     <<: *app-service
     command: ["alembic", "upgrade", "head"]
@@ -98,13 +206,20 @@ services:
       <<: *app-environment
       API_HOST: 0.0.0.0
       API_PORT: "8000"
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio-local}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minio-local-only}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
     ports:
       - "${API_BIND_ADDRESS:-127.0.0.1}:${API_PORT:-8000}:8000"
+    volumes:
+      - artifact-data:/var/lib/mini-ai-cloud/artifacts
     depends_on:
+      artifact-init:
+        condition: service_completed_successfully
       migrate:
         condition: service_completed_successfully
       redis:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
       test:
         - CMD
@@ -112,7 +227,7 @@ services:
         - -c
         - >-
           import urllib.request;
-          urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()
+          urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=4).read()
       interval: 10s
       timeout: 5s
       retries: 6
@@ -136,6 +251,11 @@ services:
       WORKER_ID: ${WORKER_ID:-}
       WORKER_CONCURRENCY: "${WORKER_CONCURRENCY:-4}"
       WORKER_LABELS: ${WORKER_LABELS:-runtime=docker,region=local}
+      WORKER_RUNTIME_TYPES: ${WORKER_RUNTIME_TYPES:-docker}
+      WORKER_NODE_NAME: ${WORKER_NODE_NAME:-}
+      FAKE_GPU_COUNT: "${FAKE_GPU_COUNT:-0}"
+      FAKE_GPU_MODEL: ${FAKE_GPU_MODEL:-FAKE-A100}
+      FAKE_GPU_MEMORY_MB: "${FAKE_GPU_MEMORY_MB:-40960}"
       HEARTBEAT_INTERVAL: "${HEARTBEAT_INTERVAL:-5}"
       WORKER_OFFLINE_TIMEOUT: "${WORKER_OFFLINE_TIMEOUT:-15}"
       WORKER_SHUTDOWN_TIMEOUT: "${WORKER_SHUTDOWN_TIMEOUT:-30}"
@@ -147,13 +267,25 @@ services:
       MAX_LOG_CHUNK_BYTES: "${MAX_LOG_CHUNK_BYTES:-65536}"
       LOG_DRAIN_TIMEOUT: "${LOG_DRAIN_TIMEOUT:-5}"
       ORPHAN_RECONCILE_INTERVAL: "${ORPHAN_RECONCILE_INTERVAL:-1}"
+      KUBERNETES_NAMESPACE: ${KUBERNETES_NAMESPACE:-mini-ai-cloud}
+      KUBERNETES_KUBECONFIG: ${KUBERNETES_KUBECONFIG:-}
+      KUBERNETES_IN_CLUSTER: "${KUBERNETES_IN_CLUSTER:-false}"
+      KUBERNETES_CLEANUP_GRACE_SECONDS: "${KUBERNETES_CLEANUP_GRACE_SECONDS:-30}"
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio-local}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minio-local-only}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      DOCKER_ARTIFACT_WORKSPACE_VOLUME: ${DOCKER_ARTIFACT_WORKSPACE_VOLUME:-${COMPOSE_PROJECT_NAME:-mini-docker-cloud}-task-workspaces}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - artifact-data:/var/lib/mini-ai-cloud/artifacts
+      - artifact-workspace-data:${ARTIFACT_WORKSPACE_ROOT:-/var/lib/mini-ai-cloud/workspaces}
     depends_on:
+      artifact-init:
+        condition: service_completed_successfully
       migrate:
         condition: service_completed_successfully
       redis:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
       test: ["CMD", "python", "-c", "import docker; assert docker.from_env().ping()"]
       interval: 15s
@@ -170,6 +302,58 @@ services:
     cap_drop:
       - ALL
 
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    profiles: ["observability"]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-7d}
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges=true
+    cap_drop:
+      - ALL
+
+  grafana:
+    image: grafana/grafana:11.6.1
+    profiles: ["observability"]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges=true
+    cap_drop:
+      - ALL
+
 volumes:
   postgres-data:
   redis-data:
+  artifact-data:
+  artifact-workspace-data:
+    name: ${DOCKER_ARTIFACT_WORKSPACE_VOLUME:-${COMPOSE_PROJECT_NAME:-mini-docker-cloud}-task-workspaces}
+  minio-data:
+  prometheus-data:
+  grafana-data:

@@ -3,7 +3,10 @@ import uuid
 from core.database import Database
 from core.logging import get_logger
 from core.metrics import (
+    PROJECT_CPU_SECONDS,
+    PROJECT_GPU_SECONDS,
     TASK_DURATION,
+    TASK_PREEMPTIONS,
     TASK_QUEUE_WAIT,
     TASKS_CANCELLED,
     TASKS_FAILED,
@@ -61,6 +64,9 @@ class OutboxDispatcher:
 
     @staticmethod
     def _record_terminal_metric(event: OutboxEvent) -> None:
+        if event.event_type == "task.preemption_requested":
+            TASK_PREEMPTIONS.inc()
+            return
         if event.event_type == "task.assigned":
             queue_wait = event.payload.get("queue_wait_seconds")
             if isinstance(queue_wait, int | float) and queue_wait >= 0:
@@ -71,6 +77,12 @@ class OutboxDispatcher:
         duration = event.payload.get("duration_seconds")
         if isinstance(duration, int | float) and duration >= 0:
             TASK_DURATION.observe(duration)
+        cpu_seconds = event.payload.get("cpu_seconds")
+        if isinstance(cpu_seconds, int | float) and cpu_seconds >= 0:
+            PROJECT_CPU_SECONDS.inc(cpu_seconds)
+        gpu_seconds = event.payload.get("gpu_seconds")
+        if isinstance(gpu_seconds, int | float) and gpu_seconds >= 0:
+            PROJECT_GPU_SECONDS.inc(gpu_seconds)
         status = event.payload.get("status")
         if status == "succeeded":
             TASKS_SUCCEEDED.inc()

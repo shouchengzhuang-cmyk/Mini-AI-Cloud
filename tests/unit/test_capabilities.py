@@ -12,7 +12,10 @@ def test_detect_gpus_parses_multiple_devices_and_sums_memory(
     completed = subprocess.CompletedProcess(
         args=["nvidia-smi"],
         returncode=0,
-        stdout="NVIDIA RTX Test, 8192\nNVIDIA RTX Test, 16384\n",
+        stdout=(
+            "GPU-first, 0, NVIDIA RTX Test, 8192, 4096, 8.9\n"
+            "GPU-second, 1, NVIDIA RTX Test, 16384, 12000, 8.9\n"
+        ),
     )
     run = Mock(return_value=completed)
     monkeypatch.setattr(capabilities.subprocess, "run", run)
@@ -21,7 +24,7 @@ def test_detect_gpus_parses_multiple_devices_and_sums_memory(
     run.assert_called_once_with(
         [
             "nvidia-smi",
-            "--query-gpu=name,memory.total",
+            "--query-gpu=uuid,index,name,memory.total,memory.free,compute_cap",
             "--format=csv,noheader,nounits",
         ],
         check=True,

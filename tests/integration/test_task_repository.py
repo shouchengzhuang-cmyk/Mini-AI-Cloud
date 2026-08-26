@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import func, select, text
 
 from core.database import Database
-from core.enums import TaskStatus
+from core.enums import RuntimeType, TaskStatus
 from models.outbox import OutboxEvent
 from models.worker import Worker
 from repositories.tasks import ClaimRejected, TaskRepository
@@ -218,6 +218,30 @@ async def test_stale_execution_result_cannot_overwrite_new_owner(database: Datab
     assert task.worker_id == "worker-b"
     assert task.execution_id == current_execution_id
     assert worker_b is not None and worker_b.running_tasks == 1
+
+
+async def test_pull_claim_rechecks_worker_runtime_compatibility(database: Database) -> None:
+    task_id = await _create_task(database)
+    await _register_worker(database, "docker-only-worker")
+    async with database.session() as session, session.begin():
+        task = await TaskRepository.get(session, task_id, for_update=True)
+        assert task is not None
+        task.runtime_type = RuntimeType.KUBERNETES
+
+    async with database.session() as session, session.begin():
+        with pytest.raises(ClaimRejected, match="requirements"):
+            await TaskRepository.claim(
+                session,
+                task_id=task_id,
+                worker_id="docker-only-worker",
+                lease_seconds=30,
+            )
+
+    async with database.session() as session:
+        task = await TaskRepository.get(session, task_id)
+        worker = await WorkerRepository.get(session, "docker-only-worker")
+    assert task is not None and task.status == TaskStatus.QUEUED
+    assert worker is not None and worker.running_tasks == 0
 
 
 async def test_scheduler_fallback_pages_past_incompatible_queue_prefix(

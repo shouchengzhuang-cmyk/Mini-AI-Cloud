@@ -53,7 +53,7 @@ async def _register_worker(
     gpu_count: int = 0,
 ) -> None:
     async with database.session() as session, session.begin():
-        await WorkerRepository.register(
+        worker = await WorkerRepository.register(
             session,
             worker_id=worker_id,
             hostname=f"{worker_id}.test",
@@ -66,6 +66,26 @@ async def _register_worker(
             gpu_model="test-gpu" if gpu_count else None,
             gpu_memory_mb=24_576 if gpu_count else 0,
         )
+        if gpu_count:
+            await WorkerRepository.replace_gpu_inventory(
+                session,
+                worker_id=worker_id,
+                worker_session_id=worker.worker_session_id,
+                devices=[
+                    {
+                        "uuid": f"GPU-{worker_id}-{index}",
+                        "index": index,
+                        "vendor": "nvidia",
+                        "model": "test-gpu",
+                        "memory_total_mb": 24_576,
+                        "memory_free_mb": 24_576,
+                        "compute_capability": "8.0",
+                        "health": "healthy",
+                        "fake": False,
+                    }
+                    for index in range(gpu_count)
+                ],
+            )
 
 
 async def _claim_and_start(
@@ -130,7 +150,7 @@ async def test_cancel_requested_overrides_late_success_result(database: Database
     async with database.session() as session, session.begin():
         cancellation = await TaskRepository.cancel(session, task_id)
     assert cancellation is not None
-    assert cancellation.status == TaskStatus.RUNNING
+    assert cancellation.status == TaskStatus.STOPPING
     assert cancellation.cancel_requested is True
 
     async with database.session() as session, session.begin():

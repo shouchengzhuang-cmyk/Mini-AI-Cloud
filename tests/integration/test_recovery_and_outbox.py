@@ -129,6 +129,39 @@ async def test_reaper_marks_worker_offline_and_requeues_expired_lease(
     assert worker.running_tasks == 0
 
 
+async def test_reaper_bounds_mass_worker_offline_transition(database: Database) -> None:
+    worker_ids = tuple(f"mass-offline-{index}" for index in range(3))
+    for worker_id in worker_ids:
+        await _register_worker(database, worker_id)
+    async with database.session() as session, session.begin():
+        workers = list(await session.scalars(select(Worker).where(Worker.id.in_(worker_ids))))
+        for worker in workers:
+            worker.last_heartbeat_at = utcnow() - timedelta(seconds=60)
+
+    settings = Settings(
+        database_url=str(database.engine.url),
+        control_plane_enabled=False,
+        worker_offline_timeout=15,
+        batch_size=2,
+    )
+    reaper = Reaper(database, settings)
+
+    assert await reaper.run_once() == (2, 0, 0)
+    async with database.session() as session:
+        first_statuses = list(
+            await session.scalars(select(Worker.status).where(Worker.id.in_(worker_ids)))
+        )
+    assert first_statuses.count(WorkerStatus.OFFLINE) == 2
+    assert first_statuses.count(WorkerStatus.ONLINE) == 1
+
+    assert await reaper.run_once() == (1, 0, 0)
+    async with database.session() as session:
+        final_statuses = list(
+            await session.scalars(select(Worker.status).where(Worker.id.in_(worker_ids)))
+        )
+    assert final_statuses == [WorkerStatus.OFFLINE] * 3
+
+
 async def test_outbox_dispatch_is_at_least_once_after_publish_before_mark(
     database: Database, redis_queue: RedisQueue
 ) -> None:

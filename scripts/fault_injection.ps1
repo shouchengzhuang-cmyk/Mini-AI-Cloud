@@ -60,9 +60,46 @@ function Invoke-Docker {
     return $output
 }
 
+function Start-WslKeeper {
+    if (-not $script:UseWsl) {
+        return $null
+    }
+
+    $process = Start-Process `
+        -FilePath "wsl.exe" `
+        -ArgumentList @("--cd", $script:WslRepoRoot, "--", "sleep", "infinity") `
+        -WindowStyle Hidden `
+        -PassThru
+    Start-Sleep -Milliseconds 500
+    if ($process.HasExited) {
+        throw "WSL keepalive exited before fault injection could start"
+    }
+    return $process
+}
+
+function Stop-WslKeeper {
+    param([System.Diagnostics.Process]$Process)
+
+    if ($null -ne $Process -and -not $Process.HasExited) {
+        Stop-Process -Id $Process.Id -Force
+        $Process.WaitForExit(5000) | Out-Null
+    }
+}
+
 function Invoke-Compose {
     param([Parameter(Mandatory)][string[]]$ArgumentList)
     return Invoke-Docker -ArgumentList (@("compose") + $ArgumentList)
+}
+
+function Ensure-DockerImage {
+    param([Parameter(Mandatory)][string]$Image)
+
+    try {
+        Invoke-Docker -ArgumentList @("image", "inspect", $Image) | Out-Null
+    }
+    catch {
+        Invoke-Docker -ArgumentList @("pull", $Image) | Out-Host
+    }
 }
 
 function Invoke-Api {
@@ -322,7 +359,7 @@ function Test-CommandExitOne {
 
 function Test-TaskTimeout {
     Write-Host "[Case 5] Running task timeout"
-    Invoke-Docker -ArgumentList @("pull", "python:3.12-slim") | Out-Host
+    Ensure-DockerImage -Image "python:3.12-slim"
     $task = New-SleepTask -SleepSeconds 60 -TimeoutSeconds 2
     $result = Wait-TerminalTask -TaskId ([string]$task.id)
     Assert-Condition ($result.status -eq "timed_out") "timeout task ended as $($result.status)"
@@ -332,7 +369,7 @@ function Test-TaskTimeout {
 
 function Test-WorkerDeath {
     Write-Host "[Case 6] Worker dies during execution"
-    Invoke-Docker -ArgumentList @("pull", "python:3.12-slim") | Out-Host
+    Ensure-DockerImage -Image "python:3.12-slim"
     $task = New-SleepTask -SleepSeconds 20 -TimeoutSeconds 120
     Wait-Task -TaskId ([string]$task.id) -Statuses @("running") | Out-Null
     Invoke-Compose -ArgumentList @("kill", "-s", "SIGKILL", "worker") | Out-Host
@@ -410,7 +447,7 @@ function Test-DuplicateEnqueue {
 
 function Test-StaleWorkerResult {
     Write-Host "[Case 9] Stale Worker result"
-    Invoke-Docker -ArgumentList @("pull", "python:3.12-slim") | Out-Host
+    Ensure-DockerImage -Image "python:3.12-slim"
     $task = New-SleepTask -SleepSeconds 20 -TimeoutSeconds 120
     $old = Wait-Task -TaskId ([string]$task.id) -Statuses @("running")
     $oldExecution = [string]$old.execution_id
@@ -497,7 +534,7 @@ asyncio.run(check())
 
 function Test-CancelRunning {
     Write-Host "[Case 10] User cancels a running task"
-    Invoke-Docker -ArgumentList @("pull", "python:3.12-slim") | Out-Host
+    Ensure-DockerImage -Image "python:3.12-slim"
     $task = New-SleepTask -SleepSeconds 60 -TimeoutSeconds 120
     Wait-Task -TaskId ([string]$task.id) -Statuses @("running") | Out-Null
     Invoke-Api -Method "POST" -Path "/api/v1/tasks/$($task.id)/cancel" | Out-Null
@@ -555,7 +592,9 @@ if (-not $PSCmdlet.ShouldProcess($target, "run destructive fault injection case 
 }
 
 Push-Location $script:RepoRoot
+$wslKeeper = $null
 try {
+    $wslKeeper = Start-WslKeeper
     Invoke-Compose -ArgumentList @("config", "--quiet") | Out-Null
     Wait-Health | Out-Null
     $selected = if ($Case -eq "All") { $caseNames } else { @($Case) }
@@ -564,5 +603,6 @@ try {
     }
 }
 finally {
+    Stop-WslKeeper -Process $wslKeeper
     Pop-Location
 }

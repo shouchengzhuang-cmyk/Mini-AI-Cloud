@@ -4,9 +4,15 @@ from enum import StrEnum
 class TaskStatus(StrEnum):
     PENDING = "pending"
     QUEUED = "queued"
+    SCHEDULING = "scheduling"
     ASSIGNED = "assigned"
+    PREPARING = "preparing"
     PULLING = "pulling"
+    STARTING = "starting"
     RUNNING = "running"
+    PREEMPTING = "preempting"
+    PREEMPTED = "preempted"
+    STOPPING = "stopping"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -32,7 +38,62 @@ FINAL_TASK_STATUSES = frozenset(
         TaskStatus.FAILED,
         TaskStatus.CANCELLED,
         TaskStatus.TIMED_OUT,
+        TaskStatus.PREEMPTED,
     }
 )
 
-ACTIVE_TASK_STATUSES = frozenset({TaskStatus.ASSIGNED, TaskStatus.PULLING, TaskStatus.RUNNING})
+ACTIVE_TASK_STATUSES = frozenset(
+    {
+        TaskStatus.SCHEDULING,
+        TaskStatus.ASSIGNED,
+        TaskStatus.PREPARING,
+        TaskStatus.PULLING,
+        TaskStatus.STARTING,
+        TaskStatus.RUNNING,
+        TaskStatus.PREEMPTING,
+        TaskStatus.STOPPING,
+    }
+)
+
+
+class RuntimeType(StrEnum):
+    DOCKER = "docker"
+    KUBERNETES = "kubernetes"
+    FAKE = "fake"
+
+
+class WorkloadType(StrEnum):
+    BATCH_JOB = "batch_job"
+    MODEL_SERVICE = "model_service"
+
+
+class RetryBackoff(StrEnum):
+    EXPONENTIAL = "exponential"
+    LINEAR = "linear"
+    FIXED = "fixed"
+
+
+class ErrorCategory(StrEnum):
+    USER_ERROR = "USER_ERROR"
+    INFRA_ERROR = "INFRA_ERROR"
+    RESOURCE_ERROR = "RESOURCE_ERROR"
+    TIMEOUT = "TIMEOUT"
+    PREEMPTED = "PREEMPTED"
+    CANCELLED = "CANCELLED"
+    INTERNAL_ERROR = "INTERNAL_ERROR"
+
+
+class ErrorCode(StrEnum):
+    IMAGE_PULL_FAILED = "IMAGE_PULL_FAILED"
+    CONTAINER_START_FAILED = "CONTAINER_START_FAILED"
+    OOM_KILLED = "OOM_KILLED"
+    GPU_UNAVAILABLE = "GPU_UNAVAILABLE"
+    WORKER_LOST = "WORKER_LOST"
+    LEASE_EXPIRED = "LEASE_EXPIRED"
+
+
+class ProjectRole(StrEnum):
+    OWNER = "owner"
+    ADMIN = "admin"
+    MEMBER = "member"
+    VIEWER = "viewer"

@@ -46,10 +46,16 @@ def _wait_for_online_worker(
         items = payload.get("items")
         if isinstance(items, list):
             for item in items:
-                if isinstance(item, dict) and item.get("status") == "online":
+                runtime_types = item.get("runtime_types") if isinstance(item, dict) else None
+                if (
+                    isinstance(item, dict)
+                    and item.get("status") == "online"
+                    and isinstance(runtime_types, list)
+                    and "docker" in runtime_types
+                ):
                     return item
         time.sleep(poll_interval)
-    raise RuntimeError("no online worker registered before the E2E deadline")
+    raise RuntimeError("no online Docker worker registered before the E2E deadline")
 
 
 def _wait_for_terminal_task(
@@ -149,7 +155,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if health.get("status") != "ok":
                 raise RuntimeError(f"platform health is not ok: {health}")
             deadline = time.monotonic() + args.timeout
-            worker = _wait_for_online_worker(
+            _wait_for_online_worker(
                 client,
                 deadline=deadline,
                 poll_interval=args.poll_interval,
@@ -213,12 +219,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 raise AssertionError(f"task {task_id} exit_code is {task.get('exit_code')!r}")
             if not task.get("execution_id"):
                 raise AssertionError(f"task {task_id} has no execution_id")
+            if task.get("runtime_type") != "docker":
+                raise AssertionError(
+                    f"task {task_id} used unexpected runtime {task.get('runtime_type')!r}"
+                )
+            assigned_worker_id = task.get("worker_id")
+            if not isinstance(assigned_worker_id, str) or not assigned_worker_id:
+                raise AssertionError(f"task {task_id} has no assigned Worker")
 
             logs = _request_json(client, "GET", f"/api/v1/tasks/{task_id}/logs?limit=5000")
             log_count = _assert_logs(logs, start_marker, error_marker, end_marker)
             return {
                 "health": health["status"],
-                "worker_id": worker["id"],
+                "worker_id": assigned_worker_id,
                 "task_id": task_id,
                 "status": task["status"],
                 "exit_code": task["exit_code"],

@@ -9,21 +9,74 @@ class InvalidTaskTransition(ValueError):
 
 ALLOWED_TRANSITIONS: Mapping[TaskStatus, frozenset[TaskStatus]] = {
     TaskStatus.PENDING: frozenset({TaskStatus.QUEUED, TaskStatus.CANCELLED}),
-    TaskStatus.QUEUED: frozenset({TaskStatus.ASSIGNED, TaskStatus.CANCELLED}),
+    TaskStatus.QUEUED: frozenset(
+        {TaskStatus.SCHEDULING, TaskStatus.ASSIGNED, TaskStatus.CANCELLED}
+    ),
+    TaskStatus.SCHEDULING: frozenset(
+        {TaskStatus.QUEUED, TaskStatus.ASSIGNED, TaskStatus.CANCELLED}
+    ),
     TaskStatus.ASSIGNED: frozenset(
-        {TaskStatus.PULLING, TaskStatus.CANCELLED, TaskStatus.FAILED, TaskStatus.TIMED_OUT}
+        {
+            TaskStatus.PREPARING,
+            TaskStatus.PULLING,
+            TaskStatus.STOPPING,
+            TaskStatus.PREEMPTING,
+            TaskStatus.CANCELLED,
+            TaskStatus.FAILED,
+            TaskStatus.TIMED_OUT,
+        }
+    ),
+    TaskStatus.PREPARING: frozenset(
+        {
+            TaskStatus.PULLING,
+            TaskStatus.STARTING,
+            TaskStatus.STOPPING,
+            TaskStatus.PREEMPTING,
+            TaskStatus.FAILED,
+            TaskStatus.TIMED_OUT,
+        }
     ),
     TaskStatus.PULLING: frozenset(
-        {TaskStatus.RUNNING, TaskStatus.CANCELLED, TaskStatus.FAILED, TaskStatus.TIMED_OUT}
+        {
+            TaskStatus.STARTING,
+            TaskStatus.RUNNING,
+            TaskStatus.STOPPING,
+            TaskStatus.PREEMPTING,
+            TaskStatus.CANCELLED,
+            TaskStatus.FAILED,
+            TaskStatus.TIMED_OUT,
+        }
+    ),
+    TaskStatus.STARTING: frozenset(
+        {
+            TaskStatus.RUNNING,
+            TaskStatus.STOPPING,
+            TaskStatus.PREEMPTING,
+            TaskStatus.FAILED,
+            TaskStatus.TIMED_OUT,
+        }
     ),
     TaskStatus.RUNNING: frozenset(
         {
+            TaskStatus.STOPPING,
+            TaskStatus.PREEMPTING,
             TaskStatus.SUCCEEDED,
             TaskStatus.FAILED,
             TaskStatus.CANCELLED,
             TaskStatus.TIMED_OUT,
         }
     ),
+    TaskStatus.STOPPING: frozenset(
+        {
+            TaskStatus.CANCELLED,
+            TaskStatus.FAILED,
+            TaskStatus.TIMED_OUT,
+        }
+    ),
+    TaskStatus.PREEMPTING: frozenset(
+        {TaskStatus.PREEMPTED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+    ),
+    TaskStatus.PREEMPTED: frozenset({TaskStatus.RETRYING}),
     TaskStatus.FAILED: frozenset({TaskStatus.RETRYING}),
     TaskStatus.TIMED_OUT: frozenset({TaskStatus.RETRYING}),
     TaskStatus.RETRYING: frozenset({TaskStatus.QUEUED, TaskStatus.CANCELLED}),
