@@ -15,7 +15,7 @@ curl -fsS http://localhost:8000/readyz
 全新数据库按 README bootstrap，保存一次性 API Key 到安全环境变量，并为演示镜像配置最小 allow rule：
 
 ```bash
-export MINI_DOCKER_CLOUD_API_KEY='<bootstrap key>'
+export MINI_CLOUD_API_KEY='<bootstrap key>'
 ```
 
 不要把 API Key、Secret、数据库密码或 presigned URL 粘进演示输出。每次记录：Git commit、UTC 时间、命令、exit code、关键 UUID 和明确断言。
@@ -46,9 +46,9 @@ uv run python scripts/e2e_demo.py \
 目标：认证 Project task、quota、logs、timeline、usage/cost、artifact checksum 全链路。可选第二 Project key 验证隔离。
 
 ```bash
-export MINI_DOCKER_CLOUD_API_KEY='<owner/admin key>'
+export MINI_CLOUD_API_KEY='<owner/admin key>'
 # 可选，必须属于另一个 Project：
-export MINI_DOCKER_CLOUD_OTHER_PROJECT_API_KEY='<other project key>'
+export MINI_CLOUD_OTHER_PROJECT_API_KEY='<other project key>'
 
 uv run python scripts/phase2_demo.py \
   --base-url http://localhost:8000 \
@@ -191,7 +191,7 @@ uv run pytest \
 
 ### 安全前置条件
 
-- 使用新 run id：`mini-docker-cloud-local-dr-<run-id>`；
+- 使用新 run id：`mini-ai-cloud-local-dr-<run-id>`；
 - Project name、Compose labels、volume name 三者都要匹配；
 - backup 目录在该 run 外且 checksum 验证通过；
 - 禁止对默认日常栈、共享 DB、未知 volume、workspace root 使用删除命令；
@@ -200,7 +200,7 @@ uv run pytest \
 流程：
 
 ```bash
-DR_PROJECT='mini-docker-cloud-local-dr-<run-id>'
+DR_PROJECT='mini-ai-cloud-local-dr-<run-id>'
 BACKUP_ROOT="$PWD/build/dr-backups"
 
 docker compose --project-name "$DR_PROJECT" up --build -d

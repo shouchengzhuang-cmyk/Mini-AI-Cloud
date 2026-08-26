@@ -1,10 +1,10 @@
-name: mini-docker-cloud
+name: mini-ai-cloud
 
 x-app-service: &app-service
   build:
     context: .
     dockerfile: docker/Dockerfile
-  image: mini-docker-cloud:${APP_IMAGE_TAG:-local}
+  image: mini-ai-cloud:${APP_IMAGE_TAG:-local}
   init: true
 
 x-app-environment: &app-environment
@@ -20,7 +20,7 @@ x-app-environment: &app-environment
   API_KEY_PEPPER: ${API_KEY_PEPPER:-}
   SECRET_MASTER_KEY: ${SECRET_MASTER_KEY:-}
   WORKER_AUTH_TOKEN: ${WORKER_AUTH_TOKEN:-}
-  CLUSTER_ID: ${CLUSTER_ID:-mini-docker-cloud-local}
+  CLUSTER_ID: ${CLUSTER_ID:-mini-ai-cloud-local}
   DEFAULT_TASK_TIMEOUT: "${DEFAULT_TASK_TIMEOUT:-60}"
   MAX_TASK_TIMEOUT: "${MAX_TASK_TIMEOUT:-86400}"
   MAX_TASK_RETRIES: "${MAX_TASK_RETRIES:-10}"
@@ -294,7 +294,7 @@ services:
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio-local}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minio-local-only}
       AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
-      DOCKER_ARTIFACT_WORKSPACE_VOLUME: ${DOCKER_ARTIFACT_WORKSPACE_VOLUME:-${COMPOSE_PROJECT_NAME:-mini-docker-cloud}-task-workspaces}
+      DOCKER_ARTIFACT_WORKSPACE_VOLUME: ${DOCKER_ARTIFACT_WORKSPACE_VOLUME:-${COMPOSE_PROJECT_NAME:-mini-ai-cloud}-task-workspaces}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - artifact-data:/var/lib/mini-ai-cloud/artifacts
@@ -373,7 +373,7 @@ volumes:
   redis-data:
   artifact-data:
   artifact-workspace-data:
-    name: ${DOCKER_ARTIFACT_WORKSPACE_VOLUME:-${COMPOSE_PROJECT_NAME:-mini-docker-cloud}-task-workspaces}
+    name: ${DOCKER_ARTIFACT_WORKSPACE_VOLUME:-${COMPOSE_PROJECT_NAME:-mini-ai-cloud}-task-workspaces}
   minio-data:
   prometheus-data:
   grafana-data:

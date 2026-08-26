@@ -1187,8 +1187,8 @@ wheels = [
 ]
 
 [[package]]
-name = "mini-docker-cloud"
-version = "0.2.0"
+name = "mini-ai-cloud"
+version = "0.4.0.dev0"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },

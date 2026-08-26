@@ -194,7 +194,7 @@ async def test_live_postgresql_global_candidate_lanes_compile_and_execute(
 
 async def test_live_redis_consumer_group_reclaim_ack_and_delete(live_redis: Redis) -> None:
     run_id = uuid.uuid4().hex
-    stream = f"mini-docker-cloud:live-test:{run_id}"
+    stream = f"mini-ai-cloud:live-test:{run_id}"
     group = f"live-group-{run_id}"
     consumer_a = f"consumer-a-{run_id}"
     consumer_b = f"consumer-b-{run_id}"

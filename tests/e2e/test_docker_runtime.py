@@ -47,7 +47,7 @@ class DockerHarness:
             leftovers = await asyncio.to_thread(
                 self.runtime.client.containers.list,
                 all=True,
-                filters={"label": f"mini-docker-cloud.task_id={task_id}"},
+                filters={"label": f"mini-ai-cloud.task_id={task_id}"},
             )
             for container in leftovers:
                 await self.runtime.remove_container(container)
@@ -60,7 +60,7 @@ async def docker_harness() -> AsyncIterator[DockerHarness]:
     runtime = DockerRuntime(
         # Keep synthetic test containers outside any concurrently running local
         # stack's orphan-recovery domain.
-        cluster_id=f"mini-docker-cloud-e2e-{uuid.uuid4().hex}",
+        cluster_id=f"mini-ai-cloud-e2e-{uuid.uuid4().hex}",
         pids_limit=PIDS_LIMIT,
         tmpfs_size_mb=16,
         stop_timeout=1,
@@ -199,8 +199,8 @@ async def test_container_security_and_resource_configuration(
     assert host_config["Binds"] is None
     security_options = set(host_config["SecurityOpt"])
     assert security_options & {"no-new-privileges:true", "no-new-privileges=true"}
-    assert config["Labels"]["mini-docker-cloud.managed"] == "true"
-    assert config["Labels"]["mini-docker-cloud.task_id"] == str(task.id)
+    assert config["Labels"]["mini-ai-cloud.managed"] == "true"
+    assert config["Labels"]["mini-ai-cloud.task_id"] == str(task.id)
 
 
 async def test_named_volume_subpaths_isolate_task_artifact_files(
@@ -211,7 +211,7 @@ async def test_named_volume_subpaths_isolate_task_artifact_files(
     volume = await asyncio.to_thread(
         docker_harness.runtime.client.volumes.create,
         name=volume_name,
-        labels={"mini-docker-cloud.e2e": "true"},
+        labels={"mini-ai-cloud.e2e": "true"},
     )
     handle = None
     input_probe = tmp_path / "input.bin"

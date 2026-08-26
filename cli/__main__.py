@@ -14,8 +14,17 @@ import typer
 
 _DEFAULT_BASE_URL = "http://localhost:8000"
 _API_KEY = re.compile(r"^mkc_[a-f0-9]{16}_[A-Za-z0-9_-]{43}$")
+_CONFIG_ENV = "MINI_CLOUD_CONFIG"
+_LEGACY_CONFIG_ENV = "MINI_DOCKER_CLOUD_CONFIG"
+_URL_ENV = "MINI_CLOUD_URL"
+_LEGACY_URL_ENV = "MINI_DOCKER_CLOUD_URL"
+_API_KEY_ENV = "MINI_CLOUD_API_KEY"
+_LEGACY_API_KEY_ENV = "MINI_DOCKER_CLOUD_API_KEY"
 
-app = typer.Typer(no_args_is_help=True, help="Submit and inspect distributed Docker tasks.")
+app = typer.Typer(
+    no_args_is_help=True,
+    help="Submit and inspect AI compute tasks and model services.",
+)
 auth_app = typer.Typer(no_args_is_help=True, help="Manage local CLI authentication.")
 project_app = typer.Typer(no_args_is_help=True, help="Create and list projects.")
 task_app = typer.Typer(no_args_is_help=True, help="Submit and inspect tasks.")
@@ -34,19 +43,33 @@ class CLIConfigError(RuntimeError):
     pass
 
 
+def _environment_value(name: str, legacy_name: str) -> str | None:
+    return os.getenv(name) or os.getenv(legacy_name)
+
+
+def _config_root() -> Path:
+    if os.name == "nt":
+        return Path(os.getenv("APPDATA") or Path.home() / "AppData" / "Roaming")
+    return Path(os.getenv("XDG_CONFIG_HOME") or Path.home() / ".config")
+
+
 def _config_path() -> Path:
-    override = os.getenv("MINI_DOCKER_CLOUD_CONFIG")
+    override = _environment_value(_CONFIG_ENV, _LEGACY_CONFIG_ENV)
     if override:
         return Path(override).expanduser()
-    if os.name == "nt":
-        root = Path(os.getenv("APPDATA") or Path.home() / "AppData" / "Roaming")
-    else:
-        root = Path(os.getenv("XDG_CONFIG_HOME") or Path.home() / ".config")
-    return root / "mini-docker-cloud" / "config.json"
+    return _config_root() / "mini-ai-cloud" / "config.json"
+
+
+def _legacy_config_path() -> Path:
+    return _config_root() / "mini-docker-cloud" / "config.json"
 
 
 def _load_config() -> dict[str, str]:
     path = _config_path()
+    if not _environment_value(_CONFIG_ENV, _LEGACY_CONFIG_ENV) and not path.exists():
+        legacy_path = _legacy_config_path()
+        if legacy_path.exists():
+            path = legacy_path
     if not path.exists():
         return {}
     try:
@@ -67,13 +90,14 @@ def _load_config() -> dict[str, str]:
 
 def _base_url() -> str:
     configured = _load_config()
-    return os.getenv("MINI_DOCKER_CLOUD_URL", configured.get("base_url", _DEFAULT_BASE_URL)).rstrip(
-        "/"
-    )
+    return (
+        _environment_value(_URL_ENV, _LEGACY_URL_ENV)
+        or configured.get("base_url", _DEFAULT_BASE_URL)
+    ).rstrip("/")
 
 
 def _configured_api_key() -> str | None:
-    value = os.getenv("MINI_DOCKER_CLOUD_API_KEY") or _load_config().get("api_key")
+    value = _environment_value(_API_KEY_ENV, _LEGACY_API_KEY_ENV) or _load_config().get("api_key")
     return value or None
 
 
@@ -536,5 +560,17 @@ def admin_doctor(
     _print_json(diagnostic)
 
 
-if __name__ == "__main__":
+def main() -> None:
     app()
+
+
+def legacy_main() -> None:
+    typer.echo(
+        "warning: 'mini-docker-cloud' is deprecated; use 'mini-cloud' instead.",
+        err=True,
+    )
+    app()
+
+
+if __name__ == "__main__":
+    main()

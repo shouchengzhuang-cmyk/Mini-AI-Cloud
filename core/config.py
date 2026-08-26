@@ -63,7 +63,7 @@ class Settings(BaseSettings):
     worker_auth_token: str = _LOCAL_WORKER_AUTH_TOKEN
 
     cluster_id: str = Field(
-        default="mini-docker-cloud-local",
+        default="mini-ai-cloud-local",
         min_length=1,
         max_length=63,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$",

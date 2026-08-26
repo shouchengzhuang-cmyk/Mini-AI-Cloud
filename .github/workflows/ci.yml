@@ -25,6 +25,14 @@ jobs:
           python-version-file: .python-version
       - name: Install locked dependencies
         run: uv sync --frozen --all-groups
+      - name: Validate package and CLI identity
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$(uv run python -c 'import importlib.metadata; print(importlib.metadata.metadata("mini-ai-cloud")["Name"])')" = "mini-ai-cloud"
+          uv run mini-cloud --help >/dev/null
+          legacy_output="$(uv run mini-docker-cloud --help 2>&1)"
+          grep -Fq "deprecated" <<<"${legacy_output}"
       - name: Validate Compose configuration
         run: docker compose config --quiet
       - name: Ruff format

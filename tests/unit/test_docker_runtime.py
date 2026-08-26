@@ -221,10 +221,10 @@ async def test_create_container_enforces_security_and_resource_limits() -> None:
     assert options["nano_cpus"] == 1_500_000_000
     assert options["tmpfs"] == {"/tmp": "rw,noexec,nosuid,nodev,size=32m,mode=1777"}
     assert options["labels"] == {
-        "mini-docker-cloud.task_id": str(task.id),
-        "mini-docker-cloud.execution_id": str(execution_id),
-        "mini-docker-cloud.managed": "true",
-        "mini-docker-cloud.cluster_id": "mini-docker-cloud-local",
+        "mini-ai-cloud.task_id": str(task.id),
+        "mini-ai-cloud.execution_id": str(execution_id),
+        "mini-ai-cloud.managed": "true",
+        "mini-ai-cloud.cluster_id": "mini-ai-cloud-local",
     }
     assert {"volumes", "devices", "pid_mode", "ipc_mode", "userns_mode"}.isdisjoint(options)
     assert "device_requests" not in options
@@ -326,9 +326,9 @@ async def test_managed_container_scan_is_scoped_to_cluster() -> None:
         all=True,
         filters={
             "label": [
-                "mini-docker-cloud.managed=true",
-                "mini-docker-cloud.cluster_id=cluster-a",
-                "mini-docker-cloud.worker_id",
+                "mini-ai-cloud.managed=true",
+                "mini-ai-cloud.cluster_id=cluster-a",
+                "mini-ai-cloud.worker_id",
             ]
         },
     )
