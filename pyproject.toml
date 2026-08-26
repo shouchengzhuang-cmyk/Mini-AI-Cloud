@@ -7,6 +7,8 @@ name = "mini-docker-cloud"
 version = "0.2.0"
 description = "A production-minded distributed Docker task execution platform prototype"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12,<3.15"
 dependencies = [
   "alembic>=1.14,<2",
@@ -46,6 +48,11 @@ dev = [
 [project.scripts]
 mini-docker-cloud = "cli.__main__:app"
 mini-cloud = "cli.__main__:app"
+
+[project.urls]
+Repository = "https://github.com/shouchengzhuang-cmyk/Mini-AI-Cloud"
+Issues = "https://github.com/shouchengzhuang-cmyk/Mini-AI-Cloud/issues"
+Security = "https://github.com/shouchengzhuang-cmyk/Mini-AI-Cloud/security/policy"
 
 [tool.hatch.build.targets.wheel]
 packages = ["api", "cli", "core", "models", "repositories", "scheduler", "worker"]
