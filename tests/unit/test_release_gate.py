@@ -74,3 +74,11 @@ def test_action_pin_validator_rejects_mutable_tags(tmp_path: Path) -> None:
 
     with pytest.raises(ReleaseGateError, match="full commit SHAs"):
         validate_action_pins(tmp_path)
+
+
+def test_release_security_workflow_prepares_sbom_output_directory() -> None:
+    workflow = (ROOT / ".github/workflows/release-security.yml").read_text(encoding="utf-8")
+
+    prepare = workflow.index("run: mkdir -p build/release-security")
+    generate = workflow.index("name: Generate image SPDX SBOM")
+    assert prepare < generate
