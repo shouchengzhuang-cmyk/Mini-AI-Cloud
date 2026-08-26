@@ -2,7 +2,7 @@
 
 *An evidence-driven experimental control plane for reliable AI workload scheduling and model serving.*
 
-Python distribution、CLI、Compose project 与默认镜像统一使用 `mini-ai-cloud` / `mini-cloud` 身份；当前开发版本为 `0.4.0.dev0`。
+Python distribution、CLI、Compose project 与默认镜像统一使用 `mini-ai-cloud` / `mini-cloud` 身份；当前准备版本为 `0.4.0`。本分支只完成发布准备，不代表已经创建 GitHub Release 或部署生产。
 
 Mini AI Cloud 是一个面向 AI 工作负载控制面正确性的轻量级实验平台。它重点研究在并发调度、Worker、Pod、Controller 故障和在线请求缩容时，如何依靠 PostgreSQL 这一状态真相源、lease、execution fencing 与 reconciliation，让任务和模型服务状态收敛。
 
@@ -17,9 +17,10 @@ Mini AI Cloud 是一个面向 AI 工作负载控制面正确性的轻量级实�
 
 功能存在、自动化测试通过和真实外部运行是三种不同证据。逐项状态见 [验证证据矩阵](docs/verification-matrix.md)，Phase IV-A.1 的实时验收状态见 [Kubernetes Serving 验证报告](docs/verification-report-phase4a-2026-08-24.md)。
 
-## 最短启动路径
+## 五分钟 Quickstart
 
 需要 Docker Engine、Docker Compose v2。宿主开发和脚本要求 Python 3.12 与 `uv`。Windows 若 Docker 只在 WSL 中可用，请在 WSL 终端执行。
+“五分钟”指最短操作路径；首次拉取基础镜像和构建耗时取决于网络与主机，不承诺固定 wall time。
 
 ```bash
 cp .env.example .env
@@ -28,6 +29,23 @@ docker compose up --build -d
 docker compose ps
 curl -fsS http://localhost:8000/readyz
 ```
+
+成功时 `/readyz` 返回 PostgreSQL、Redis 与控制面依赖状态。完成体验后保留数据卷地停止：
+
+```bash
+docker compose down --remove-orphans
+```
+
+无需 Kubernetes 的正确性 Hero Scenario 可直接生成本地证据：
+
+```bash
+uv sync --frozen --all-groups
+uv run mini-cloud demo fencing --output-dir build/hero/fencing
+```
+
+Controller adoption 与 active SSE drain 使用独立 Kind 集群，统一入口、证据边界和清理说明见
+[Hero Scenarios](docs/hero-scenarios.md)。平台与 KServe、Kueue、Volcano、Ray Serve 的职责差异见
+[诚实能力对照](docs/comparison.md)。
 
 `migrate` 服务会先执行 `alembic upgrade head`。`/livez` 只表示 API 进程存活；默认 fail-closed 限流模式下，`/readyz` 同时要求 PostgreSQL 与 Redis 可用。`/health` 会把 Redis 故障报告为 HTTP 200 `degraded`，而 PostgreSQL 故障返回 503；只有显式 `RATE_LIMIT_FAIL_OPEN=true` 时，readiness 才允许 Redis 降级。
 
@@ -148,6 +166,7 @@ make test-integration
 make test-serving
 make test
 make config
+make test-release
 
 make up
 make down

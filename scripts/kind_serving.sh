@@ -14,6 +14,7 @@ NAMESPACE="mini-ai-cloud-serving"
 APP_IMAGE="mini-ai-cloud:kind-serving-v4a"
 POSTGRES_IMAGE="postgres:16-alpine"
 REDIS_IMAGE="redis:7.4-alpine"
+PULL_IMAGES="${KIND_SERVING_PULL:-true}"
 BASE_URL="http://127.0.0.1:18080"
 UV_BIN="${UV:-uv}"
 SERVING_POD_SELECTOR="mini-ai-cloud/managed=true,mini-ai-cloud/resource-kind=serving-pod"
@@ -74,6 +75,10 @@ preflight() {
     || not_run "kubectl client is installed but not executable"
   case "$APP_IMAGE" in
     *:latest|latest) not_run "the Kind serving image must use a fixed non-latest tag" ;;
+  esac
+  case "$PULL_IMAGES" in
+    true|false) ;;
+    *) not_run "KIND_SERVING_PULL must be true or false" ;;
   esac
 }
 
@@ -158,12 +163,23 @@ up() {
     *) not_run "Kind serving requires a Linux Docker server platform" ;;
   esac
 
+  local -a pull_flag=()
+  if [[ "$PULL_IMAGES" == true ]]; then
+    pull_flag=(--pull)
+  else
+    docker image inspect "$POSTGRES_IMAGE" "$REDIS_IMAGE" >/dev/null \
+      || not_run "KIND_SERVING_PULL=false requires cached PostgreSQL and Redis images"
+    printf 'Using explicitly requested local image cache; remote pulls are disabled.\n'
+  fi
+
   printf 'Building fixed Kind application image %s...\n' "$APP_IMAGE"
-  docker buildx build --pull --load --platform "$platform" \
+  docker buildx build "${pull_flag[@]}" --load --platform "$platform" \
     --provenance=false --sbom=false \
     -f docker/Dockerfile -t "$APP_IMAGE" .
-  docker pull --platform "$platform" "$POSTGRES_IMAGE"
-  docker pull --platform "$platform" "$REDIS_IMAGE"
+  if [[ "$PULL_IMAGES" == true ]]; then
+    docker pull --platform "$platform" "$POSTGRES_IMAGE"
+    docker pull --platform "$platform" "$REDIS_IMAGE"
+  fi
 
   # Docker's containerd image store keeps local tags as OCI indexes. A normal
   # `kind load docker-image` asks containerd to import every descriptor in those

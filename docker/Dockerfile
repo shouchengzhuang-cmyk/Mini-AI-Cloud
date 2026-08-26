@@ -9,7 +9,8 @@ RUN python -m venv "$VIRTUAL_ENV" \
 
 WORKDIR /src
 COPY . .
-RUN --mount=type=cache,target=/root/.cache/pip python -m pip install .
+RUN --mount=type=cache,target=/root/.cache/pip python -m pip install . \
+    && python -m pip uninstall --yes pip
 
 
 FROM python:3.12-slim-bookworm AS runtime
@@ -22,7 +23,8 @@ ENV PYTHONUNBUFFERED=1 \
     VIRTUAL_ENV=/opt/venv \
     PATH="/opt/venv/bin:$PATH"
 
-RUN groupadd --system --gid 10001 app \
+RUN python -m pip uninstall --yes pip \
+    && groupadd --system --gid 10001 app \
     && useradd --system --uid 10001 --gid app --create-home \
         --home-dir /home/app --shell /usr/sbin/nologin app
 

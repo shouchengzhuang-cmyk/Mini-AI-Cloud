@@ -27,11 +27,11 @@ jobs:
       KIND_VERSION: v0.27.0
       KUBECTL_VERSION: v1.32.2
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
         with:
           enable-cache: true
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version-file: .python-version
       - name: Install locked dependencies
@@ -67,7 +67,7 @@ jobs:
         run: make test-soak
       - name: Upload redacted soak evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: bounded-soak-${{ github.run_id }}
           path: build/soak

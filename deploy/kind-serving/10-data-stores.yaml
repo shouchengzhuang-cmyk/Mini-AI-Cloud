@@ -68,12 +68,21 @@ spec:
             capabilities:
               drop: ["ALL"]
             privileged: false
+            readOnlyRootFilesystem: true
             runAsNonRoot: true
           volumeMounts:
             - name: postgres-data
               mountPath: /var/lib/postgresql/data
+            - name: postgres-run
+              mountPath: /var/run/postgresql
+            - name: postgres-tmp
+              mountPath: /tmp
       volumes:
         - name: postgres-data
+          emptyDir: {}
+        - name: postgres-run
+          emptyDir: {}
+        - name: postgres-tmp
           emptyDir: {}
 ---
 apiVersion: v1

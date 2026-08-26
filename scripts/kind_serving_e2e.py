@@ -27,6 +27,7 @@ CLUSTER_ID_LABEL = "mini-ai-cloud/cluster-id"
 RUNTIME_LABEL = "mini-ai-cloud/runtime"
 POD_RESOURCE_KIND = "serving-pod"
 SERVICE_RESOURCE_KIND = "serving-service"
+HEADLESS_SERVICE_NAME = "mini-ai-cloud-serving-pods"
 
 
 class KindServingE2EError(RuntimeError):
@@ -375,9 +376,9 @@ async def _run_serving_scenario(
                 raise KindServingE2EError(
                     "ready Kubernetes Replica did not persist its resolved image digest"
                 )
-        if len(kube.serving_services(service_id)) != 2:
-            raise KindServingE2EError("expected one Kubernetes Service per ready Replica")
-        print("PASS: two real Kubernetes serving Pods reached ready with resolved image digests")
+        if kube.serving_services(service_id):
+            raise KindServingE2EError("controller created a forbidden per-Replica Service")
+        print("PASS: two real Kubernetes serving Pods reached ready behind static headless DNS")
 
         models = await api.json("GET", "/v1/models")
         model_rows = models.get("data")
@@ -443,8 +444,8 @@ async def _run_serving_scenario(
         await _scale(api, service_id, 4)
         _, scaled, _ = await _wait_service_ready(api, service_id, 4, timeout_seconds=90)
         scaled_pods = await _wait_pods(kube, service_id, expected=4, ready=True, timeout_seconds=60)
-        if len(kube.serving_services(service_id)) != 4:
-            raise KindServingE2EError("scale-up did not converge to four per-Replica Services")
+        if kube.serving_services(service_id):
+            raise KindServingE2EError("scale-up created a forbidden per-Replica Service")
         print("PASS: Kubernetes serving scaled from 2 to 4 ready Replicas")
 
         await _assert_scale_down_drain(
@@ -477,8 +478,8 @@ async def _run_serving_scenario(
             raise KindServingE2EError(
                 "controller restart replaced or duplicated a healthy execution"
             )
-        if len(kube.serving_services(service_id)) != 1:
-            raise KindServingE2EError("controller restart left duplicate per-Replica Services")
+        if kube.serving_services(service_id):
+            raise KindServingE2EError("controller restart created a forbidden per-Replica Service")
         print("PASS: controller rollout restart adopted the existing healthy Replica")
 
         bad_service_id = await _assert_bad_image_backoff(
@@ -711,8 +712,8 @@ async def _assert_scale_down_drain(
     final_pod_replica_id = _required_label(_labels(final_pods[0]), REPLICA_ID_LABEL)
     if final_ready_ids != {expected_survivor_id} or final_pod_replica_id != expected_survivor_id:
         raise KindServingE2EError("scale-down did not retain the expected healthy Replica")
-    if len(kube.serving_services(service_id)) != 1:
-        raise KindServingE2EError("scale-down left duplicate per-Replica Services")
+    if kube.serving_services(service_id):
+        raise KindServingE2EError("scale-down created a forbidden per-Replica Service")
 
 
 async def _wait_replica_status(
@@ -794,55 +795,34 @@ async def _assert_bad_image_backoff(
     retry_not_before = (
         scheduling_details.get("retry_not_before") if isinstance(scheduling_details, dict) else None
     )
-    try:
-        retry_at = (
-            datetime.fromisoformat(retry_not_before) if isinstance(retry_not_before, str) else None
-        )
-    except ValueError as exc:
-        raise KindServingE2EError("bad-image backoff has an invalid retry timestamp") from exc
-    if retry_at is not None and retry_at.tzinfo is None:
-        retry_at = retry_at.replace(tzinfo=UTC)
-    now = datetime.now(UTC)
-    if retry_at is None or retry_at.astimezone(UTC) <= now:
-        raise KindServingE2EError("bad-image backoff was not future-bounded when observed")
-    retry_at = retry_at.astimezone(UTC)
-    if retry_at > now + timedelta(seconds=10):
-        raise KindServingE2EError("bad-image backoff exceeded the bounded E2E retry window")
+    retry_at, retry_delay = _bounded_backoff_window(
+        updated_at=service_state.get("updated_at"),
+        retry_not_before=retry_not_before,
+    )
 
     failed_ids = {_required_string(row, "id") for row in failed}
-    initial_execution_ids = {
-        execution_id
-        for row in all_rows
-        if isinstance((execution_id := row.get("execution_id")), str)
-    }
-    while (retry_at - datetime.now(UTC)).total_seconds() > 0.1:
-        pre_retry_document = await api.json("GET", f"/api/v1/services/{service_id}/replicas")
-        pre_retry_rows = _object_items(pre_retry_document)
-        observed_execution_ids = {
-            execution_id
-            for row in pre_retry_rows
-            if isinstance((execution_id := row.get("execution_id")), str)
-        }
-        if not observed_execution_ids.issubset(initial_execution_ids):
-            raise KindServingE2EError("bad-image replacement launched before retry_not_before")
-        await asyncio.sleep(0.1)
-
     count_before = len(all_rows)
-    replacement_deadline = time.monotonic() + 15
-    replacement_seen = False
+    replacement_deadline = time.monotonic() + max(15, retry_delay.total_seconds() + 10)
+    replacement_rows: list[dict[str, Any]] = []
     later_rows = all_rows
     while time.monotonic() < replacement_deadline:
         later_document = await api.json("GET", f"/api/v1/services/{service_id}/replicas")
         later_rows = _object_items(later_document)
-        replacement_seen = any(
-            row.get("id") not in failed_ids and isinstance(row.get("execution_id"), str)
+        replacement_rows = [
+            row
             for row in later_rows
-        )
-        if replacement_seen:
+            if row.get("id") not in failed_ids and isinstance(row.get("execution_id"), str)
+        ]
+        if replacement_rows:
             break
         await asyncio.sleep(0.25)
-    if not replacement_seen:
+    if not replacement_rows:
         raise KindServingE2EError("bad-image failure did not launch a replacement after backoff")
+    if any(
+        _required_utc_timestamp(row.get("started_at"), "replacement started_at") < retry_at
+        for row in replacement_rows
+    ):
+        raise KindServingE2EError("bad-image replacement launched before retry_not_before")
 
     await asyncio.sleep(7)
     later_document = await api.json("GET", f"/api/v1/services/{service_id}/replicas")
@@ -855,6 +835,33 @@ async def _assert_bad_image_backoff(
     if len(active_pods) > 1:
         raise KindServingE2EError("bad image backoff left multiple active Pods")
     return service_id
+
+
+def _bounded_backoff_window(
+    *,
+    updated_at: object,
+    retry_not_before: object,
+) -> tuple[datetime, timedelta]:
+    backoff_set_at = _required_utc_timestamp(updated_at, "service updated_at")
+    retry_at = _required_utc_timestamp(retry_not_before, "bad-image retry_not_before")
+    retry_delay = retry_at - backoff_set_at
+    if retry_delay <= timedelta(0):
+        raise KindServingE2EError("bad-image backoff was not future-bounded when persisted")
+    if retry_delay > timedelta(seconds=10):
+        raise KindServingE2EError("bad-image backoff exceeded the bounded E2E retry window")
+    return retry_at, retry_delay
+
+
+def _required_utc_timestamp(value: object, label: str) -> datetime:
+    if not isinstance(value, str):
+        raise KindServingE2EError(f"{label} is missing")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise KindServingE2EError(f"{label} is invalid") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 async def _cleanup_services(api: API, kube: Kubectl, service_ids: Sequence[str]) -> list[str]:
@@ -874,7 +881,7 @@ async def _cleanup_services(api: API, kube: Kubectl, service_ids: Sequence[str])
         except KindServingE2EError as exc:
             errors.append(f"resources {service_id}: {exc}")
     if not errors and service_ids:
-        print("PASS: stopped test services and removed their Kubernetes resources")
+        print("PASS: stopped test services and removed their Kubernetes serving Pods")
     return errors
 
 
@@ -891,7 +898,9 @@ async def _wait_kubernetes_resources_removed(
         if not pods and not services:
             return
         await asyncio.sleep(0.5)
-    raise KindServingE2EError(f"service {service_id} retained serving Pods or Services after stop")
+    raise KindServingE2EError(
+        f"service {service_id} retained serving Pods or forbidden per-Replica Services after stop"
+    )
 
 
 def _assert_pod_contract(
@@ -936,6 +945,8 @@ def _assert_pod_contract(
             raise KindServingE2EError("serving Pod labels do not match persisted ownership")
         if spec.get("automountServiceAccountToken") is not False:
             raise KindServingE2EError("inference Pod automounts a service account token")
+        if spec.get("hostname") != name or spec.get("subdomain") != HEADLESS_SERVICE_NAME:
+            raise KindServingE2EError("inference Pod is outside the static headless DNS contract")
         if any(spec.get(key) is True for key in ("hostNetwork", "hostPID", "hostIPC")):
             raise KindServingE2EError("inference Pod enables a host namespace")
         pod_security = spec.get("securityContext")

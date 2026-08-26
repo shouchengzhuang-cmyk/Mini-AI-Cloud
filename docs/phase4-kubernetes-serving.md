@@ -17,7 +17,7 @@ KubernetesReplicaRuntimeController
               |
               v
  KubernetesServingRuntimeAdapter
-        Pod + ClusterIP Service
+        Pod + static headless Service DNS
               |
               v
  readinessProbe GET /health
@@ -31,17 +31,17 @@ KubernetesReplicaRuntimeController
 
 PostgreSQL 仍保存 desired state、Replica 生命周期、`execution_id`、generation、lease、endpoint 和请求计数。Kubernetes 是 workload 的实际运行环境，不取代数据库里的所有权判断。Service Reconciler 只创建或收缩 Replica 记录，Kubernetes controller claim `runtime=fake,runtime_type=kubernetes` 的 pending Replica，再创建资源并推进状态。
 
-每个 execution 对应一个 Pod 和一个 ClusterIP Service。Service selector 包含 Replica、generation、execution 和 controller worker identity，旧 execution 不会被新流量误选。Gateway 使用集群内 DNS：
+每个 execution 只对应一个动态 Pod。部署清单预置一个只选择受管推理 Pod 的 headless Service，Pod 把自己的有界名称同时写入 `hostname`，并使用该 Service 名称作为 `subdomain`。因此每个 execution 都有专属 DNS，而 controller 不需要创建、删除或读取 Service，也没有 Service RBAC 权限。Gateway 使用集群内 DNS：
 
 ```text
-http://<service-name>.<namespace>.svc.cluster.local:8000
+http://<pod-name>.mini-ai-cloud-serving-pods.<namespace>.svc.cluster.local:8000
 ```
 
 API 和 Gateway 部署在同一 Kind 集群时，应把对应的 `*.svc.cluster.local` 后缀加入 `SERVICE_ENDPOINT_HOST_ALLOWLIST`。Gateway 仍走原有 endpoint 选择、round-robin、active request 和 SSE 转发代码，没有测试专用旁路。
 
 ## 资源身份和 fencing
 
-资源名称经过 DNS-1123 清洗，并把完整身份的哈希放进有界名称。Pod 和 Service 带以下稳定标签：
+Pod 名称经过 DNS-1123 清洗，并把完整身份的哈希放进有界名称。Pod 带以下稳定标签：
 
 ```text
 mini-ai-cloud/managed
@@ -58,7 +58,7 @@ mini-ai-cloud/runtime
 mini-ai-cloud/spec-hash
 ```
 
-create 返回 409 时，runtime 会读取同名资源并逐项核对身份、spec hash 和安全边界。任一 fence 不一致都会拒绝 adopt。删除前也会核对标签，并使用 Pod UID precondition，旧 handle 不能删除同名的新 Pod。
+create 返回 409 时，runtime 会读取同名 Pod 并逐项核对身份、spec hash、静态 DNS 和安全边界。任一 fence 不一致都会拒绝 adopt。删除前也会核对标签，并使用 Pod UID precondition，旧 handle 不能删除同名的新 Pod。
 
 Controller 使用稳定 virtual Worker ID，每次进程启动生成新的 worker session。数据库 session 已被新进程替换后，旧 controller 的续租和终态写入会失败。旧进程遇到这种情况只丢弃本地 handle，不删除 Pod，因为新进程可能已经接管同一个 execution。
 

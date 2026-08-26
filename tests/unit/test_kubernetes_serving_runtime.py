@@ -12,6 +12,7 @@ from worker.kubernetes_serving_runtime import (
     CLUSTER_ID_LABEL,
     EXECUTION_ID_LABEL,
     GENERATION_LABEL,
+    HEADLESS_SERVICE_NAME,
     MANAGED_LABEL,
     POD_RESOURCE_KIND,
     PROJECT_ID_LABEL,
@@ -20,7 +21,6 @@ from worker.kubernetes_serving_runtime import (
     RUNTIME_LABEL,
     RUNTIME_LABEL_VALUE,
     SERVICE_ID_LABEL,
-    SERVICE_RESOURCE_KIND,
     SPEC_HASH_LABEL,
     WORKER_ID_LABEL,
     WORKER_SESSION_ID_LABEL,
@@ -87,7 +87,7 @@ def _prepare_api() -> SimpleNamespace:
 
 async def _prepare(
     runtime: KubernetesServingRuntimeAdapter,
-) -> tuple[KubernetesServingHandle, Any, Any]:
+) -> tuple[KubernetesServingHandle, Any]:
     handle = await runtime.prepare(
         _spec(),
         worker_id="k8s-serving-worker",
@@ -96,8 +96,7 @@ async def _prepare(
     api = runtime._api
     assert api is not None
     pod = api.create_namespaced_pod.call_args.kwargs["body"]
-    service = api.create_namespaced_service.call_args.kwargs["body"]
-    return handle, pod, service
+    return handle, pod
 
 
 def test_runtime_implements_serving_protocol_and_validates_configuration() -> None:
@@ -151,11 +150,11 @@ def test_resource_names_are_deterministic_bounded_dns_1123_and_fenced() -> None:
     ) != KubernetesServingRuntimeAdapter.service_name(spec)
 
 
-async def test_prepare_builds_secure_fenced_pod_and_exact_cluster_ip_service() -> None:
+async def test_prepare_builds_secure_fenced_pod_with_static_headless_dns() -> None:
     api = _prepare_api()
     runtime = _runtime(api)
 
-    handle, pod, service = await _prepare(runtime)
+    handle, pod = await _prepare(runtime)
 
     expected_selector = {
         SERVICE_ID_LABEL: str(SERVICE_ID),
@@ -171,18 +170,11 @@ async def test_prepare_builds_secure_fenced_pod_and_exact_cluster_ip_service() -
         SPEC_HASH_LABEL: pod.metadata.labels[SPEC_HASH_LABEL],
     }
     assert pod.metadata.labels == {**expected_selector, RESOURCE_KIND_LABEL: POD_RESOURCE_KIND}
-    assert service.metadata.labels == {
-        **expected_selector,
-        RESOURCE_KIND_LABEL: SERVICE_RESOURCE_KIND,
-    }
-    assert service.spec.type == "ClusterIP"
-    assert service.spec.selector == expected_selector
-    assert service.spec.publish_not_ready_addresses is False
-    assert len(service.spec.ports) == 1
-    assert service.spec.ports[0].port == 8000
-    assert service.spec.ports[0].target_port == 8000
+    api.create_namespaced_service.assert_not_awaited()
 
     assert pod.spec.automount_service_account_token is False
+    assert pod.spec.hostname == pod.metadata.name
+    assert pod.spec.subdomain == HEADLESS_SERVICE_NAME
     assert pod.spec.host_network is False
     assert pod.spec.host_pid is False
     assert pod.spec.host_ipc is False
@@ -218,14 +210,14 @@ async def test_prepare_builds_secure_fenced_pod_and_exact_cluster_ip_service() -
 
     assert handle.object_id == pod.metadata.name
     assert handle.uid == "pod-uid"
-    assert handle.service_name == service.metadata.name
-    assert handle.service_uid == "service-uid"
+    assert handle.service_name == HEADLESS_SERVICE_NAME
+    assert handle.service_uid is None
     assert handle.endpoint_url == (
-        f"http://{service.metadata.name}.serving-tests.svc.cluster.local:8000"
+        f"http://{pod.metadata.name}.{HEADLESS_SERVICE_NAME}.serving-tests.svc.cluster.local:8000"
     )
 
 
-async def test_prepare_adopts_only_exact_pod_and_service_after_conflict() -> None:
+async def test_prepare_adopts_only_exact_pod_after_conflict() -> None:
     api = _prepare_api()
     runtime = _runtime(api)
     spec = _spec()
@@ -235,11 +227,8 @@ async def test_prepare_adopts_only_exact_pod_and_service_after_conflict() -> Non
         worker_session_id=WORKER_SESSION_ID,
     )
     pod = _set_uid(runtime._build_pod(spec, selector), "adopted-pod")
-    service = _set_uid(runtime._build_service(spec, selector), "adopted-service")
     api.create_namespaced_pod.side_effect = ApiException(status=409, reason="AlreadyExists")
-    api.create_namespaced_service.side_effect = ApiException(status=409, reason="AlreadyExists")
     api.read_namespaced_pod = AsyncMock(return_value=pod)
-    api.read_namespaced_service = AsyncMock(return_value=service)
 
     handle = await runtime.prepare(
         spec,
@@ -248,7 +237,8 @@ async def test_prepare_adopts_only_exact_pod_and_service_after_conflict() -> Non
     )
 
     assert handle.uid == "adopted-pod"
-    assert handle.service_uid == "adopted-service"
+    assert handle.service_uid is None
+    api.create_namespaced_service.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -315,7 +305,8 @@ async def test_prepare_rejects_pod_with_exact_labels_but_drifted_workload(
     api.create_namespaced_service.assert_not_awaited()
 
 
-async def test_prepare_rejects_service_with_exact_labels_but_wrong_endpoint_port() -> None:
+@pytest.mark.parametrize("field", ["hostname", "subdomain"])
+async def test_prepare_rejects_pod_outside_static_headless_dns_contract(field: str) -> None:
     api = _prepare_api()
     runtime = _runtime(api)
     spec = _spec()
@@ -325,14 +316,11 @@ async def test_prepare_rejects_service_with_exact_labels_but_wrong_endpoint_port
         worker_session_id=WORKER_SESSION_ID,
     )
     pod = runtime._build_pod(spec, selector)
-    service = runtime._build_service(spec, selector)
-    service.spec.ports[0].port = 9000
-    service.spec.ports[0].target_port = 9000
-    api.create_namespaced_pod.side_effect = lambda *, namespace, body: pod
-    api.create_namespaced_service.side_effect = ApiException(status=409)
-    api.read_namespaced_service = AsyncMock(return_value=service)
+    setattr(pod.spec, field, "wrong-dns-name")
+    api.create_namespaced_pod.side_effect = ApiException(status=409)
+    api.read_namespaced_pod = AsyncMock(return_value=pod)
 
-    with pytest.raises(KubernetesServingOwnershipError, match="endpoint contract"):
+    with pytest.raises(KubernetesServingOwnershipError, match="security baseline"):
         await runtime.prepare(
             spec,
             worker_id="k8s-serving-worker",
@@ -340,7 +328,7 @@ async def test_prepare_rejects_service_with_exact_labels_but_wrong_endpoint_port
         )
 
 
-async def test_prepare_rejects_stale_execution_and_conflicting_service_selector() -> None:
+async def test_prepare_rejects_stale_execution_fence() -> None:
     api = _prepare_api()
     runtime = _runtime(api)
     spec = _spec()
@@ -362,25 +350,11 @@ async def test_prepare_rejects_stale_execution_and_conflicting_service_selector(
         )
     api.create_namespaced_service.assert_not_awaited()
 
-    exact_pod = runtime._build_pod(spec, selector)
-    service = runtime._build_service(spec, selector)
-    service.spec.selector[EXECUTION_ID_LABEL] = str(uuid.uuid4())
-    api.create_namespaced_pod.side_effect = lambda *, namespace, body: exact_pod
-    api.create_namespaced_service.side_effect = ApiException(status=409)
-    api.read_namespaced_service = AsyncMock(return_value=service)
 
-    with pytest.raises(KubernetesServingOwnershipError, match="selector"):
-        await runtime.prepare(
-            spec,
-            worker_id="k8s-serving-worker",
-            worker_session_id=WORKER_SESSION_ID,
-        )
-
-
-async def test_start_and_inspect_publish_only_ready_non_deleting_service() -> None:
+async def test_start_and_inspect_publish_only_ready_non_deleting_pod() -> None:
     api = _prepare_api()
     runtime = _runtime(api)
-    handle, pod, service = await _prepare(runtime)
+    handle, pod = await _prepare(runtime)
     pod.status = SimpleNamespace(
         phase="Running",
         conditions=[SimpleNamespace(type="Ready", status="True")],
@@ -393,7 +367,6 @@ async def test_start_and_inspect_publish_only_ready_non_deleting_service() -> No
     )
     api.read_namespaced_pod = AsyncMock(return_value=pod)
     api.read_namespaced_pod_status = AsyncMock(return_value=pod)
-    api.read_namespaced_service = AsyncMock(return_value=service)
 
     refreshed = await runtime.start(handle)
     state = await runtime.inspect(refreshed)
@@ -408,7 +381,7 @@ async def test_start_and_inspect_publish_only_ready_non_deleting_service() -> No
     assert state.image_digest == f"sha256:{'a' * 64}"
     assert state.reason is None
 
-    service.metadata.deletion_timestamp = "terminating"
+    pod.metadata.deletion_timestamp = "terminating"
     deleting = await runtime.inspect(refreshed)
     assert deleting.running is False
     assert deleting.ready is False
@@ -467,10 +440,9 @@ async def test_inspect_maps_image_pull_and_oom_failures(
 ) -> None:
     api = _prepare_api()
     runtime = _runtime(api)
-    handle, pod, service = await _prepare(runtime)
+    handle, pod = await _prepare(runtime)
     pod.status = status
     api.read_namespaced_pod_status = AsyncMock(return_value=pod)
-    api.read_namespaced_service = AsyncMock(return_value=service)
 
     state = await runtime.inspect(handle)
 
@@ -480,56 +452,42 @@ async def test_inspect_maps_image_pull_and_oom_failures(
     assert state.ready is False
 
 
-async def test_inspect_reports_missing_pod_and_missing_service() -> None:
+async def test_inspect_reports_missing_pod_without_reading_services() -> None:
     api = _prepare_api()
     runtime = _runtime(api)
-    handle, pod, _service = await _prepare(runtime)
+    handle, _pod = await _prepare(runtime)
     api.read_namespaced_pod_status = AsyncMock(side_effect=ApiException(status=404))
+    api.read_namespaced_service = AsyncMock()
 
     missing = await runtime.inspect(handle)
 
     assert missing.phase == "Missing"
     assert missing.missing is True
     assert missing.endpoint_url is None
-
-    pod.status = SimpleNamespace(
-        phase="Running",
-        conditions=[SimpleNamespace(type="Ready", status="True")],
-        container_statuses=[],
-    )
-    api.read_namespaced_pod_status = AsyncMock(return_value=pod)
-    api.read_namespaced_service = AsyncMock(side_effect=ApiException(status=404))
-
-    service_missing = await runtime.inspect(handle)
-    assert service_missing.running is True
-    assert service_missing.ready is False
-    assert service_missing.reason == "ServiceMissing"
-    assert service_missing.endpoint_url is None
+    api.read_namespaced_service.assert_not_awaited()
 
 
 async def test_graceful_and_force_delete_use_uid_preconditions_and_are_idempotent() -> None:
     api = _prepare_api()
     runtime = _runtime(api)
-    handle, pod, service = await _prepare(runtime)
+    handle, pod = await _prepare(runtime)
     api.read_namespaced_pod = AsyncMock(return_value=pod)
-    api.read_namespaced_service = AsyncMock(return_value=service)
+    api.read_namespaced_service = AsyncMock()
     api.delete_namespaced_pod = AsyncMock()
     api.delete_namespaced_service = AsyncMock()
 
     await runtime.request_stop(handle)
 
-    service_body = api.delete_namespaced_service.call_args.kwargs["body"]
     pod_body = api.delete_namespaced_pod.call_args.kwargs["body"]
-    assert service_body.preconditions.uid == "service-uid"
-    assert service_body.grace_period_seconds == 0
     assert pod_body.preconditions.uid == "pod-uid"
     assert pod_body.grace_period_seconds == 17
+    api.read_namespaced_service.assert_not_awaited()
+    api.delete_namespaced_service.assert_not_awaited()
 
     await runtime.force_cleanup(handle)
     forced_pod_body = api.delete_namespaced_pod.call_args.kwargs["body"]
     assert forced_pod_body.grace_period_seconds == 0
 
-    api.read_namespaced_service = AsyncMock(side_effect=ApiException(status=404))
     api.read_namespaced_pod = AsyncMock(side_effect=ApiException(status=404))
     api.delete_namespaced_pod.reset_mock()
     api.delete_namespaced_service.reset_mock()
@@ -543,7 +501,7 @@ async def test_graceful_and_force_delete_use_uid_preconditions_and_are_idempoten
 async def test_delete_refuses_recreated_pod_with_different_uid() -> None:
     api = _prepare_api()
     runtime = _runtime(api)
-    handle, pod, _service = await _prepare(runtime)
+    handle, pod = await _prepare(runtime)
     pod.metadata.uid = "replacement-pod-uid"
     api.read_namespaced_service = AsyncMock(side_effect=ApiException(status=404))
     api.read_namespaced_pod = AsyncMock(return_value=pod)
@@ -555,30 +513,24 @@ async def test_delete_refuses_recreated_pod_with_different_uid() -> None:
     api.delete_namespaced_pod.assert_not_awaited()
 
 
-async def test_list_managed_uses_bounded_selectors_and_recovers_service_identity() -> None:
+async def test_list_managed_uses_bounded_selector_and_recovers_pod_dns_identity() -> None:
     api = _prepare_api()
     runtime = _runtime(api)
-    handle, pod, service = await _prepare(runtime)
+    handle, pod = await _prepare(runtime)
     api.list_namespaced_pod = AsyncMock(return_value=SimpleNamespace(items=[pod]))
-    api.list_namespaced_service = AsyncMock(return_value=SimpleNamespace(items=[service]))
+    api.list_namespaced_service = AsyncMock()
 
     recovered = await runtime.list_managed(worker_id="k8s-serving-worker")
 
     assert len(recovered) == 1
     assert recovered[0].object_id == handle.object_id
-    assert recovered[0].service_uid == "service-uid"
+    assert recovered[0].service_name == HEADLESS_SERVICE_NAME
+    assert recovered[0].service_uid is None
+    assert recovered[0].endpoint_url == handle.endpoint_url
     pod_selector = api.list_namespaced_pod.call_args.kwargs["label_selector"]
-    service_selector = api.list_namespaced_service.call_args.kwargs["label_selector"]
     assert f"{CLUSTER_ID_LABEL}=kind-serving-test" in pod_selector
     assert f"{RESOURCE_KIND_LABEL}={POD_RESOURCE_KIND}" in pod_selector
-    assert f"{RESOURCE_KIND_LABEL}={SERVICE_RESOURCE_KIND}" in service_selector
-
-    api.list_namespaced_pod.return_value = SimpleNamespace(items=[])
-    service_orphan = await runtime.list_managed(worker_id="k8s-serving-worker")
-    assert len(service_orphan) == 1
-    assert service_orphan[0].object_id == handle.object_id
-    assert service_orphan[0].uid is None
-    assert service_orphan[0].service_uid == "service-uid"
+    api.list_namespaced_service.assert_not_awaited()
 
     api.list_namespaced_pod.return_value = SimpleNamespace(items=[pod])
     pod.metadata.labels.pop(EXECUTION_ID_LABEL)
@@ -589,10 +541,7 @@ async def test_list_managed_uses_bounded_selectors_and_recovers_service_identity
     assert all(conflict.ownership is None for conflict in runtime.recovery_conflicts)
 
 
-@pytest.mark.parametrize("drifted_kind", ["pod", "service"])
-async def test_list_managed_isolates_one_drifted_pair_and_recovers_other_resources(
-    drifted_kind: str,
-) -> None:
+async def test_list_managed_isolates_one_drifted_pod_and_recovers_other_resources() -> None:
     api = _prepare_api()
     runtime = _runtime(api)
     specs = [
@@ -610,7 +559,7 @@ async def test_list_managed_isolates_one_drifted_pair_and_recovers_other_resourc
             execution_id=uuid.uuid4(),
         ),
     ]
-    pairs: list[tuple[Any, Any]] = []
+    pods: list[Any] = []
     for index, spec in enumerate(specs):
         selector = runtime._selector_labels(
             spec,
@@ -618,20 +567,13 @@ async def test_list_managed_isolates_one_drifted_pair_and_recovers_other_resourc
             worker_session_id=WORKER_SESSION_ID,
         )
         pod = _set_uid(runtime._build_pod(spec, selector), f"pod-uid-{index}")
-        service = _set_uid(runtime._build_service(spec, selector), f"service-uid-{index}")
-        pairs.append((pod, service))
+        pods.append(pod)
 
-    drifted_pod, drifted_service = pairs[2]
-    if drifted_kind == "pod":
-        drifted_pod.spec.containers[0].image = "mini-ai-cloud:drifted-image"
-    else:
-        drifted_service.spec.selector[PROJECT_ID_LABEL] = str(uuid.uuid4())
+    drifted_pod = pods[2]
+    drifted_pod.spec.containers[0].image = "mini-ai-cloud:drifted-image"
 
     api.list_namespaced_pod = AsyncMock(
-        return_value=SimpleNamespace(items=[pairs[0][0], drifted_pod, pairs[1][0]])
-    )
-    api.list_namespaced_service = AsyncMock(
-        return_value=SimpleNamespace(items=[pairs[0][1], drifted_service, pairs[1][1]])
+        return_value=SimpleNamespace(items=[pods[0], drifted_pod, pods[1]])
     )
     api.delete_namespaced_pod = AsyncMock()
     api.delete_namespaced_service = AsyncMock()
@@ -644,13 +586,9 @@ async def test_list_managed_isolates_one_drifted_pair_and_recovers_other_resourc
     }
     assert len(runtime.recovery_conflicts) == 1
     conflict = runtime.recovery_conflicts[0]
-    assert conflict.resource_kind == drifted_kind
+    assert conflict.resource_kind == "pod"
     assert conflict.reason == "ownership_conflict"
-    assert conflict.resource_name == (
-        KubernetesServingRuntimeAdapter.pod_name(specs[2])
-        if drifted_kind == "pod"
-        else KubernetesServingRuntimeAdapter.service_name(specs[2])
-    )
+    assert conflict.resource_name == KubernetesServingRuntimeAdapter.pod_name(specs[2])
     assert conflict.ownership is not None
     assert conflict.ownership.service_id == specs[2].service_id
     assert conflict.ownership.replica_id == specs[2].replica_id

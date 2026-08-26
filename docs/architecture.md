@@ -33,7 +33,7 @@ source of truth             notification/cache/rate limit
 Docker Worker       Kubernetes   Kubernetes
                     Batch Worker  Serving Controller
       |                    |        |
-task container         Pod/Job   Pod + ClusterIP Service
+task container         Pod/Job   Pod + static headless DNS
 
 Artifact metadata -> PostgreSQL
 Artifact bytes    -> Local volume or S3-compatible store
@@ -119,7 +119,7 @@ prepare -> start -> logs + wait -> stop -> cleanup
 - Kubernetes：创建带 task/project/execution labels 的对象，支持资源 request/limit、GPU、日志、停止和 reconciliation；Pod/Container 固定 UID/GID 65532、`runAsNonRoot`、`RuntimeDefault` seccomp、只读 rootfs 与 drop ALL。
 - Fake：只用于 development/test，使无 GPU、无 vLLM 环境仍可验证完整控制面。
 - Docker vLLM controller：默认关闭，只能在具备 Docker socket 与真实 NVIDIA inventory 的专用 serving node 显式启用。它以独立 draining Worker 身份领取 replica intent，按 generation/execution/session fencing 管理容器，并为每个 Project/Service 使用隔离的缓存卷；本机无 GPU 时只验证 lifecycle/spec，不把它写成真实推理实测。
-- Kubernetes serving：采用独立 long-running runtime boundary，不复用 batch `wait/logs/terminal` 语义。它为 Fake Replica 创建 Pod 和 ClusterIP Service，等 Kubernetes Ready condition 成立后才开放 Gateway 流量。应用 shutdown 只关闭 client，启动恢复会 adopt 仍由数据库 execution 持有的 Pod。
+- Kubernetes serving：采用独立 long-running runtime boundary，不复用 batch `wait/logs/terminal` 语义。它为 Fake Replica 只创建 Pod，通过预置的 headless Service 获得 Pod 专属 DNS，等 Kubernetes Ready condition 成立后才开放 Gateway 流量；controller 没有 Service 写权限。应用 shutdown 只关闭 client，启动恢复会 adopt 仍由数据库 execution 持有的 Pod。
 
 `FAKE_GPU_*` 在 production 配置下会被拒绝。Kubernetes client 的代码路径与单测存在，但没有真实 cluster 的机器只能把它报告为“implemented, environment-limited”，不能写成已完成 K8s E2E。
 

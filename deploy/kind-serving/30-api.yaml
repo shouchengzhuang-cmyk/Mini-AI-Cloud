@@ -166,6 +166,26 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
+  name: mini-ai-cloud-serving-pods
+  namespace: mini-ai-cloud-serving
+  labels:
+    app.kubernetes.io/name: mini-ai-cloud-serving-pods
+    app.kubernetes.io/part-of: kind-serving-e2e
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: false
+  selector:
+    mini-ai-cloud/managed: "true"
+    mini-ai-cloud/runtime: kubernetes-serving
+    mini-ai-cloud/resource-kind: serving-pod
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
   name: mini-ai-cloud-api
   namespace: mini-ai-cloud-serving
   labels:

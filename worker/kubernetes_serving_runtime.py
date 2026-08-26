@@ -11,7 +11,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
-from urllib.parse import urlsplit
 
 from kubernetes_asyncio import client, config
 from kubernetes_asyncio.client.exceptions import ApiException
@@ -31,9 +30,9 @@ SPEC_HASH_LABEL = "mini-ai-cloud/spec-hash"
 
 RUNTIME_LABEL_VALUE = "kubernetes-serving"
 POD_RESOURCE_KIND = "serving-pod"
-SERVICE_RESOURCE_KIND = "serving-service"
 CONTAINER_NAME = "inference"
 TMP_VOLUME_NAME = "tmp"
+HEADLESS_SERVICE_NAME = "mini-ai-cloud-serving-pods"
 
 _DNS_1123_LABEL = re.compile(r"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$")
 _LABEL_VALUE = re.compile(r"^[A-Za-z0-9](?:[-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$")
@@ -162,12 +161,14 @@ class KubernetesServingRuntime(Protocol):
 
 
 class KubernetesServingRuntimeAdapter:
-    """Manage one long-lived Pod and one exact-selector Service per replica.
+    """Manage one long-lived Pod per replica behind a shared headless Service.
 
-    Kubernetes starts a Pod as part of creation, so ``prepare`` creates both
-    resources and ``start`` is an ownership-checked observation barrier.  The
-    adapter never treats controller shutdown as workload shutdown; ``close``
-    only closes a client owned by this instance.
+    Kubernetes starts a Pod as part of creation, so ``prepare`` creates the Pod
+    and ``start`` is an ownership-checked observation barrier.  A statically
+    provisioned headless Service provides stable per-Pod DNS without granting
+    this controller Service write access.  The adapter never treats controller
+    shutdown as workload shutdown; ``close`` only closes a client owned by this
+    instance.
     """
 
     def __init__(
@@ -248,11 +249,9 @@ class KubernetesServingRuntimeAdapter:
             worker_session_id=worker_session_id,
         )
         pod = self._build_pod(spec, selector)
-        service = self._build_service(spec, selector)
 
         observed_pod = await self._create_or_adopt_pod(api, pod, spec, selector)
-        observed_service = await self._create_or_adopt_service(api, service, spec, selector)
-        return self._handle(observed_pod, service=observed_service)
+        return self._handle(observed_pod, service=None)
 
     async def start(self, handle: KubernetesServingHandle) -> KubernetesServingHandle:
         api = await self._ensure_api()
@@ -262,19 +261,10 @@ class KubernetesServingRuntimeAdapter:
                 name=handle.object_id,
                 namespace=self.namespace,
             )
-            service = await api.read_namespaced_service(
-                name=self._service_name(handle),
-                namespace=self.namespace,
-            )
         except ApiException as exc:
             raise self._operation_error("start Kubernetes serving replica", exc) from exc
         self._validate_observed_pod(pod, expected_labels=expected_labels)
-        self._validate_observed_service(
-            service,
-            expected_selector=expected_labels,
-            expected_port=_container_port(pod),
-        )
-        return self._handle(pod, service=service)
+        return self._handle(pod, service=None)
 
     async def inspect(self, handle: KubernetesServingHandle) -> KubernetesServingState:
         api = await self._ensure_api()
@@ -301,32 +291,11 @@ class KubernetesServingRuntimeAdapter:
             raise self._operation_error("inspect Kubernetes serving Pod", exc) from exc
         self._validate_observed_pod(pod, expected_labels=expected_labels)
 
-        service_missing = False
-        service_deleting = False
-        try:
-            service = await api.read_namespaced_service(
-                name=self._service_name(handle),
-                namespace=self.namespace,
-            )
-            self._validate_observed_service(
-                service,
-                expected_selector=expected_labels,
-                expected_port=_container_port(pod),
-            )
-            service_deleting = _deleting(service)
-        except ApiException as exc:
-            if exc.status != 404:
-                raise self._operation_error("inspect Kubernetes serving Service", exc) from exc
-            service_missing = True
-
         status = getattr(pod, "status", None)
         phase = str(getattr(status, "phase", None) or "Unknown")
-        deleting = _deleting(pod) or service_deleting
-        ready = _pod_ready(status) and not deleting and not service_missing
+        deleting = _deleting(pod)
+        ready = _pod_ready(status) and not deleting
         exit_code, oom_killed, reason, message = _pod_failure(status)
-        if service_missing and reason is None:
-            reason = "ServiceMissing"
-            message = "Kubernetes serving Service is missing"
         return KubernetesServingState(
             phase=phase,
             running=phase.lower() == "running" and not deleting,
@@ -337,7 +306,7 @@ class KubernetesServingRuntimeAdapter:
             oom_killed=oom_killed,
             reason=reason,
             message=_bounded(message),
-            endpoint_url=handle.endpoint_url if not service_missing else None,
+            endpoint_url=handle.endpoint_url,
             image_digest=_pod_image_digest(status),
         )
 
@@ -366,72 +335,14 @@ class KubernetesServingRuntimeAdapter:
                 namespace=self.namespace,
                 label_selector=selector,
             )
-            service_list = await api.list_namespaced_service(
-                namespace=self.namespace,
-                label_selector=",".join(
-                    (
-                        f"{MANAGED_LABEL}=true",
-                        f"{CLUSTER_ID_LABEL}={self.cluster_id}",
-                        f"{WORKER_ID_LABEL}={normalized_worker_id}",
-                        f"{RUNTIME_LABEL}={RUNTIME_LABEL_VALUE}",
-                        f"{RESOURCE_KIND_LABEL}={SERVICE_RESOURCE_KIND}",
-                    )
-                ),
-            )
         except ApiException as exc:
-            raise self._operation_error("list managed Kubernetes serving resources", exc) from exc
-
-        services: dict[str, object] = {}
-        for service in getattr(service_list, "items", None) or []:
-            observed_service_name = _observed_resource_name(service)
-            if not observed_service_name:
-                self._record_recovery_conflict(
-                    resource_kind="service",
-                    resource=service,
-                    worker_id=normalized_worker_id,
-                    error=KubernetesServingOwnershipError(
-                        "managed Kubernetes serving Service has no name"
-                    ),
-                )
-                continue
-            services[observed_service_name] = service
+            raise self._operation_error("list managed Kubernetes serving Pods", exc) from exc
 
         handles: list[KubernetesServingHandle] = []
-        matched_services: set[str] = set()
-        observed_pod_names = {
-            name
-            for pod in (getattr(pod_list, "items", None) or [])
-            if (name := _observed_resource_name(pod))
-        }
         for pod in getattr(pod_list, "items", None) or []:
-            service_name: str | None = None
             try:
-                labels = self._managed_pod_labels(pod)
-                service_name = _service_name_from_labels(labels)
-                service = services.get(service_name)
-                if service is not None:
-                    # Mark the pair before validation so a drifted endpoint is
-                    # quarantined with its Pod instead of being returned later
-                    # as a deletable Service-only orphan.
-                    matched_services.add(service_name)
-                    try:
-                        self._validate_observed_service(
-                            service,
-                            expected_selector=_selector_from_resource_labels(labels),
-                            expected_port=_container_port(pod),
-                        )
-                    except KubernetesServingOwnershipError as exc:
-                        self._record_recovery_conflict(
-                            resource_kind="service",
-                            resource=service,
-                            worker_id=normalized_worker_id,
-                            error=exc,
-                        )
-                        continue
-                handles.append(self._handle(pod, service=service))
+                handles.append(self._handle(pod, service=None))
             except KubernetesServingOwnershipError as exc:
-                if service_name is not None:
-                    matched_services.add(service_name)
                 self._record_recovery_conflict(
                     resource_kind="pod",
                     resource=pod,
@@ -439,24 +350,6 @@ class KubernetesServingRuntimeAdapter:
                     error=exc,
                 )
                 continue
-        for service_name, service in services.items():
-            if service_name in matched_services:
-                continue
-            try:
-                handle = self._service_only_handle(service)
-                if handle.object_id in observed_pod_names:
-                    # The Pod pass already recorded the resource-level conflict.
-                    # Do not turn its otherwise valid Service into a deletable
-                    # orphan handle or emit a duplicate warning for the pair.
-                    continue
-                handles.append(handle)
-            except KubernetesServingOwnershipError as exc:
-                self._record_recovery_conflict(
-                    resource_kind="service",
-                    resource=service,
-                    worker_id=normalized_worker_id,
-                    error=exc,
-                )
         return tuple(handles)
 
     def _ownership_identity(
@@ -468,12 +361,9 @@ class KubernetesServingRuntimeAdapter:
     ) -> KubernetesServingOwnershipIdentity | None:
         """Parse identity only when every DB correlation fence is canonical."""
 
-        expected_resource_kind = {
-            "pod": POD_RESOURCE_KIND,
-            "service": SERVICE_RESOURCE_KIND,
-        }.get(resource_kind)
-        if expected_resource_kind is None:
+        if resource_kind != "pod":
             return None
+        expected_resource_kind = POD_RESOURCE_KIND
         try:
             labels = _resource_labels(resource)
         except KubernetesServingOwnershipError:
@@ -510,7 +400,7 @@ class KubernetesServingRuntimeAdapter:
         ):
             return None
         expected_name = _resource_name(
-            "sr" if resource_kind == "pod" else "ss",
+            "sr",
             service_id=service_id,
             replica_id=replica_id,
             generation=generation,
@@ -577,13 +467,8 @@ class KubernetesServingRuntimeAdapter:
 
     @staticmethod
     def service_name(spec: KubernetesServingLaunchSpec) -> str:
-        return _resource_name(
-            "ss",
-            service_id=spec.service_id,
-            replica_id=spec.replica_id,
-            generation=spec.generation,
-            execution_id=spec.execution_id,
-        )
+        del spec
+        return HEADLESS_SERVICE_NAME
 
     async def _create_or_adopt_pod(
         self,
@@ -607,34 +492,6 @@ class KubernetesServingRuntimeAdapter:
         self._validate_observed_pod(observed, expected_labels=selector, expected_spec=spec)
         return observed
 
-    async def _create_or_adopt_service(
-        self,
-        api: Any,
-        service: client.V1Service,
-        spec: KubernetesServingLaunchSpec,
-        selector: Mapping[str, str],
-    ) -> object:
-        try:
-            observed = await api.create_namespaced_service(namespace=self.namespace, body=service)
-        except ApiException as exc:
-            if exc.status != 409:
-                raise self._operation_error("create Kubernetes serving Service", exc) from exc
-            try:
-                observed = await api.read_namespaced_service(
-                    name=self.service_name(spec),
-                    namespace=self.namespace,
-                )
-            except ApiException as read_exc:
-                raise self._operation_error(
-                    "adopt Kubernetes serving Service", read_exc
-                ) from read_exc
-        self._validate_observed_service(
-            observed,
-            expected_selector=selector,
-            expected_port=spec.container_port,
-        )
-        return observed
-
     async def _delete_resources(
         self,
         handle: KubernetesServingHandle,
@@ -643,58 +500,12 @@ class KubernetesServingRuntimeAdapter:
     ) -> None:
         api = await self._ensure_api()
         expected_labels = self._expected_handle_labels(handle)
-        await self._delete_service(
-            api,
-            handle,
-            expected_labels=expected_labels,
-        )
         await self._delete_pod(
             api,
             handle,
             expected_labels=expected_labels,
             grace_seconds=grace_seconds,
         )
-
-    async def _delete_service(
-        self,
-        api: Any,
-        handle: KubernetesServingHandle,
-        *,
-        expected_labels: Mapping[str, str],
-    ) -> None:
-        name = self._service_name(handle)
-        try:
-            service = await api.read_namespaced_service(name=name, namespace=self.namespace)
-        except ApiException as exc:
-            if exc.status == 404:
-                return
-            raise self._operation_error(
-                "inspect Kubernetes serving Service for deletion", exc
-            ) from exc
-        self._validate_observed_service(
-            service,
-            expected_selector=expected_labels,
-            expected_port=_endpoint_port(handle.endpoint_url),
-        )
-        uid = _required_uid(service, resource="Service")
-        if handle.service_uid is not None and handle.service_uid != uid:
-            raise KubernetesServingOwnershipError(
-                f"refusing to delete Kubernetes serving Service {name}: UID fence mismatch"
-            )
-        body = client.V1DeleteOptions(
-            grace_period_seconds=0,
-            preconditions=client.V1Preconditions(uid=uid),
-            propagation_policy="Background",
-        )
-        try:
-            await api.delete_namespaced_service(
-                name=name,
-                namespace=self.namespace,
-                body=body,
-            )
-        except ApiException as exc:
-            if exc.status != 404:
-                raise self._operation_error("delete Kubernetes serving Service", exc) from exc
 
     async def _delete_pod(
         self,
@@ -834,6 +645,7 @@ class KubernetesServingRuntimeAdapter:
             spec=client.V1PodSpec(
                 automount_service_account_token=False,
                 containers=[container],
+                hostname=self.pod_name(spec),
                 host_ipc=False,
                 host_network=False,
                 host_pid=False,
@@ -844,6 +656,7 @@ class KubernetesServingRuntimeAdapter:
                     run_as_group=10001,
                     seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
                 ),
+                subdomain=HEADLESS_SERVICE_NAME,
                 termination_grace_period_seconds=self.termination_grace_seconds,
                 volumes=[
                     client.V1Volume(
@@ -854,31 +667,6 @@ class KubernetesServingRuntimeAdapter:
                         ),
                     )
                 ],
-            ),
-        )
-
-    def _build_service(
-        self,
-        spec: KubernetesServingLaunchSpec,
-        selector: Mapping[str, str],
-    ) -> client.V1Service:
-        return client.V1Service(
-            metadata=client.V1ObjectMeta(
-                name=self.service_name(spec),
-                labels={**dict(selector), RESOURCE_KIND_LABEL: SERVICE_RESOURCE_KIND},
-            ),
-            spec=client.V1ServiceSpec(
-                ports=[
-                    client.V1ServicePort(
-                        name="http",
-                        port=spec.container_port,
-                        protocol="TCP",
-                        target_port=spec.container_port,
-                    )
-                ],
-                publish_not_ready_addresses=False,
-                selector=dict(selector),
-                type="ClusterIP",
             ),
         )
 
@@ -908,6 +696,8 @@ class KubernetesServingRuntimeAdapter:
         volume_mounts = getattr(container, "volume_mounts", None) or []
         secure = (
             getattr(pod_spec, "automount_service_account_token", None) is False
+            and getattr(pod_spec, "hostname", None) == _observed_resource_name(pod)
+            and getattr(pod_spec, "subdomain", None) == HEADLESS_SERVICE_NAME
             and getattr(pod_spec, "host_network", None) is not True
             and getattr(pod_spec, "host_pid", None) is not True
             and getattr(pod_spec, "host_ipc", None) is not True
@@ -955,41 +745,6 @@ class KubernetesServingRuntimeAdapter:
                 "refusing to adopt Kubernetes serving Pod with mismatched launch spec"
             )
 
-    def _validate_observed_service(
-        self,
-        service: object,
-        *,
-        expected_selector: Mapping[str, str],
-        expected_port: int | None = None,
-    ) -> None:
-        labels = _resource_labels(service)
-        _validate_labels(
-            labels,
-            {**dict(expected_selector), RESOURCE_KIND_LABEL: SERVICE_RESOURCE_KIND},
-            resource="Service",
-        )
-        service_spec = getattr(service, "spec", None)
-        selector = getattr(service_spec, "selector", None) or {}
-        ports = getattr(service_spec, "ports", None) or []
-        if selector != dict(expected_selector) or len(ports) != 1:
-            raise KubernetesServingOwnershipError(
-                "refusing to adopt Kubernetes serving Service with mismatched selector or ports"
-            )
-        port = ports[0]
-        if (
-            getattr(service_spec, "type", None) != "ClusterIP"
-            or getattr(port, "protocol", None) != "TCP"
-            or getattr(port, "name", None) != "http"
-            or getattr(service_spec, "publish_not_ready_addresses", None) is True
-            or not isinstance(getattr(port, "port", None), int)
-            or isinstance(getattr(port, "port", None), bool)
-            or getattr(port, "port", None) != getattr(port, "target_port", None)
-            or (expected_port is not None and getattr(port, "port", None) != expected_port)
-        ):
-            raise KubernetesServingOwnershipError(
-                "refusing to adopt Kubernetes serving Service outside the endpoint contract"
-            )
-
     def _managed_pod_labels(self, pod: object) -> Mapping[str, str]:
         labels = _resource_labels(pod)
         required = {
@@ -1030,58 +785,19 @@ class KubernetesServingRuntimeAdapter:
         if not name:
             raise KubernetesServingOwnershipError("Kubernetes serving Pod has no name")
         labels = self._managed_pod_labels(pod)
-        service_name = _service_name_from_labels(labels)
-        observed_service_name = str(
-            getattr(getattr(service, "metadata", None), "name", "") if service is not None else ""
-        )
-        if observed_service_name and observed_service_name != service_name:
-            raise KubernetesServingOwnershipError(
-                "Kubernetes serving Service name does not match its Pod fence"
-            )
         port = _container_port(pod)
         return KubernetesServingHandle(
             object_id=name,
             display_id=name,
-            endpoint_url=(f"http://{service_name}.{self.namespace}.svc.cluster.local:{port}"),
+            endpoint_url=(
+                f"http://{name}.{HEADLESS_SERVICE_NAME}.{self.namespace}.svc.cluster.local:{port}"
+            ),
             image_digest=_pod_image_digest(getattr(pod, "status", None)),
             labels=labels,
             uid=_optional_uid(pod),
-            service_name=service_name,
-            service_uid=_optional_uid(service) if service is not None else None,
+            service_name=HEADLESS_SERVICE_NAME,
+            service_uid=None,
             native=pod,
-        )
-
-    def _service_only_handle(self, service: object) -> KubernetesServingHandle:
-        # A Service cannot prove the image/process/resource portion of the
-        # workload hash without its Pod.  Keep it discoverable only as an
-        # orphan-cleanup handle; ``inspect`` will report the derived Pod missing
-        # and the controller must never publish this handle as ready.
-        labels = self._managed_service_labels(service)
-        service_name = _service_name_from_labels(labels)
-        observed_name = str(getattr(getattr(service, "metadata", None), "name", ""))
-        if observed_name != service_name:
-            raise KubernetesServingOwnershipError(
-                "Kubernetes serving Service name does not match its identity fence"
-            )
-        service_spec = getattr(service, "spec", None)
-        ports = getattr(service_spec, "ports", None) or []
-        port = getattr(ports[0], "port", None) if len(ports) == 1 else None
-        if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
-            raise KubernetesServingOwnershipError(
-                "Kubernetes serving Service endpoint port is invalid"
-            )
-        selector = _selector_from_resource_labels(labels)
-        pod_labels = MappingProxyType({**selector, RESOURCE_KIND_LABEL: POD_RESOURCE_KIND})
-        pod_name = _pod_name_from_labels(labels)
-        return KubernetesServingHandle(
-            object_id=pod_name,
-            display_id=pod_name,
-            endpoint_url=(f"http://{service_name}.{self.namespace}.svc.cluster.local:{port}"),
-            labels=pod_labels,
-            uid=None,
-            service_name=service_name,
-            service_uid=_optional_uid(service),
-            native=None,
         )
 
     def _expected_handle_labels(self, handle: KubernetesServingHandle) -> Mapping[str, str]:
@@ -1094,39 +810,6 @@ class KubernetesServingRuntimeAdapter:
         }
         _validate_labels(labels, required_values, resource="handle")
         return MappingProxyType(_selector_from_resource_labels(labels))
-
-    def _managed_service_labels(self, service: object) -> Mapping[str, str]:
-        labels = _resource_labels(service)
-        selector = _selector_from_resource_labels(labels)
-        required = {
-            SERVICE_ID_LABEL,
-            REPLICA_ID_LABEL,
-            PROJECT_ID_LABEL,
-            EXECUTION_ID_LABEL,
-            GENERATION_LABEL,
-            MANAGED_LABEL,
-            CLUSTER_ID_LABEL,
-            WORKER_ID_LABEL,
-            WORKER_SESSION_ID_LABEL,
-            RUNTIME_LABEL,
-            SPEC_HASH_LABEL,
-        }
-        if (
-            any(not selector.get(key) for key in required)
-            or selector.get(MANAGED_LABEL) != "true"
-            or selector.get(CLUSTER_ID_LABEL) != self.cluster_id
-            or selector.get(RUNTIME_LABEL) != RUNTIME_LABEL_VALUE
-            or labels.get(RESOURCE_KIND_LABEL) != SERVICE_RESOURCE_KIND
-        ):
-            raise KubernetesServingOwnershipError(
-                "managed Kubernetes serving Service has incomplete or mismatched fencing labels"
-            )
-        self._validate_observed_service(service, expected_selector=selector)
-        return MappingProxyType(dict(labels))
-
-    @staticmethod
-    def _service_name(handle: KubernetesServingHandle) -> str:
-        return handle.service_name or _service_name_from_labels(handle.labels)
 
     @staticmethod
     def _validate_launch_spec(spec: KubernetesServingLaunchSpec) -> None:
@@ -1174,29 +857,6 @@ def _resource_name(
     return f"{stem}-{digest}"
 
 
-def _service_name_from_labels(labels: Mapping[str, str]) -> str:
-    return _resource_name_from_labels("ss", labels)
-
-
-def _pod_name_from_labels(labels: Mapping[str, str]) -> str:
-    return _resource_name_from_labels("sr", labels)
-
-
-def _resource_name_from_labels(prefix: str, labels: Mapping[str, str]) -> str:
-    try:
-        return _resource_name(
-            prefix,
-            service_id=uuid.UUID(labels[SERVICE_ID_LABEL]),
-            replica_id=uuid.UUID(labels[REPLICA_ID_LABEL]),
-            generation=int(labels[GENERATION_LABEL]),
-            execution_id=uuid.UUID(labels[EXECUTION_ID_LABEL]),
-        )
-    except (KeyError, TypeError, ValueError) as exc:
-        raise KubernetesServingOwnershipError(
-            "Kubernetes serving resource has invalid identity labels"
-        ) from exc
-
-
 def _pod_contract_hash(pod: object) -> str:
     return _canonical_contract_hash(_pod_contract(pod))
 
@@ -1239,11 +899,13 @@ def _pod_contract(pod: object) -> dict[str, object]:
             "automount_service_account_token": getattr(
                 pod_spec, "automount_service_account_token", None
             ),
+            "hostname": getattr(pod_spec, "hostname", None),
             "host_ipc": getattr(pod_spec, "host_ipc", None) is True,
             "host_network": getattr(pod_spec, "host_network", None) is True,
             "host_pid": getattr(pod_spec, "host_pid", None) is True,
             "share_process_namespace": getattr(pod_spec, "share_process_namespace", None) is True,
             "restart_policy": getattr(pod_spec, "restart_policy", None),
+            "subdomain": getattr(pod_spec, "subdomain", None),
             "termination_grace_period_seconds": getattr(
                 pod_spec, "termination_grace_period_seconds", None
             ),
@@ -1381,18 +1043,6 @@ def _volume_sources(volume: object) -> tuple[str, ...]:
             if name != "name" and getattr(volume, str(name), None) is not None
         )
     )
-
-
-def _endpoint_port(endpoint_url: str) -> int:
-    try:
-        port = urlsplit(endpoint_url).port
-    except ValueError as exc:
-        raise KubernetesServingOwnershipError(
-            "Kubernetes serving handle endpoint port is invalid"
-        ) from exc
-    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
-        raise KubernetesServingOwnershipError("Kubernetes serving handle endpoint port is invalid")
-    return port
 
 
 def _fake_inference_command(spec: KubernetesServingLaunchSpec) -> tuple[str, ...]:
