@@ -1,0 +1,64 @@
+invariants:
+  - id: task.single-active-execution
+    description: A task has at most one current execution authorized to mutate runtime state.
+    scope: Task ownership, lease renewal, terminal writes, logs, artifacts, and cleanup.
+    failure_condition: A stale execution successfully renews, completes, or cleans up a replacement.
+    references:
+      - kind: test
+        path: tests/integration/test_worker_session_fencing.py
+  - id: scheduler.unique-gpu-reservation
+    description: A concrete GPU device is reserved by at most one active allocation.
+    scope: Transactional placement, preemption, cancellation, and release.
+    failure_condition: Two active tasks or replicas own the same GPU device reservation.
+    references:
+      - kind: test
+        path: tests/integration/test_gpu_claim_security.py
+  - id: quota.non-negative
+    description: Reserved CPU, memory, GPU, service, and replica counters never become negative.
+    scope: Concurrent claim, release, retry, cancellation, and reconciliation.
+    failure_condition: Any persisted or calculated reserved counter is below zero.
+    references:
+      - kind: test
+        path: tests/property/test_platform_invariants.py
+  - id: project.no-cross-tenant-disclosure
+    description: A project cannot read, infer, or mutate another project's protected resources.
+    scope: API, Gateway, task, service, artifact, secret, and diagnostic access.
+    failure_condition: Cross-project access succeeds or reveals resource existence where 404 is required.
+    references:
+      - kind: test
+        path: tests/integration/test_gateway_project_isolation.py
+  - id: service.desired-actual-convergence
+    description: Reconciliation converges actual healthy replicas to durable desired state.
+    scope: Concurrent reconcilers, failures, scale up/down, and controller restart.
+    failure_condition: Stable prerequisites leave duplicate, missing, or permanently extra replicas.
+    references:
+      - kind: test
+        path: tests/integration/test_service_reconcile_concurrency.py
+  - id: service.adopt-exact-identity
+    description: Controller restart adopts only an exact matching managed resource identity.
+    scope: Pod UID, service, generation, execution, session, image, command, env, and resources.
+    failure_condition: Restart duplicates an exact resource or adopts a drifted workload.
+    references:
+      - kind: test
+        path: tests/unit/test_kubernetes_serving_controller.py
+  - id: service.drain-preserves-active-requests
+    description: Draining replicas reject new traffic and remain until active requests finish or timeout.
+    scope: HTTP, SSE, scale down, graceful deletion, and fenced cleanup.
+    failure_condition: New traffic reaches a draining replica or an active stream is deleted early.
+    references:
+      - kind: test
+        path: tests/e2e/test_kind_serving.py
+  - id: serving.positive-capacity-fails-closed
+    description: Positive desired capacity is rejected when the required serving controller is unavailable.
+    scope: Create and positive scale operations for Kubernetes-backed services.
+    failure_condition: Desired replicas increase without an available controller able to reconcile them.
+    references:
+      - kind: test
+        path: tests/integration/test_services_api.py
+  - id: artifact.integrity-before-ready
+    description: Artifact size and SHA-256 are verified before an artifact becomes ready for use.
+    scope: Upload completion, task input grants, output collection, and cross-project access.
+    failure_condition: Missing, oversized, or checksum-mismatched bytes become ready or executable.
+    references:
+      - kind: test
+        path: tests/unit/test_artifact_service.py

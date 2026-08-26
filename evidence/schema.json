@@ -1,0 +1,286 @@
+{
+  "$defs": {
+    "Claim": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/EvidenceRecord"
+          },
+          "minItems": 1,
+          "title": "Evidence",
+          "type": "array"
+        },
+        "failure_model": {
+          "minLength": 1,
+          "title": "Failure Model",
+          "type": "string"
+        },
+        "id": {
+          "pattern": "^[a-z][a-z0-9_.-]+$",
+          "title": "Id",
+          "type": "string"
+        },
+        "invariant_ids": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Invariant Ids",
+          "type": "array"
+        },
+        "known_limitations": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Known Limitations",
+          "type": "array"
+        },
+        "required_environment_ids": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Required Environment Ids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "description",
+        "invariant_ids",
+        "failure_model",
+        "required_environment_ids",
+        "evidence",
+        "known_limitations"
+      ],
+      "title": "Claim",
+      "type": "object"
+    },
+    "Environment": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "execution": {
+          "minLength": 1,
+          "title": "Execution",
+          "type": "string"
+        },
+        "id": {
+          "pattern": "^[a-z][a-z0-9_.-]+$",
+          "title": "Id",
+          "type": "string"
+        },
+        "level": {
+          "$ref": "#/$defs/EvidenceLevel"
+        },
+        "limitations": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Limitations",
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "description",
+        "level",
+        "execution",
+        "limitations"
+      ],
+      "title": "Environment",
+      "type": "object"
+    },
+    "EvidenceLevel": {
+      "enum": [
+        "UNIT",
+        "INTEGRATION",
+        "DOCKER",
+        "KIND",
+        "REAL_GPU"
+      ],
+      "title": "EvidenceLevel",
+      "type": "string"
+    },
+    "EvidenceRecord": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "minLength": 1,
+          "title": "Command",
+          "type": "string"
+        },
+        "environment_id": {
+          "pattern": "^[a-z][a-z0-9_.-]+$",
+          "title": "Environment Id",
+          "type": "string"
+        },
+        "level": {
+          "$ref": "#/$defs/EvidenceLevel"
+        },
+        "references": {
+          "items": {
+            "$ref": "#/$defs/Reference"
+          },
+          "minItems": 1,
+          "title": "References",
+          "type": "array"
+        },
+        "status": {
+          "$ref": "#/$defs/EvidenceStatus"
+        },
+        "verified_commit": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{7,40}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Verified Commit"
+        }
+      },
+      "required": [
+        "environment_id",
+        "level",
+        "status",
+        "command",
+        "references"
+      ],
+      "title": "EvidenceRecord",
+      "type": "object"
+    },
+    "EvidenceStatus": {
+      "enum": [
+        "PASS",
+        "PENDING",
+        "NOT_RUN",
+        "N/A"
+      ],
+      "title": "EvidenceStatus",
+      "type": "string"
+    },
+    "Invariant": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "failure_condition": {
+          "minLength": 1,
+          "title": "Failure Condition",
+          "type": "string"
+        },
+        "id": {
+          "pattern": "^[a-z][a-z0-9_.-]+$",
+          "title": "Id",
+          "type": "string"
+        },
+        "references": {
+          "items": {
+            "$ref": "#/$defs/Reference"
+          },
+          "minItems": 1,
+          "title": "References",
+          "type": "array"
+        },
+        "scope": {
+          "minLength": 1,
+          "title": "Scope",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "description",
+        "scope",
+        "failure_condition",
+        "references"
+      ],
+      "title": "Invariant",
+      "type": "object"
+    },
+    "Reference": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "test",
+            "command",
+            "document"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "path": {
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "path"
+      ],
+      "title": "Reference",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "claims": {
+      "items": {
+        "$ref": "#/$defs/Claim"
+      },
+      "minItems": 1,
+      "title": "Claims",
+      "type": "array"
+    },
+    "environments": {
+      "items": {
+        "$ref": "#/$defs/Environment"
+      },
+      "minItems": 1,
+      "title": "Environments",
+      "type": "array"
+    },
+    "invariants": {
+      "items": {
+        "$ref": "#/$defs/Invariant"
+      },
+      "minItems": 1,
+      "title": "Invariants",
+      "type": "array"
+    },
+    "schema_version": {
+      "pattern": "^1\\.\\d+\\.\\d+$",
+      "title": "Schema Version",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "environments",
+    "invariants",
+    "claims"
+  ],
+  "title": "EvidenceContract",
+  "type": "object"
+}
