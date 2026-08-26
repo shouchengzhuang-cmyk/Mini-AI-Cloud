@@ -1,0 +1,275 @@
+name: Publish approved release
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: publish-mini-ai-cloud-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      github.event.issue.pull_request == null &&
+      github.event.comment.author_association == 'OWNER' &&
+      github.event.comment.user.login == github.repository_owner &&
+      startsWith(github.event.comment.body, '/publish-release ')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      RELEASE_VERSION: 0.4.0
+      KIND_VERSION: v0.27.0
+      KUBECTL_VERSION: v1.32.2
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Parse explicit owner authorization
+        id: approval
+        shell: bash
+        env:
+          RELEASE_COMMENT: ${{ github.event.comment.body }}
+        run: |
+          set -Eeuo pipefail
+          read -r command version target_sha extra <<<"${RELEASE_COMMENT}"
+          test "${command}" = "/publish-release"
+          test "${version}" = "${RELEASE_VERSION}"
+          test -z "${extra:-}"
+          [[ "${target_sha}" =~ ^[0-9a-f]{40}$ ]]
+          echo "target_sha=${target_sha}" >>"${GITHUB_OUTPUT}"
+          echo "tag=v${version}" >>"${GITHUB_OUTPUT}"
+
+      - name: Record publication start
+        shell: bash
+        run: |
+          gh issue comment "${{ github.event.issue.number }}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --body "Release publication started for Mini AI Cloud v${RELEASE_VERSION} at commit \`${{ steps.approval.outputs.target_sha }}\`. No deployment is performed."
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.approval.outputs.target_sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Verify release target is the current default-branch head
+        shell: bash
+        env:
+          TARGET_SHA: ${{ steps.approval.outputs.target_sha }}
+        run: |
+          set -Eeuo pipefail
+          main_sha="$(git ls-remote origin refs/heads/main | cut -f1)"
+          test "${main_sha}" = "${TARGET_SHA}"
+          test "$(git rev-parse HEAD)" = "${TARGET_SHA}"
+
+      - name: Require successful CI and release security gates for the exact SHA
+        shell: bash
+        env:
+          TARGET_SHA: ${{ steps.approval.outputs.target_sha }}
+        run: |
+          set -Eeuo pipefail
+          require_success() {
+            workflow_name="$1"
+            count="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/actions/runs" \
+              -f head_sha="${TARGET_SHA}" -f per_page=100 \
+              --jq "[.workflow_runs[] | select(.name == \"${workflow_name}\" and .conclusion == \"success\")] | length")"
+            test "${count}" -ge 1 || {
+              echo "No successful ${workflow_name} run found for ${TARGET_SHA}" >&2
+              exit 1
+            }
+          }
+          require_success "CI"
+          require_success "Release security gates"
+
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version-file: .python-version
+
+      - name: Install locked dependencies
+        run: uv sync --frozen --all-groups
+
+      - name: Install pinned Kind and kubectl
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          tool_dir="${RUNNER_TEMP}/release-tools"
+          mkdir -p "${tool_dir}"
+          case "$(dpkg --print-architecture)" in
+            amd64) tool_arch=amd64 ;;
+            arm64) tool_arch=arm64 ;;
+            *) echo "Unsupported runner architecture" >&2; exit 1 ;;
+          esac
+
+          kind_asset="kind-linux-${tool_arch}"
+          kind_url="https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output "${tool_dir}/${kind_asset}" "${kind_url}/${kind_asset}"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output "${tool_dir}/${kind_asset}.sha256sum" \
+            "${kind_url}/${kind_asset}.sha256sum"
+          (cd "${tool_dir}" && sha256sum --check "${kind_asset}.sha256sum")
+          mv "${tool_dir}/${kind_asset}" "${tool_dir}/kind"
+
+          kubectl_url="https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${tool_arch}"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output "${tool_dir}/kubectl" "${kubectl_url}/kubectl"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output "${tool_dir}/kubectl.sha256" "${kubectl_url}/kubectl.sha256"
+          echo "$(cat "${tool_dir}/kubectl.sha256")  ${tool_dir}/kubectl" | sha256sum --check
+          chmod 0755 "${tool_dir}/kind" "${tool_dir}/kubectl"
+          echo "${tool_dir}" >>"${GITHUB_PATH}"
+
+      - name: Run complete release gate including real Kind acceptance
+        run: make test-release
+
+      - name: Run bounded restart and fencing soak
+        env:
+          CONFIRM_SOAK: "YES"
+          SOAK_ROUNDS: "3"
+        run: make test-soak
+
+      - name: Run isolated destructive disaster-recovery rehearsal
+        env:
+          CONFIRM_DR: "YES"
+        run: make test-dr
+
+      - name: Scan Git history for secrets
+        uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Scan repository dependencies, secrets and misconfiguration
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - name: Scan release candidate container
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: mini-ai-cloud:release-gate
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - name: Generate image SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: mini-ai-cloud:release-gate
+          format: spdx-json
+          output-file: build/mini-ai-cloud-image.spdx.json
+          upload-artifact: false
+
+      - name: Prepare deterministic release assets and final notes
+        shell: bash
+        env:
+          TARGET_SHA: ${{ steps.approval.outputs.target_sha }}
+        run: |
+          set -Eeuo pipefail
+          release_dir="build/release/${TARGET_SHA}"
+          evidence_dir="build/evidence/${TARGET_SHA}"
+          test -f "${release_dir}/release-notes.md"
+          test -f "${release_dir}/release-preparation.json"
+          test -f "${release_dir}/cyclonedx-sbom.json"
+          test -f "${release_dir}/SHA256SUMS"
+          test -f "${evidence_dir}/manifest.json"
+          test -n "$(find build/release-wheel -maxdepth 1 -name 'mini_ai_cloud-*.whl' -print -quit)"
+
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          sha = os.environ["TARGET_SHA"]
+          source = Path("build/release") / sha / "release-notes.md"
+          text = source.read_text(encoding="utf-8")
+          text = text.replace(
+              "This file prepares release notes; it does **not** create a GitHub Release or deploy anything.",
+              "This GitHub Release was created by the repository's owner-approved publication workflow. It does **not** deploy anything.",
+          )
+          text = text.replace("GitHub Release: **NOT CREATED**.", "GitHub Release: **CREATED BY APPROVED WORKFLOW**.")
+          text += "\n## Publication record\n\n"
+          text += f"- Published from exact default-branch commit: `{sha}`\n"
+          text += "- Real NVIDIA/vLLM GPU acceptance: **NOT RUN**.\n"
+          text += "- Production deployment: **NOT DEPLOYED**.\n"
+          text += "- Bounded soak, isolated DR rehearsal, real PostgreSQL tests, Docker gates and real Kind acceptance were rerun before publication.\n"
+          Path("build/final-release-notes.md").write_text(text, encoding="utf-8", newline="\n")
+          PY
+
+          tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+            -czf "build/mini-ai-cloud-v${RELEASE_VERSION}-evidence.tar.gz" \
+            -C build "evidence/${TARGET_SHA}" "release/${TARGET_SHA}"
+
+          sha256sum \
+            build/release-wheel/mini_ai_cloud-*.whl \
+            "build/mini-ai-cloud-v${RELEASE_VERSION}-evidence.tar.gz" \
+            build/mini-ai-cloud-image.spdx.json \
+            "${release_dir}/cyclonedx-sbom.json" \
+            "${release_dir}/release-preparation.json" \
+            >build/release-assets.sha256
+
+      - name: Create or repair the exact release tag and GitHub Release
+        shell: bash
+        env:
+          TARGET_SHA: ${{ steps.approval.outputs.target_sha }}
+          RELEASE_TAG: ${{ steps.approval.outputs.tag }}
+        run: |
+          set -Eeuo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --force --tags origin
+
+          if git show-ref --verify --quiet "refs/tags/${RELEASE_TAG}"; then
+            test "$(git rev-list -n1 "${RELEASE_TAG}")" = "${TARGET_SHA}"
+          else
+            git tag -a "${RELEASE_TAG}" "${TARGET_SHA}" -m "Mini AI Cloud ${RELEASE_TAG}"
+            git push origin "refs/tags/${RELEASE_TAG}"
+          fi
+
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+              --title "Mini AI Cloud ${RELEASE_TAG}" \
+              --notes-file build/final-release-notes.md \
+              --latest
+          else
+            gh release create "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag \
+              --title "Mini AI Cloud ${RELEASE_TAG}" \
+              --notes-file build/final-release-notes.md \
+              --latest
+          fi
+
+          gh release upload "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --clobber \
+            build/release-wheel/mini_ai_cloud-*.whl \
+            "build/mini-ai-cloud-v${RELEASE_VERSION}-evidence.tar.gz" \
+            build/mini-ai-cloud-image.spdx.json \
+            "build/release/${TARGET_SHA}/cyclonedx-sbom.json" \
+            "build/release/${TARGET_SHA}/release-preparation.json" \
+            "build/release/${TARGET_SHA}/SHA256SUMS" \
+            build/release-assets.sha256
+
+      - name: Record successful publication
+        if: success()
+        shell: bash
+        run: |
+          gh issue comment "${{ github.event.issue.number }}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --body "✅ Published Mini AI Cloud v${RELEASE_VERSION} from \`${{ steps.approval.outputs.target_sha }}\` with wheel, SBOMs and commit-bound evidence. Production deployment remains **NOT DEPLOYED**; real NVIDIA/vLLM acceptance remains **NOT RUN**."
+
+      - name: Record publication failure
+        if: failure()
+        shell: bash
+        run: |
+          gh issue comment "${{ github.event.issue.number }}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --body "❌ Mini AI Cloud v${RELEASE_VERSION} publication failed. No production deployment was attempted. Inspect workflow run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} before retrying the same owner authorization command."
