@@ -1,0 +1,1048 @@
+{
+  "cli": {
+    "commands": {
+      "admin": {
+        "commands": {
+          "doctor": {
+            "commands": {},
+            "deprecated": false,
+            "name": "doctor",
+            "parameters": [
+              {
+                "kind": "TyperOption",
+                "name": "limit",
+                "nargs": 1,
+                "options": [
+                  "--limit"
+                ],
+                "required": false,
+                "type": "int range"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "repair",
+                "nargs": 1,
+                "options": [
+                  "--repair"
+                ],
+                "required": false,
+                "type": "boolean"
+              }
+            ]
+          }
+        },
+        "deprecated": false,
+        "name": "admin",
+        "parameters": []
+      },
+      "auth": {
+        "commands": {
+          "login": {
+            "commands": {},
+            "deprecated": false,
+            "name": "login",
+            "parameters": [
+              {
+                "kind": "TyperOption",
+                "name": "api_key",
+                "nargs": 1,
+                "options": [
+                  "--api-key"
+                ],
+                "required": false,
+                "type": "str"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "url",
+                "nargs": 1,
+                "options": [
+                  "--url"
+                ],
+                "required": false,
+                "type": "str"
+              }
+            ]
+          }
+        },
+        "deprecated": false,
+        "name": "auth",
+        "parameters": []
+      },
+      "cancel": {
+        "commands": {},
+        "deprecated": false,
+        "name": "cancel",
+        "parameters": [
+          {
+            "kind": "TyperArgument",
+            "name": "task_id",
+            "nargs": 1,
+            "options": [],
+            "required": true,
+            "type": "str"
+          }
+        ]
+      },
+      "demo": {
+        "commands": {
+          "all": {
+            "commands": {},
+            "deprecated": false,
+            "name": "all",
+            "parameters": [
+              {
+                "kind": "TyperOption",
+                "name": "output_dir",
+                "nargs": 1,
+                "options": [
+                  "--output-dir"
+                ],
+                "required": false,
+                "type": "path"
+              }
+            ]
+          },
+          "controller-adoption": {
+            "commands": {},
+            "deprecated": false,
+            "name": "controller-adoption",
+            "parameters": [
+              {
+                "kind": "TyperOption",
+                "name": "output_dir",
+                "nargs": 1,
+                "options": [
+                  "--output-dir"
+                ],
+                "required": false,
+                "type": "path"
+              }
+            ]
+          },
+          "fencing": {
+            "commands": {},
+            "deprecated": false,
+            "name": "fencing",
+            "parameters": [
+              {
+                "kind": "TyperOption",
+                "name": "output_dir",
+                "nargs": 1,
+                "options": [
+                  "--output-dir"
+                ],
+                "required": false,
+                "type": "path"
+              }
+            ]
+          },
+          "sse-drain": {
+            "commands": {},
+            "deprecated": false,
+            "name": "sse-drain",
+            "parameters": [
+              {
+                "kind": "TyperOption",
+                "name": "output_dir",
+                "nargs": 1,
+                "options": [
+                  "--output-dir"
+                ],
+                "required": false,
+                "type": "path"
+              }
+            ]
+          }
+        },
+        "deprecated": false,
+        "name": "demo",
+        "parameters": []
+      },
+      "evidence": {
+        "commands": {
+          "collect": {
+            "commands": {},
+            "deprecated": false,
+            "name": "collect",
+            "parameters": [
+              {
+                "kind": "TyperOption",
+                "name": "allow_dirty",
+                "nargs": 1,
+                "options": [
+                  "--allow-dirty"
+                ],
+                "required": false,
+                "type": "boolean"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "deployment_status",
+                "nargs": 1,
+                "options": [
+                  "--deployment-status"
+                ],
+                "required": false,
+                "type": "str"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "output_dir",
+                "nargs": 1,
+                "options": [
+                  "--output-dir"
+                ],
+                "required": false,
+                "type": "path"
+              }
+            ]
+          }
+        },
+        "deprecated": false,
+        "name": "evidence",
+        "parameters": []
+      },
+      "logs": {
+        "commands": {},
+        "deprecated": false,
+        "name": "logs",
+        "parameters": [
+          {
+            "kind": "TyperOption",
+            "name": "follow",
+            "nargs": 1,
+            "options": [
+              "--follow"
+            ],
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "kind": "TyperArgument",
+            "name": "task_id",
+            "nargs": 1,
+            "options": [],
+            "required": true,
+            "type": "str"
+          }
+        ]
+      },
+      "project": {
+        "commands": {
+          "create": {
+            "commands": {},
+            "deprecated": false,
+            "name": "create",
+            "parameters": [
+              {
+                "kind": "TyperOption",
+                "name": "name",
+                "nargs": 1,
+                "options": [
+                  "--name"
+                ],
+                "required": true,
+                "type": "str"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "slug",
+                "nargs": 1,
+                "options": [
+                  "--slug"
+                ],
+                "required": true,
+                "type": "str"
+              }
+            ]
+          },
+          "list": {
+            "commands": {},
+            "deprecated": false,
+            "name": "list",
+            "parameters": [
+              {
+                "kind": "TyperOption",
+                "name": "limit",
+                "nargs": 1,
+                "options": [
+                  "--limit"
+                ],
+                "required": false,
+                "type": "int range"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "offset",
+                "nargs": 1,
+                "options": [
+                  "--offset"
+                ],
+                "required": false,
+                "type": "int range"
+              }
+            ]
+          }
+        },
+        "deprecated": false,
+        "name": "project",
+        "parameters": []
+      },
+      "service": {
+        "commands": {
+          "deploy": {
+            "commands": {},
+            "deprecated": false,
+            "name": "deploy",
+            "parameters": [
+              {
+                "kind": "TyperOption",
+                "name": "autoscaling",
+                "nargs": 1,
+                "options": [
+                  "--autoscaling",
+                  "--no-autoscaling"
+                ],
+                "required": false,
+                "type": "boolean"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "cooldown_seconds",
+                "nargs": 1,
+                "options": [
+                  "--cooldown-seconds"
+                ],
+                "required": false,
+                "type": "int range"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "cpu_millicores",
+                "nargs": 1,
+                "options": [
+                  "--cpu-millicores"
+                ],
+                "required": false,
+                "type": "int range"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "dtype",
+                "nargs": 1,
+                "options": [
+                  "--dtype"
+                ],
+                "required": false,
+                "type": "str"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "gpu_count",
+                "nargs": 1,
+                "options": [
+                  "--gpu-count"
+                ],
+                "required": false,
+                "type": "int range"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "gpu_memory_mb",
+                "nargs": 1,
+                "options": [
+                  "--gpu-memory-mb"
+                ],
+                "required": false,
+                "type": "int range"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "gpu_memory_utilization",
+                "nargs": 1,
+                "options": [
+                  "--gpu-memory-utilization"
+                ],
+                "required": false,
+                "type": "float range"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "gpu_model",
+                "nargs": 1,
+                "options": [
+                  "--gpu-model"
+                ],
+                "required": false,
+                "type": "str"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "image",
+                "nargs": 1,
+                "options": [
+                  "--image"
+                ],
+                "required": false,
+                "type": "str"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "max_model_len",
+                "nargs": 1,
+                "options": [
+                  "--max-model-len"
+                ],
+                "required": false,
+                "type": "int range"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "max_replicas",
+                "nargs": 1,
+                "options": [
+                  "--max-replicas"
+                ],
+                "required": false,
+                "type": "int range"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "memory_mb",
+                "nargs": 1,
+                "options": [
+                  "--memory-mb"
+                ],
+                "required": false,
+                "type": "int range"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "min_replicas",
+                "nargs": 1,
+                "options": [
+                  "--min-replicas"
+                ],
+                "required": false,
+                "type": "int range"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "model",
+                "nargs": 1,
+                "options": [
+                  "--model"
+                ],
+                "required": false,
+                "type": "str"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "model_revision",
+                "nargs": 1,
+                "options": [
+                  "--model-revision"
+                ],
+                "required": false,
+                "type": "str"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "name",
+                "nargs": 1,
+                "options": [
+                  "--name"
+                ],
+                "required": true,
+                "type": "str"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "registered_model_id",
+                "nargs": 1,
+                "options": [
+                  "--registered-model-id"
+                ],
+                "required": false,
+                "type": "str"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "replicas",
+                "nargs": 1,
+                "options": [
+                  "--replicas"
+                ],
+                "required": false,
+                "type": "int range"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "runtime",
+                "nargs": 1,
+                "options": [
+                  "--runtime"
+                ],
+                "required": false,
+                "type": "str"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "runtime_type",
+                "nargs": 1,
+                "options": [
+                  "--runtime-type"
+                ],
+                "required": false,
+                "type": "str"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "target_concurrency",
+                "nargs": 1,
+                "options": [
+                  "--target-concurrency"
+                ],
+                "required": false,
+                "type": "int range"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "tensor_parallel_size",
+                "nargs": 1,
+                "options": [
+                  "--tensor-parallel-size"
+                ],
+                "required": false,
+                "type": "int range"
+              }
+            ]
+          },
+          "list": {
+            "commands": {},
+            "deprecated": false,
+            "name": "list",
+            "parameters": [
+              {
+                "kind": "TyperOption",
+                "name": "limit",
+                "nargs": 1,
+                "options": [
+                  "--limit"
+                ],
+                "required": false,
+                "type": "int range"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "offset",
+                "nargs": 1,
+                "options": [
+                  "--offset"
+                ],
+                "required": false,
+                "type": "int range"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "service_status",
+                "nargs": 1,
+                "options": [
+                  "--status"
+                ],
+                "required": false,
+                "type": "str"
+              }
+            ]
+          },
+          "scale": {
+            "commands": {},
+            "deprecated": false,
+            "name": "scale",
+            "parameters": [
+              {
+                "kind": "TyperOption",
+                "name": "replicas",
+                "nargs": 1,
+                "options": [
+                  "--replicas"
+                ],
+                "required": true,
+                "type": "int range"
+              },
+              {
+                "kind": "TyperArgument",
+                "name": "service_id",
+                "nargs": 1,
+                "options": [],
+                "required": true,
+                "type": "str"
+              }
+            ]
+          },
+          "stop": {
+            "commands": {},
+            "deprecated": false,
+            "name": "stop",
+            "parameters": [
+              {
+                "kind": "TyperArgument",
+                "name": "service_id",
+                "nargs": 1,
+                "options": [],
+                "required": true,
+                "type": "str"
+              }
+            ]
+          }
+        },
+        "deprecated": false,
+        "name": "service",
+        "parameters": []
+      },
+      "status": {
+        "commands": {},
+        "deprecated": false,
+        "name": "status",
+        "parameters": [
+          {
+            "kind": "TyperArgument",
+            "name": "task_id",
+            "nargs": 1,
+            "options": [],
+            "required": true,
+            "type": "str"
+          }
+        ]
+      },
+      "submit": {
+        "commands": {},
+        "deprecated": false,
+        "name": "submit",
+        "parameters": [
+          {
+            "kind": "TyperOption",
+            "name": "command",
+            "nargs": 1,
+            "options": [
+              "--command"
+            ],
+            "required": true,
+            "type": "str"
+          },
+          {
+            "kind": "TyperOption",
+            "name": "cpu_limit",
+            "nargs": 1,
+            "options": [
+              "--cpu-limit"
+            ],
+            "required": false,
+            "type": "float range"
+          },
+          {
+            "kind": "TyperOption",
+            "name": "environment",
+            "nargs": 1,
+            "options": [
+              "--env"
+            ],
+            "required": false,
+            "type": "str"
+          },
+          {
+            "kind": "TyperOption",
+            "name": "gpu_count",
+            "nargs": 1,
+            "options": [
+              "--gpu-count"
+            ],
+            "required": false,
+            "type": "int range"
+          },
+          {
+            "kind": "TyperOption",
+            "name": "idempotency_key",
+            "nargs": 1,
+            "options": [
+              "--idempotency-key"
+            ],
+            "required": false,
+            "type": "str"
+          },
+          {
+            "kind": "TyperOption",
+            "name": "image",
+            "nargs": 1,
+            "options": [
+              "--image"
+            ],
+            "required": true,
+            "type": "str"
+          },
+          {
+            "kind": "TyperOption",
+            "name": "label",
+            "nargs": 1,
+            "options": [
+              "--label"
+            ],
+            "required": false,
+            "type": "str"
+          },
+          {
+            "kind": "TyperOption",
+            "name": "max_retries",
+            "nargs": 1,
+            "options": [
+              "--max-retries"
+            ],
+            "required": false,
+            "type": "int range"
+          },
+          {
+            "kind": "TyperOption",
+            "name": "memory_limit_mb",
+            "nargs": 1,
+            "options": [
+              "--memory-limit-mb"
+            ],
+            "required": false,
+            "type": "int range"
+          },
+          {
+            "kind": "TyperOption",
+            "name": "network_enabled",
+            "nargs": 1,
+            "options": [
+              "--network-enabled",
+              "--no-network-enabled"
+            ],
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "kind": "TyperOption",
+            "name": "timeout_seconds",
+            "nargs": 1,
+            "options": [
+              "--timeout-seconds"
+            ],
+            "required": false,
+            "type": "int range"
+          }
+        ]
+      },
+      "task": {
+        "commands": {
+          "cancel": {
+            "commands": {},
+            "deprecated": false,
+            "name": "cancel",
+            "parameters": [
+              {
+                "kind": "TyperArgument",
+                "name": "task_id",
+                "nargs": 1,
+                "options": [],
+                "required": true,
+                "type": "str"
+              }
+            ]
+          },
+          "explain": {
+            "commands": {},
+            "deprecated": false,
+            "name": "explain",
+            "parameters": [
+              {
+                "kind": "TyperArgument",
+                "name": "task_id",
+                "nargs": 1,
+                "options": [],
+                "required": true,
+                "type": "str"
+              }
+            ]
+          },
+          "list": {
+            "commands": {},
+            "deprecated": false,
+            "name": "list",
+            "parameters": [
+              {
+                "kind": "TyperOption",
+                "name": "limit",
+                "nargs": 1,
+                "options": [
+                  "--limit"
+                ],
+                "required": false,
+                "type": "int range"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "offset",
+                "nargs": 1,
+                "options": [
+                  "--offset"
+                ],
+                "required": false,
+                "type": "int range"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "task_status",
+                "nargs": 1,
+                "options": [
+                  "--status"
+                ],
+                "required": false,
+                "type": "str"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "worker_id",
+                "nargs": 1,
+                "options": [
+                  "--worker-id"
+                ],
+                "required": false,
+                "type": "str"
+              }
+            ]
+          },
+          "logs": {
+            "commands": {},
+            "deprecated": false,
+            "name": "logs",
+            "parameters": [
+              {
+                "kind": "TyperOption",
+                "name": "follow",
+                "nargs": 1,
+                "options": [
+                  "--follow"
+                ],
+                "required": false,
+                "type": "boolean"
+              },
+              {
+                "kind": "TyperArgument",
+                "name": "task_id",
+                "nargs": 1,
+                "options": [],
+                "required": true,
+                "type": "str"
+              }
+            ]
+          },
+          "submit": {
+            "commands": {},
+            "deprecated": false,
+            "name": "submit",
+            "parameters": [
+              {
+                "kind": "TyperOption",
+                "name": "command",
+                "nargs": 1,
+                "options": [
+                  "--command"
+                ],
+                "required": true,
+                "type": "str"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "cpu_limit",
+                "nargs": 1,
+                "options": [
+                  "--cpu-limit"
+                ],
+                "required": false,
+                "type": "float range"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "environment",
+                "nargs": 1,
+                "options": [
+                  "--env"
+                ],
+                "required": false,
+                "type": "str"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "gpu_count",
+                "nargs": 1,
+                "options": [
+                  "--gpu-count"
+                ],
+                "required": false,
+                "type": "int range"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "idempotency_key",
+                "nargs": 1,
+                "options": [
+                  "--idempotency-key"
+                ],
+                "required": false,
+                "type": "str"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "image",
+                "nargs": 1,
+                "options": [
+                  "--image"
+                ],
+                "required": true,
+                "type": "str"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "label",
+                "nargs": 1,
+                "options": [
+                  "--label"
+                ],
+                "required": false,
+                "type": "str"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "max_retries",
+                "nargs": 1,
+                "options": [
+                  "--max-retries"
+                ],
+                "required": false,
+                "type": "int range"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "memory_limit_mb",
+                "nargs": 1,
+                "options": [
+                  "--memory-limit-mb"
+                ],
+                "required": false,
+                "type": "int range"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "network_enabled",
+                "nargs": 1,
+                "options": [
+                  "--network-enabled",
+                  "--no-network-enabled"
+                ],
+                "required": false,
+                "type": "boolean"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "timeout_seconds",
+                "nargs": 1,
+                "options": [
+                  "--timeout-seconds"
+                ],
+                "required": false,
+                "type": "int range"
+              }
+            ]
+          }
+        },
+        "deprecated": false,
+        "name": "task",
+        "parameters": []
+      },
+      "usage": {
+        "commands": {},
+        "deprecated": false,
+        "name": "usage",
+        "parameters": [
+          {
+            "kind": "TyperOption",
+            "name": "from_time",
+            "nargs": 1,
+            "options": [
+              "--from"
+            ],
+            "required": false,
+            "type": "str"
+          },
+          {
+            "kind": "TyperOption",
+            "name": "project_id",
+            "nargs": 1,
+            "options": [
+              "--project-id"
+            ],
+            "required": false,
+            "type": "str"
+          },
+          {
+            "kind": "TyperOption",
+            "name": "to_time",
+            "nargs": 1,
+            "options": [
+              "--to"
+            ],
+            "required": false,
+            "type": "str"
+          }
+        ]
+      },
+      "worker": {
+        "commands": {
+          "list": {
+            "commands": {},
+            "deprecated": false,
+            "name": "list",
+            "parameters": []
+          }
+        },
+        "deprecated": false,
+        "name": "worker",
+        "parameters": []
+      },
+      "workers": {
+        "commands": {},
+        "deprecated": false,
+        "name": "workers",
+        "parameters": []
+      }
+    },
+    "deprecated": false,
+    "name": "",
+    "parameters": [
+      {
+        "kind": "TyperOption",
+        "name": "install_completion",
+        "nargs": 1,
+        "options": [
+          "--install-completion"
+        ],
+        "required": false,
+        "type": "boolean"
+      },
+      {
+        "kind": "TyperOption",
+        "name": "show_completion",
+        "nargs": 1,
+        "options": [
+          "--show-completion"
+        ],
+        "required": false,
+        "type": "boolean"
+      }
+    ]
+  },
+  "release_version": "0.4.0",
+  "schema_version": "1.0.0"
+}

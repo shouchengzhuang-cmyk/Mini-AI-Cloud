@@ -3,7 +3,7 @@
 from importlib.metadata import PackageNotFoundError, version
 
 PROJECT_NAME = "mini-ai-cloud"
-DEVELOPMENT_VERSION = "0.4.0.dev0"
+DEVELOPMENT_VERSION = "0.4.0"
 
 try:
     PROJECT_VERSION = version(PROJECT_NAME)
