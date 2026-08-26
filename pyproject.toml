@@ -7,6 +7,8 @@ name = "mini-ai-cloud"
 version = "0.4.0.dev0"
 description = "Evidence-driven control plane for reliable AI workload scheduling and serving"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12,<3.15"
 dependencies = [
   "alembic>=1.14,<2",
@@ -46,6 +48,11 @@ dev = [
 [project.scripts]
 mini-cloud = "cli.__main__:main"
 mini-docker-cloud = "cli.__main__:legacy_main"
+
+[project.urls]
+Repository = "https://github.com/shouchengzhuang-cmyk/Mini-AI-Cloud"
+Issues = "https://github.com/shouchengzhuang-cmyk/Mini-AI-Cloud/issues"
+Security = "https://github.com/shouchengzhuang-cmyk/Mini-AI-Cloud/security/policy"
 
 [tool.hatch.build.targets.wheel]
 packages = ["api", "cli", "core", "models", "repositories", "scheduler", "worker"]

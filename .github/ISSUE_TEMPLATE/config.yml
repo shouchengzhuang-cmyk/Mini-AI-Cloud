@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Private security report
+    url: https://github.com/shouchengzhuang-cmyk/Mini-AI-Cloud/security/advisories/new
+    about: 请在此私下报告未修复的安全漏洞。

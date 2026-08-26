@@ -189,8 +189,15 @@ Kubernetes Pod、readiness、drain、恢复与 Kind 命令见 [Phase IV-A Kubern
 - [Phase IV-A Kubernetes 原生模型服务](docs/phase4-kubernetes-serving.md)
 - [Phase IV-A 验证报告](docs/verification-report-phase4a-2026-08-24.md)
 - [PostgreSQL hot-path 实测审计](docs/sql-review.md)
+- [证据与能力声明规范](docs/claim-policy.md)
+- [版本、发布与弃用策略](docs/release-policy.md)
+- [建议的 GitHub 仓库元数据](docs/repository-metadata.md)
 
 FastAPI 交互文档位于 `http://localhost:8000/docs`，OpenAPI JSON 位于 `http://localhost:8000/openapi.json`。
+
+## 参与与发布
+
+提交改动前请阅读 [贡献指南](CONTRIBUTING.md) 与 [安全策略](SECURITY.md)。版本变化记录在 [CHANGELOG](CHANGELOG.md)，优先级与证据边界见 [ROADMAP](ROADMAP.md)；仓库采用 [MIT License](LICENSE)。PR 必须明确变更、非目标、验证、风险和 `REAL` / `SIMULATED` / `NOT RUN` 证据，不把未执行或模拟结果写成真实环境通过。
 
 ## 安全边界
 
