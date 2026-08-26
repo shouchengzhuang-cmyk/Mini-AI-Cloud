@@ -139,6 +139,10 @@ jobs:
           CONFIRM_DR: "YES"
         run: make test-dr
 
+      - name: Ensure dedicated Kind cluster and local credentials are absent
+        if: always()
+        run: make kind-serving-down
+
       - name: Scan Git history for secrets
         uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
         env:
@@ -184,6 +188,8 @@ jobs:
           test -f "${release_dir}/cyclonedx-sbom.json"
           test -f "${release_dir}/SHA256SUMS"
           test -f "${evidence_dir}/manifest.json"
+          test -n "$(find build/soak -type f -print -quit)"
+          test -n "$(find build/dr-rehearsal -type f -print -quit)"
           test -n "$(find build/release-wheel -maxdepth 1 -name 'mini_ai_cloud-*.whl' -print -quit)"
 
           python - <<'PY'
@@ -208,7 +214,7 @@ jobs:
 
           tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
             -czf "build/mini-ai-cloud-v${RELEASE_VERSION}-evidence.tar.gz" \
-            -C build "evidence/${TARGET_SHA}" "release/${TARGET_SHA}"
+            -C build "evidence/${TARGET_SHA}" "release/${TARGET_SHA}" soak dr-rehearsal
 
           sha256sum \
             build/release-wheel/mini_ai_cloud-*.whl \
