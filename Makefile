@@ -14,7 +14,8 @@ BACKUP_OUTPUT_DIR ?= build/backups
 .PHONY: help install format lint typecheck validate-evidence test test-unit test-integration test-docker \
 	test-e2e test-serving check config build up down ps logs migrate migrate-local run-api run-worker \
 	load-test dev observability test-chaos test-k8s kind-up kind-down kind-serving-up \
-	test-kind-serving kind-serving-down benchmark backup restore
+	test-kind-serving kind-serving-down demo-fencing demo-adoption demo-sse-drain demo-all \
+	benchmark backup restore
 
 help: ## Show available targets.
 	@awk 'BEGIN {FS = ":.*## "; printf "Usage: make <target>\n\n"} \
@@ -121,6 +122,18 @@ test-kind-serving: ## Run the mandatory real Kubernetes serving E2E against Kind
 
 kind-serving-down: ## Delete only the Phase IV-A Kind cluster and local credentials.
 	bash scripts/kind_serving.sh down
+
+demo-fencing: ## Run the stale worker/execution fencing hero scenario.
+	$(UV) run mini-cloud demo fencing
+
+demo-adoption: ## Run controller restart adoption against an isolated Kind cluster.
+	$(UV) run mini-cloud demo controller-adoption
+
+demo-sse-drain: ## Run active SSE drain against an isolated Kind cluster.
+	$(UV) run mini-cloud demo sse-drain
+
+demo-all: ## Run all hero scenarios and clean the isolated Kind cluster.
+	$(UV) run mini-cloud demo all
 
 benchmark: ## Compare binpack/spread on 100 workers, 4 GPUs each, and 10000 jobs.
 	$(UV) run python -m scripts.scheduler_simulation \
