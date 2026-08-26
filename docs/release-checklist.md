@@ -16,6 +16,8 @@ deployment.
 - [ ] `uv lock --check`, Ruff, mypy and pytest pass.
 - [ ] PostgreSQL integration, Docker configuration, wheel install and container smoke pass.
 - [ ] Real Kind serving acceptance passes and cleans its dedicated cluster and credentials.
+- [ ] CI/default Kind runs keep `KIND_SERVING_PULL=true`; an explicitly offline local rerun may use
+  `KIND_SERVING_PULL=false` only after the fixed base, PostgreSQL and Redis images are cached.
 - [ ] All third-party GitHub Actions use full immutable commit SHAs.
 - [ ] Dependency Review, Gitleaks and Trivy filesystem/container scans pass.
 - [ ] CycloneDX and image SPDX SBOM artifacts are non-empty and retained.

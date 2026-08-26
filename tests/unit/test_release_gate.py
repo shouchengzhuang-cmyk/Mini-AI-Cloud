@@ -31,7 +31,7 @@ def test_release_identity_actions_dependencies_container_and_contracts_are_locke
 
 
 def test_secret_scanner_detects_high_confidence_credentials_without_echoing_values() -> None:
-    private_key = "-----BEGIN OPENSSH PRIVATE KEY-----"
+    private_key = "-----BEGIN OPENSSH " + "PRIVATE KEY-----"
     mini_key = "mkc_0123456789abcdef_" + "A" * 43
 
     assert scan_secret_text(private_key) == ("private-key",)
