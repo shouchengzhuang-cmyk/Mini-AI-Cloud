@@ -216,6 +216,8 @@ def validate_container_baseline(root: Path) -> None:
     dockerfile = (root / "docker/Dockerfile").read_text(encoding="utf-8")
     if "USER 10001:10001" not in dockerfile:
         raise ReleaseGateError("runtime image must use the non-root 10001:10001 user")
+    if dockerfile.count("python -m pip uninstall --yes pip") != 2:
+        raise ReleaseGateError("builder and runtime images must remove pip before release")
     if re.search(r"^FROM\s+\S+:latest(?:\s|$)", dockerfile, re.MULTILINE):
         raise ReleaseGateError("Dockerfile must not use a latest base tag")
     if re.search(
