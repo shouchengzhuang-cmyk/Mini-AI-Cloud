@@ -15,7 +15,7 @@ BACKUP_OUTPUT_DIR ?= build/backups
 	test-e2e test-serving check config build up down ps logs migrate migrate-local run-api run-worker \
 	load-test dev observability test-chaos test-k8s kind-up kind-down kind-serving-up \
 	test-kind-serving kind-serving-down demo-fencing demo-adoption demo-sse-drain demo-all \
-	test-soak benchmark backup restore
+	test-soak test-dr benchmark backup restore
 
 help: ## Show available targets.
 	@awk 'BEGIN {FS = ":.*## "; printf "Usage: make <target>\n\n"} \
@@ -156,3 +156,7 @@ restore: ## Restore BACKUP into the dedicated local stack; requires CONFIRM_REST
 	@test "$(CONFIRM_RESTORE)" = "YES" || { echo "CONFIRM_RESTORE=YES is required" >&2; exit 2; }
 	bash scripts/restore.sh --local-stack --confirm-overwrite \
 		--project-name $(LOCAL_STACK_PROJECT) --backup-dir "$(BACKUP)"
+
+test-dr: ## Run isolated destructive DR rehearsal; requires CONFIRM_DR=YES.
+	@test "$(CONFIRM_DR)" = "YES" || { echo "CONFIRM_DR=YES is required" >&2; exit 2; }
+	$(UV) run python scripts/dr_rehearsal.py

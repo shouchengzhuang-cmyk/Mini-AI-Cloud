@@ -1,0 +1,44 @@
+name: Destructive DR rehearsal
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type YES to run the isolated destructive rehearsal
+        required: true
+        default: "NO"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: destructive-dr-rehearsal
+  cancel-in-progress: false
+
+jobs:
+  dr:
+    if: github.event.inputs.confirm == 'YES'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CONFIRM_DR: YES
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+      - name: Install locked dependencies
+        run: uv sync --frozen --all-groups
+      - name: Run isolated destructive backup and restore
+        run: make test-dr
+      - name: Upload redacted DR evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dr-rehearsal-${{ github.run_id }}
+          path: build/dr-rehearsal
+          if-no-files-found: error
+          retention-days: 14

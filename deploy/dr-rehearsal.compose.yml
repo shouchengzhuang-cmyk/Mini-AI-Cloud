@@ -1,0 +1,75 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: task_platform
+      POSTGRES_USER: task
+      POSTGRES_PASSWORD: local-dr-only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U task -d task_platform"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    security_opt:
+      - no-new-privileges:true
+
+  migrate:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: mini-ai-cloud:dr-rehearsal
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://task:local-dr-only@postgres:5432/task_platform
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+
+  artifact-init:
+    image: alpine:3.21
+    profiles: ["dr-tools"]
+    command: ["sh", "-ec", "mkdir -p /artifacts && chown 10001:10001 /artifacts"]
+    user: "0:0"
+    volumes:
+      - artifact-data:/artifacts
+    restart: "no"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+    cap_add: ["CHOWN"]
+
+  dr-tool:
+    image: mini-ai-cloud:dr-rehearsal
+    profiles: ["dr-tools"]
+    command: ["python", "scripts/dr_marker.py", "verify"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://task:local-dr-only@postgres:5432/task_platform
+      ARTIFACT_LOCAL_ROOT: /var/lib/mini-ai-cloud/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+      artifact-init:
+        condition: service_completed_successfully
+    volumes:
+      - artifact-data:/var/lib/mini-ai-cloud/artifacts
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+
+volumes:
+  postgres-data:
+  artifact-data:
