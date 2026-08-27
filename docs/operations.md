@@ -128,7 +128,8 @@ uv run alembic downgrade 0010_ai_serving_infrastructure
 
 该 downgrade 会删除 runtime profile、allocation authority 和 observed allocation 证据，无法还原
 升级后的 Kubernetes Device Plugin 观测；生产恢复应使用升级前 snapshot，而不是把 downgrade
-当作无损回滚。
+当作无损回滚。如果同一 Worker 已有不同 vendor 共用 `device_index` 的合法数据，
+downgrade 恢复 v0.4 唯一键时会被数据库拒绝；应停止回退并使用升级前 snapshot。
 
 ## Local backup
 

@@ -26,12 +26,15 @@ def _legacy_metadata() -> sa.MetaData:
         "gpu_devices",
         metadata,
         sa.Column("id", sa.Uuid(), primary_key=True),
+        sa.Column("worker_id", sa.String(255), nullable=False),
         sa.Column("device_uuid", sa.String(255), nullable=False),
+        sa.Column("device_index", sa.Integer(), nullable=False),
         sa.Column("vendor", sa.String(64), nullable=False),
         sa.Column("compute_capability", sa.String(32)),
         sa.Column("memory_total_mb", sa.Integer(), nullable=False),
         sa.Column("memory_free_mb", sa.Integer(), nullable=False),
         sa.Column("fake", sa.Boolean(), nullable=False),
+        sa.UniqueConstraint("worker_id", "device_index", name="uq_gpu_devices_worker_index"),
     )
     sa.Table(
         "task_executions",
@@ -75,7 +78,9 @@ def test_sqlite_upgrade_backfills_legacy_rows_and_downgrades(tmp_path: Path) -> 
             .insert()
             .values(
                 id=device_id,
+                worker_id="legacy-worker",
                 device_uuid="FAKE-GPU-0",
+                device_index=0,
                 vendor="fake",
                 compute_capability="8.0",
                 memory_total_mb=40_960,
@@ -151,6 +156,15 @@ def test_sqlite_upgrade_backfills_legacy_rows_and_downgrades(tmp_path: Path) -> 
         assert device["vendor"] == "nvidia"
         assert device["accelerator_kind"] == "gpu"
         assert device["compute_arch"] == "8.0"
+        unique_constraints = {
+            constraint["name"]: tuple(constraint["column_names"])
+            for constraint in sa.inspect(connection).get_unique_constraints("gpu_devices")
+        }
+        assert unique_constraints["uq_gpu_devices_worker_vendor_index"] == (
+            "worker_id",
+            "vendor",
+            "device_index",
+        )
         assert bound["allocation_authority"] == "control_plane_exact_device"
         assert bound["requested_vendor"] == "nvidia"
         assert bound["requested_kind"] == "gpu"
@@ -170,6 +184,14 @@ def test_sqlite_upgrade_backfills_legacy_rows_and_downgrades(tmp_path: Path) -> 
         migration.downgrade()
         columns = {column["name"] for column in sa.inspect(connection).get_columns("gpu_devices")}
         assert "accelerator_kind" not in columns
+        downgraded_unique_constraints = {
+            constraint["name"]: tuple(constraint["column_names"])
+            for constraint in sa.inspect(connection).get_unique_constraints("gpu_devices")
+        }
+        assert downgraded_unique_constraints["uq_gpu_devices_worker_index"] == (
+            "worker_id",
+            "device_index",
+        )
         execution_columns = {
             column["name"] for column in sa.inspect(connection).get_columns("task_executions")
         }

@@ -181,6 +181,11 @@ def _backfill_legacy_rows() -> None:
 
 def _add_device_constraints() -> None:
     with op.batch_alter_table("gpu_devices") as batch:
+        batch.drop_constraint(op.f("uq_gpu_devices_worker_index"), type_="unique")
+        batch.create_unique_constraint(
+            op.f("uq_gpu_devices_worker_vendor_index"),
+            ["worker_id", "vendor", "device_index"],
+        )
         batch.create_check_constraint(
             op.f("ck_gpu_devices_memory_available"),
             "memory_free_mb <= memory_total_mb",
@@ -196,6 +201,10 @@ def _drop_device_constraints() -> None:
     with op.batch_alter_table("gpu_devices") as batch:
         batch.drop_constraint(op.f("ck_gpu_devices_vendor_kind"), type_="check")
         batch.drop_constraint(op.f("ck_gpu_devices_memory_available"), type_="check")
+        batch.drop_constraint(op.f("uq_gpu_devices_worker_vendor_index"), type_="unique")
+        batch.create_unique_constraint(
+            op.f("uq_gpu_devices_worker_index"), ["worker_id", "device_index"]
+        )
 
 
 def _add_allocation_constraints(table_name: str, *, include_legacy_exception: bool) -> None:

@@ -32,7 +32,9 @@ class GPUDevice(Base):
             name="vendor_kind",
         ),
         UniqueConstraint("worker_id", "device_uuid", name="uq_gpu_devices_worker_uuid"),
-        UniqueConstraint("worker_id", "device_index", name="uq_gpu_devices_worker_index"),
+        UniqueConstraint(
+            "worker_id", "vendor", "device_index", name="uq_gpu_devices_worker_vendor_index"
+        ),
         Index("ix_gpu_devices_worker_health", "worker_id", "health"),
     )
 
