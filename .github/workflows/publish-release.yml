@@ -221,13 +221,24 @@ jobs:
             -czf "build/mini-ai-cloud-v${RELEASE_VERSION}-evidence.tar.gz" \
             -C build "evidence/${TARGET_SHA}" "release/${TARGET_SHA}" soak dr-rehearsal
 
-          sha256sum \
-            build/release-wheel/mini_ai_cloud-*.whl \
-            "build/mini-ai-cloud-v${RELEASE_VERSION}-evidence.tar.gz" \
-            build/mini-ai-cloud-image.spdx.json \
-            "${release_dir}/cyclonedx-sbom.json" \
-            "${release_dir}/release-preparation.json" \
-            >build/release-assets.sha256
+          mapfile -t wheel_assets < <(
+            find build/release-wheel -maxdepth 1 -type f -name 'mini_ai_cloud-*.whl' -print | sort
+          )
+          test "${#wheel_assets[@]}" -eq 1
+          checksum_assets=(
+            "${wheel_assets[0]}"
+            "build/mini-ai-cloud-v${RELEASE_VERSION}-evidence.tar.gz"
+            "build/mini-ai-cloud-image.spdx.json"
+            "${release_dir}/cyclonedx-sbom.json"
+            "${release_dir}/release-preparation.json"
+            "${release_dir}/SHA256SUMS"
+          )
+          : >build/release-assets.sha256
+          for asset_path in "${checksum_assets[@]}"; do
+            digest="$(sha256sum "${asset_path}" | cut -d' ' -f1)"
+            printf '%s  %s\n' "${digest}" "$(basename "${asset_path}")" \
+              >>build/release-assets.sha256
+          done
 
       - name: Create or repair the exact release tag and GitHub Release
         shell: bash
