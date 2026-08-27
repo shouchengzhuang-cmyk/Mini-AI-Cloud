@@ -103,3 +103,12 @@ def test_release_security_workflow_prepares_sbom_output_directory() -> None:
     prepare = workflow.index("run: mkdir -p build/release-security")
     generate = workflow.index("name: Generate image SPDX SBOM")
     assert prepare < generate
+
+
+def test_issue_comment_publisher_reuses_exact_sha_gitleaks_gate() -> None:
+    publisher = (ROOT / ".github/workflows/publish-release.yml").read_text(encoding="utf-8")
+    security_gate = (ROOT / ".github/workflows/release-security.yml").read_text(encoding="utf-8")
+
+    assert 'require_success "release-security.yml"' in publisher
+    assert "gitleaks/gitleaks-action@" in security_gate
+    assert "gitleaks/gitleaks-action@" not in publisher
