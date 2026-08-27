@@ -131,7 +131,9 @@ class FakeGPUInventoryProvider:
                 GPUDevice(
                     uuid=f"FAKE-{device_uuid}",
                     index=index,
-                    vendor="fake",
+                    # A fake device simulates NVIDIA GPU inventory. ``fake`` is
+                    # evidence provenance, not a third hardware vendor.
+                    vendor="nvidia",
                     model=self.model,
                     memory_total_mb=self.memory_mb,
                     memory_free_mb=self.memory_mb,

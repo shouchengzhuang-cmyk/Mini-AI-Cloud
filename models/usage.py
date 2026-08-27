@@ -104,6 +104,33 @@ class ProjectQuotaState(Base):
 class TaskExecution(Base):
     __tablename__ = "task_executions"
     __table_args__ = (
+        CheckConstraint(
+            "allocation_authority IN ('control_plane_exact_device','kubernetes_device_plugin')",
+            name="allocation_authority",
+        ),
+        CheckConstraint(
+            "(gpu_count = 0 AND requested_vendor IS NULL AND requested_kind IS NULL "
+            "AND requested_profile_id IS NULL) OR "
+            "(gpu_count > 0 AND requested_vendor IS NOT NULL AND requested_kind IS NOT NULL)",
+            name="accelerator_request",
+        ),
+        CheckConstraint(
+            "requested_vendor IS NULL OR "
+            "(requested_vendor = 'nvidia' AND requested_kind = 'gpu') OR "
+            "(requested_vendor = 'huawei-ascend' AND requested_kind = 'npu')",
+            name="requested_vendor_kind",
+        ),
+        CheckConstraint(
+            "(observed_at IS NULL AND observed_vendor IS NULL "
+            "AND observed_device_ids_json IS NULL) OR "
+            "(observed_at IS NOT NULL AND observed_vendor IS NOT NULL "
+            "AND observed_device_ids_json IS NOT NULL)",
+            name="observed_allocation",
+        ),
+        CheckConstraint(
+            "observed_vendor IS NULL OR observed_vendor = requested_vendor",
+            name="observed_vendor",
+        ),
         UniqueConstraint("task_id", "attempt", name="uq_task_executions_task_attempt"),
         Index("ix_task_executions_project_started", "project_id", "started_at"),
     )
@@ -125,6 +152,15 @@ class TaskExecution(Base):
     memory_mb: Mapped[int] = mapped_column(Integer)
     gpu_count: Mapped[int] = mapped_column(Integer)
     gpu_model: Mapped[str | None] = mapped_column(String(255))
+    allocation_authority: Mapped[str] = mapped_column(
+        String(64), default="control_plane_exact_device"
+    )
+    requested_vendor: Mapped[str | None] = mapped_column(String(64))
+    requested_kind: Mapped[str | None] = mapped_column(String(32))
+    requested_profile_id: Mapped[str | None] = mapped_column(String(128))
+    observed_device_ids_json: Mapped[list[str] | None] = mapped_column(JSON(none_as_null=True))
+    observed_vendor: Mapped[str | None] = mapped_column(String(64))
+    observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     cpu_price_per_hour: Mapped[Decimal] = mapped_column(Numeric(20, 8))
     memory_price_per_gb_hour: Mapped[Decimal] = mapped_column(Numeric(20, 8))
     gpu_price_per_hour: Mapped[Decimal] = mapped_column(Numeric(20, 8))

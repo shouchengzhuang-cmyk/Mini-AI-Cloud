@@ -99,6 +99,37 @@ Phase I 稳定代码恢复点为 `c47702b`，但“代码能切回”不等于�
 
 不要把 `git reset --hard` 当作回滚流程；它会破坏工作树且不能恢复数据库/Object Store。
 
+### Accelerator allocation migration rollback
+
+`0011_accelerator_persistence` 是增量迁移：保留 `gpu_devices`、legacy `gpu_*`
+字段和 reservation 关联表，只追加 vendor/kind、runtime profile、allocation authority
+及 observed allocation 列。升级前后应运行：
+
+```bash
+uv run alembic current
+uv run alembic upgrade 0011_accelerator_persistence
+uv run mini-cloud admin doctor
+```
+
+升级后的只读核查至少包括：
+
+- v0.4 GPU 行映射为 `nvidia/gpu`，fake GPU 的 provenance 仍由 `fake=true` 保存；
+- 已有 concrete device link 能回填 observed device IDs；缺少绑定的历史 GPU
+  reservation 标记为 `legacy_unbound`，不能伪造观测；
+- `orphan_accelerator_allocation` 没有新增问题；
+- terminal task 不存在 active reservation 或 active exact-device link。
+
+若应用错误但 schema 已成功，优先 forward fix。仅在已停止所有写入、完成可恢复备份并确认
+没有需要保留的 A2 新写入后，才可演练：
+
+```bash
+uv run alembic downgrade 0010_ai_serving_infrastructure
+```
+
+该 downgrade 会删除 runtime profile、allocation authority 和 observed allocation 证据，无法还原
+升级后的 Kubernetes Device Plugin 观测；生产恢复应使用升级前 snapshot，而不是把 downgrade
+当作无损回滚。
+
 ## Local backup
 
 `scripts/backup.sh` 只接受受限的本地 Compose project 名，并备份 PostgreSQL custom dump、Local Artifact volume 和可选 MinIO volume。为了得到一致 snapshot，postgres 保持运行，API、Worker、migrate 和 MinIO 必须停止：

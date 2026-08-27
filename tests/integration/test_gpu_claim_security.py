@@ -4,8 +4,9 @@ import pytest
 from sqlalchemy import delete, func, select
 
 from core.database import Database
-from core.enums import TaskStatus
+from core.enums import AcceleratorKind, AcceleratorVendor, AllocationAuthority, TaskStatus
 from models.scheduling import ReservationGPUDevice, ResourceReservation
+from models.usage import TaskExecution
 from repositories.tasks import TaskRepository
 from repositories.workers import WorkerRepository
 from scheduler import Scheduler
@@ -133,6 +134,8 @@ async def test_pull_scheduler_requires_concrete_gpu_inventory_and_reservation(
             select(ResourceReservation).where(ResourceReservation.task_id == task_id)
         )
         assert reservation is not None
+        execution = await session.get(TaskExecution, reservation.execution_id)
+        assert execution is not None
         active_device_links = int(
             await session.scalar(
                 select(func.count(ReservationGPUDevice.id)).where(
@@ -143,6 +146,14 @@ async def test_pull_scheduler_requires_concrete_gpu_inventory_and_reservation(
             or 0
         )
     assert reservation.legacy_unbound is False
+    assert reservation.allocation_authority == AllocationAuthority.CONTROL_PLANE_EXACT_DEVICE
+    assert reservation.requested_vendor == AcceleratorVendor.NVIDIA
+    assert reservation.requested_kind == AcceleratorKind.GPU
+    assert reservation.observed_device_ids_json == ["GPU-A100-0"]
+    assert reservation.observed_vendor == AcceleratorVendor.NVIDIA
+    assert reservation.observed_at is not None
+    assert execution.allocation_authority == AllocationAuthority.CONTROL_PLANE_EXACT_DEVICE
+    assert execution.observed_device_ids_json == ["GPU-A100-0"]
     assert active_device_links == 1
 
 

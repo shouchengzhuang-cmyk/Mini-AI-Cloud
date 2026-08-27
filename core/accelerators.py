@@ -27,9 +27,8 @@ def vendor_kind_is_compatible(vendor: AcceleratorVendor, kind: AcceleratorKind) 
 class AcceleratorDevice:
     """Vendor-neutral accelerator inventory value object.
 
-    Persistence and provider migration are deliberately outside A1. This value
-    object freezes the vocabulary consumed by the later inventory and database
-    PRs without renaming the existing ``gpu_devices`` table.
+    A2 persists this vocabulary without renaming the existing ``gpu_devices``
+    table. Provider discovery and vendor runtime behavior remain later M6 work.
     """
 
     device_id: str

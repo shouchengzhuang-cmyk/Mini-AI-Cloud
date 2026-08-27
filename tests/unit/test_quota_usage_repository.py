@@ -9,7 +9,13 @@ import pytest_asyncio
 from sqlalchemy import event
 
 from core.database import Database
-from core.enums import RuntimeType, TaskStatus
+from core.enums import (
+    AcceleratorKind,
+    AcceleratorVendor,
+    AllocationAuthority,
+    RuntimeType,
+    TaskStatus,
+)
 from core.rbac import ProjectStatus
 from models import Base
 from models.identity import Project
@@ -295,6 +301,8 @@ async def _execution(
                 image="python:3.12",
                 command=["python", "-V"],
                 status=TaskStatus.RUNNING,
+                gpu_count=1,
+                gpu_model="A100",
             )
         )
         session.add(
@@ -310,6 +318,9 @@ async def _execution(
                 memory_mb=1_024,
                 gpu_count=1,
                 gpu_model="A100",
+                allocation_authority=AllocationAuthority.CONTROL_PLANE_EXACT_DEVICE.value,
+                requested_vendor=AcceleratorVendor.NVIDIA.value,
+                requested_kind=AcceleratorKind.GPU.value,
                 cpu_price_per_hour=Decimal("0.05"),
                 memory_price_per_gb_hour=Decimal("0.005"),
                 gpu_price_per_hour=Decimal("1.0"),

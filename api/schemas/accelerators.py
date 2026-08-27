@@ -223,6 +223,6 @@ def reconcile_legacy_gpu_fields(
 def require_current_execution_support(accelerator: AcceleratorRequest | None) -> None:
     if accelerator is not None and not accelerator.is_legacy_gpu_compatible():
         raise ValueError(
-            "the accelerator contract is schema-ready, but this request requires a later M6 "
-            "persistence and scheduling PR"
+            "the accelerator contract is schema-ready, but this request requires later M6 "
+            "scheduling and runtime PRs"
         )

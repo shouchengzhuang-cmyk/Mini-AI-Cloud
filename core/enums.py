@@ -19,6 +19,11 @@ class AcceleratorSelectionPolicy(StrEnum):
     PREFER_ASCEND = "prefer-ascend"
 
 
+class AllocationAuthority(StrEnum):
+    CONTROL_PLANE_EXACT_DEVICE = "control_plane_exact_device"
+    KUBERNETES_DEVICE_PLUGIN = "kubernetes_device_plugin"
+
+
 class TaskStatus(StrEnum):
     PENDING = "pending"
     QUEUED = "queued"

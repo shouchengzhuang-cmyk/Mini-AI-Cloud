@@ -2,10 +2,11 @@ import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.scheduling import ReservationGPUDevice, ResourceReservation
+from core.enums import AcceleratorVendor, AllocationAuthority
+from models.scheduling import GPUDevice, ReservationGPUDevice, ResourceReservation
 from models.task import Task
 from models.usage import TaskExecution, UsageLedger
 from models.worker import Worker
@@ -14,6 +15,10 @@ from repositories.quotas import QuotaRepository
 
 class ResourceInvariantViolation(RuntimeError):
     """Persistent resource accounting no longer matches its reservation truth."""
+
+
+class AllocationObservationConflict(RuntimeError):
+    """An observed allocation conflicts with its persisted request or authority."""
 
 
 class ReservationRepository:
@@ -28,6 +33,129 @@ class ReservationRepository:
         if for_update:
             query = query.with_for_update()
         return await session.scalar(query)
+
+    @staticmethod
+    async def assert_exact_device_binding(
+        session: AsyncSession,
+        reservation: ResourceReservation,
+    ) -> None:
+        """Verify the concrete binding owned by a control-plane reservation."""
+
+        if (
+            reservation.gpu_count == 0
+            or reservation.legacy_unbound
+            or reservation.allocation_authority
+            != AllocationAuthority.CONTROL_PLANE_EXACT_DEVICE.value
+        ):
+            return
+        rows = list(
+            (
+                await session.execute(
+                    select(ReservationGPUDevice, GPUDevice)
+                    .join(GPUDevice, GPUDevice.id == ReservationGPUDevice.gpu_device_id)
+                    .where(
+                        ReservationGPUDevice.reservation_id == reservation.id,
+                        ReservationGPUDevice.released_at.is_(None),
+                    )
+                    .order_by(GPUDevice.device_uuid)
+                )
+            ).all()
+        )
+        if len(rows) != reservation.gpu_count:
+            raise ResourceInvariantViolation(
+                f"exact-device reservation {reservation.id} has {len(rows)} active bindings; "
+                f"expected {reservation.gpu_count}"
+            )
+        device_ids = [device.device_uuid for _link, device in rows]
+        vendors = {device.vendor for _link, device in rows}
+        if vendors != {reservation.requested_vendor}:
+            raise ResourceInvariantViolation(
+                f"exact-device reservation {reservation.id} binding vendor does not match request"
+            )
+        if sorted(reservation.observed_device_ids_json or []) != sorted(device_ids):
+            raise ResourceInvariantViolation(
+                f"exact-device reservation {reservation.id} observation does not match bindings"
+            )
+
+    @staticmethod
+    async def record_observed_allocation(
+        session: AsyncSession,
+        *,
+        execution_id: uuid.UUID,
+        vendor: AcceleratorVendor | str,
+        device_ids: tuple[str, ...],
+        observed_at: datetime,
+    ) -> bool:
+        """Persist a Device Plugin observation once in reservation and execution."""
+
+        try:
+            normalized_vendor = AcceleratorVendor(vendor).value
+        except ValueError as exc:
+            raise AllocationObservationConflict("unsupported observed accelerator vendor") from exc
+        normalized_ids = tuple(device_id.strip() for device_id in device_ids)
+        if any(not device_id for device_id in normalized_ids):
+            raise AllocationObservationConflict("observed device IDs must not be blank")
+        if len(normalized_ids) != len(set(normalized_ids)):
+            raise AllocationObservationConflict("observed device IDs must be unique")
+
+        reservation = await ReservationRepository.get_active_for_execution(
+            session, execution_id, for_update=True
+        )
+        if reservation is None:
+            raise AllocationObservationConflict("execution has no active reservation")
+        execution = await session.get(TaskExecution, execution_id, with_for_update=True)
+        if execution is None:
+            raise ResourceInvariantViolation(
+                f"execution {execution_id} is missing for active reservation"
+            )
+        authority = AllocationAuthority.KUBERNETES_DEVICE_PLUGIN.value
+        if (
+            reservation.allocation_authority != authority
+            or execution.allocation_authority != authority
+        ):
+            raise AllocationObservationConflict(
+                "only kubernetes_device_plugin allocations accept deferred observations"
+            )
+        if reservation.requested_vendor != normalized_vendor:
+            raise AllocationObservationConflict("observed vendor does not match requested vendor")
+        if len(normalized_ids) != reservation.gpu_count:
+            raise AllocationObservationConflict(
+                "observed device count does not match the accelerator reservation"
+            )
+        exact_links = int(
+            await session.scalar(
+                select(func.count(ReservationGPUDevice.id)).where(
+                    ReservationGPUDevice.reservation_id == reservation.id
+                )
+            )
+            or 0
+        )
+        if exact_links:
+            raise ResourceInvariantViolation(
+                "kubernetes_device_plugin reservation must not own exact-device bindings"
+            )
+
+        expected_ids = list(normalized_ids)
+        if reservation.observed_at is not None or execution.observed_at is not None:
+            if (
+                reservation.observed_vendor == normalized_vendor
+                and reservation.observed_device_ids_json == expected_ids
+                and execution.observed_vendor == normalized_vendor
+                and execution.observed_device_ids_json == expected_ids
+            ):
+                return False
+            raise AllocationObservationConflict(
+                "allocation was already observed with different data"
+            )
+
+        reservation.observed_device_ids_json = expected_ids
+        reservation.observed_vendor = normalized_vendor
+        reservation.observed_at = observed_at
+        reservation.version += 1
+        execution.observed_device_ids_json = expected_ids
+        execution.observed_vendor = normalized_vendor
+        execution.observed_at = observed_at
+        return True
 
     @staticmethod
     async def release_and_settle(

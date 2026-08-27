@@ -7,7 +7,8 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.pagination import TextCursorKey
-from core.enums import WorkerStatus
+from core.accelerators import kind_for_vendor, vendor_kind_is_compatible
+from core.enums import AcceleratorKind, AcceleratorVendor, WorkerStatus
 from models.scheduling import GPUDevice
 from models.worker import Worker
 from repositories.clock import database_utcnow
@@ -156,19 +157,53 @@ class WorkerRepository:
                 item.get("memory_free_mb"), "memory_free_mb", minimum=0
             )
             if memory_free_mb > memory_total_mb:
-                raise ValueError("GPU memory_free_mb must not exceed memory_total_mb")
+                raise ValueError("accelerator memory_free_mb must not exceed memory_total_mb")
+            raw_vendor = str(item.get("vendor", AcceleratorVendor.NVIDIA.value))
+            if raw_vendor == "fake" and bool(item.get("fake", False)):
+                raw_vendor = AcceleratorVendor.NVIDIA.value
+            try:
+                vendor = AcceleratorVendor(raw_vendor)
+            except ValueError as exc:
+                raise ValueError(f"unsupported accelerator vendor: {raw_vendor}") from exc
+            raw_kind = str(item.get("accelerator_kind", kind_for_vendor(vendor).value))
+            try:
+                accelerator_kind = AcceleratorKind(raw_kind)
+            except ValueError as exc:
+                raise ValueError(f"unsupported accelerator kind: {raw_kind}") from exc
+            if not vendor_kind_is_compatible(vendor, accelerator_kind):
+                raise ValueError(
+                    f"accelerator vendor {vendor.value} is incompatible with kind "
+                    f"{accelerator_kind.value}"
+                )
+            runtime_profile_ids = _inventory_names(
+                item.get("runtime_profile_ids", []), "runtime_profile_ids"
+            )
+            capabilities = _inventory_names(
+                item.get("capabilities", item.get("capabilities_json", [])), "capabilities"
+            )
             seen.add(device_uuid)
             device = existing.get(device_uuid)
             if device is None:
                 device = GPUDevice(worker_id=worker_id, device_uuid=device_uuid)
                 session.add(device)
             device.device_index = device_index
-            device.vendor = str(item.get("vendor", "nvidia"))
+            device.vendor = vendor.value
+            device.accelerator_kind = accelerator_kind.value
             device.model = str(item["model"])
             device.memory_total_mb = memory_total_mb
             device.memory_free_mb = memory_free_mb
             capability = item.get("compute_capability")
             device.compute_capability = str(capability) if capability is not None else None
+            compute_arch = item.get("compute_arch", capability)
+            device.compute_arch = str(compute_arch) if compute_arch is not None else None
+            device.runtime_profile_ids = runtime_profile_ids
+            device.capabilities_json = capabilities
+            resource_name = item.get("kubernetes_resource_name")
+            device.kubernetes_resource_name = (
+                str(resource_name).strip() if resource_name is not None else None
+            )
+            if device.kubernetes_resource_name == "":
+                raise ValueError("accelerator kubernetes_resource_name must not be blank")
             device.health = str(item.get("health", "healthy"))
             device.fake = bool(item.get("fake", False))
             device.inventory_generation = worker.inventory_generation
@@ -276,7 +311,20 @@ class WorkerRepository:
 
 def _inventory_integer(value: object, field: str, *, minimum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"GPU {field} must be an integer")
+        raise ValueError(f"accelerator {field} must be an integer")
     if value < minimum:
-        raise ValueError(f"GPU {field} must be at least {minimum}")
+        raise ValueError(f"accelerator {field} must be at least {minimum}")
     return value
+
+
+def _inventory_names(value: object, field: str) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"accelerator {field} must be a list")
+    names: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"accelerator {field} entries must be non-blank strings")
+        names.append(item.strip())
+    if len(names) != len(set(names)):
+        raise ValueError(f"accelerator {field} entries must be unique")
+    return names

@@ -11,7 +11,13 @@ from sqlalchemy import Float, Integer, Select, case, cast, func, literal, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
-from core.enums import TaskStatus, WorkerStatus
+from core.enums import (
+    AcceleratorKind,
+    AcceleratorVendor,
+    AllocationAuthority,
+    TaskStatus,
+    WorkerStatus,
+)
 from core.state_machine import ensure_transition
 from models.scheduling import (
     GPUDevice,
@@ -26,6 +32,7 @@ from models.worker import Worker
 from repositories.clock import database_utcnow
 from repositories.outbox import OutboxRepository
 from repositories.quotas import QuotaRepository
+from repositories.reservations import ReservationRepository
 from repositories.tasks import TaskRepository, _prepare_for_assignment, _unsatisfied_dependencies
 from scheduler.policies import (
     GPUDeviceSnapshot,
@@ -370,7 +377,11 @@ class SchedulingRepository:
         devices = list(
             await session.scalars(
                 select(GPUDevice)
-                .where(GPUDevice.worker_id.in_([worker.id for worker in workers]))
+                .where(
+                    GPUDevice.worker_id.in_([worker.id for worker in workers]),
+                    GPUDevice.vendor == AcceleratorVendor.NVIDIA.value,
+                    GPUDevice.accelerator_kind == AcceleratorKind.GPU.value,
+                )
                 .order_by(GPUDevice.worker_id, GPUDevice.memory_total_mb, GPUDevice.device_uuid)
             )
         )
@@ -460,6 +471,8 @@ class SchedulingRepository:
                         GPUDevice.id.in_(requested_device_ids),
                         GPUDevice.worker_id == worker.id,
                         GPUDevice.health == "healthy",
+                        GPUDevice.vendor == AcceleratorVendor.NVIDIA.value,
+                        GPUDevice.accelerator_kind == AcceleratorKind.GPU.value,
                     )
                     .order_by(GPUDevice.id)
                     .execution_options(populate_existing=True)
@@ -562,6 +575,14 @@ class SchedulingRepository:
             memory_mb=task.memory_limit_mb,
             gpu_count=task.gpu_count,
             gpu_model=task.gpu_model,
+            allocation_authority=AllocationAuthority.CONTROL_PLANE_EXACT_DEVICE.value,
+            requested_vendor=(AcceleratorVendor.NVIDIA.value if task.gpu_count else None),
+            requested_kind=(AcceleratorKind.GPU.value if task.gpu_count else None),
+            observed_device_ids_json=(
+                [device.device_uuid for device in devices] if devices else None
+            ),
+            observed_vendor=(AcceleratorVendor.NVIDIA.value if devices else None),
+            observed_at=(now if devices else None),
             cpu_price_per_hour=Decimal(str(cpu_price_per_hour)),
             memory_price_per_gb_hour=Decimal(str(memory_price_per_gb_hour)),
             gpu_price_per_hour=Decimal(str(gpu_price_per_hour)),
@@ -579,6 +600,14 @@ class SchedulingRepository:
             cpu_millicores=task.cpu_millicores,
             memory_mb=task.memory_limit_mb,
             gpu_count=task.gpu_count,
+            allocation_authority=AllocationAuthority.CONTROL_PLANE_EXACT_DEVICE.value,
+            requested_vendor=(AcceleratorVendor.NVIDIA.value if task.gpu_count else None),
+            requested_kind=(AcceleratorKind.GPU.value if task.gpu_count else None),
+            observed_device_ids_json=(
+                [device.device_uuid for device in devices] if devices else None
+            ),
+            observed_vendor=(AcceleratorVendor.NVIDIA.value if devices else None),
+            observed_at=(now if devices else None),
             state="active",
             created_at=now,
         )
@@ -592,6 +621,8 @@ class SchedulingRepository:
                     created_at=now,
                 )
             )
+        await session.flush()
+        await ReservationRepository.assert_exact_device_binding(session, reservation)
 
         await QuotaRepository.reserve_execution(
             session,
