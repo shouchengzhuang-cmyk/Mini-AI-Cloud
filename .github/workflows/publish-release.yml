@@ -280,6 +280,7 @@ jobs:
             "build/mini-ai-cloud-v${RELEASE_VERSION}-evidence.tar.gz"
             "build/mini-ai-cloud-image.spdx.json"
             "${release_dir}/cyclonedx-sbom.json"
+            "${release_dir}/release-notes.md"
             "${release_dir}/release-preparation.json"
             "${release_dir}/SHA256SUMS"
           )
@@ -321,6 +322,7 @@ jobs:
             "build/mini-ai-cloud-v${RELEASE_VERSION}-evidence.tar.gz"
             "build/mini-ai-cloud-image.spdx.json"
             "build/release/${TARGET_SHA}/cyclonedx-sbom.json"
+            "build/release/${TARGET_SHA}/release-notes.md"
             "build/release/${TARGET_SHA}/release-preparation.json"
             "build/release/${TARGET_SHA}/SHA256SUMS"
             "build/release-assets.sha256"
@@ -389,7 +391,10 @@ jobs:
 
           export VERIFICATION_DIR="${verification_dir}"
           python - <<'PY'
+          import base64
+          import csv
           import hashlib
+          import io
           import json
           import os
           import re
@@ -428,6 +433,35 @@ jobs:
                       result[name] = hashlib.sha256(payload).hexdigest()
                   return result
 
+          def validate_wheel_record(path: Path) -> None:
+              with zipfile.ZipFile(path) as wheel:
+                  record_names = [
+                      name for name in wheel.namelist() if name.endswith(".dist-info/RECORD")
+                  ]
+                  assert len(record_names) == 1, record_names
+                  record_name = record_names[0]
+                  rows = list(
+                      csv.reader(io.StringIO(wheel.read(record_name).decode("utf-8")))
+                  )
+                  assert all(len(row) == 3 for row in rows), rows
+                  entries = {row[0]: (row[1], row[2]) for row in rows}
+                  assert len(entries) == len(rows), "duplicate RECORD path"
+                  files = {name for name in wheel.namelist() if not name.endswith("/")}
+                  assert set(entries) == files, (entries, files)
+                  for name in sorted(files):
+                      digest, size = entries[name]
+                      if name == record_name:
+                          assert digest == "" and size == ""
+                          continue
+                      payload = wheel.read(name)
+                      expected = base64.urlsafe_b64encode(
+                          hashlib.sha256(payload).digest()
+                      ).rstrip(b"=").decode("ascii")
+                      assert digest == f"sha256={expected}", name
+                      assert size == str(len(payload)), name
+
+          validate_wheel_record(wheels[0])
+          validate_wheel_record(generated_wheels[0])
           assert normalized_wheel_hashes(wheels[0]) == normalized_wheel_hashes(generated_wheels[0])
 
           archive = root / f"mini-ai-cloud-v{version}-evidence.tar.gz"
@@ -436,6 +470,7 @@ jobs:
               archive.name,
               "mini-ai-cloud-image.spdx.json",
               "cyclonedx-sbom.json",
+              "release-notes.md",
               "release-preparation.json",
               "SHA256SUMS",
           }
