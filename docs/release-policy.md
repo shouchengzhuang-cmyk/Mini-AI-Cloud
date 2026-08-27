@@ -23,6 +23,19 @@ Mini AI Cloud 使用语义化版本表达公开包、CLI、配置和 API 契约�
 
 发布、合并、推送和部署是不同动作。通过 CI 不自动授权发布或部署。
 
+## Owner-approved GitHub publication
+
+仓库提供受限的 `Publish approved release` 工作流，用于在代码和证据已经收口后创建 Git tag 与 GitHub Release：
+
+1. 必须由仓库 Owner 在普通 Issue 中提交精确命令：`/publish-release <version> <40-char-main-sha>`；
+2. 工作流只接受当前默认分支 head，拒绝功能分支、过期 commit、非 Owner 评论和非精确版本；
+3. 精确 SHA 必须已有成功的 `CI` 与 `Release security gates`；
+4. 发布前重新执行完整 release gate、真实 Kind acceptance、bounded soak、隔离 DR rehearsal、secret/vulnerability scan，并生成 wheel、SBOM 和 commit-bound evidence；
+5. 工作流可幂等修复同一 tag 的 Release 资产，但拒绝让 tag 指向其他 commit；
+6. GitHub Release 只发布仓库制品，不执行生产部署，也不改变 `REAL GPU: NOT RUN` 等证据边界。
+
+Owner 的精确命令构成 tag/GitHub Release 的显式授权，但**不构成部署授权**。任何部署仍需独立、明确的目标环境与风险确认。
+
 ## Deprecation
 
 公开 CLI、环境变量、配置键或 API 被替代时：

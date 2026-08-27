@@ -1,0 +1,689 @@
+name: Publish approved release
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  actions: read
+  contents: write
+  issues: write
+
+concurrency:
+  group: publish-mini-ai-cloud-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      github.event.issue.pull_request == null &&
+      github.event.comment.author_association == 'OWNER' &&
+      github.event.comment.user.login == github.repository_owner &&
+      startsWith(github.event.comment.body, '/publish-release ')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      RELEASE_VERSION: 0.4.0
+      KIND_VERSION: v0.27.0
+      KUBECTL_VERSION: v1.32.2
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Parse explicit owner authorization
+        id: approval
+        shell: bash
+        env:
+          RELEASE_COMMENT: ${{ github.event.comment.body }}
+        run: |
+          set -Eeuo pipefail
+          read -r command version target_sha extra <<<"${RELEASE_COMMENT}"
+          test "${command}" = "/publish-release"
+          test "${version}" = "${RELEASE_VERSION}"
+          test -z "${extra:-}"
+          [[ "${target_sha}" =~ ^[0-9a-f]{40}$ ]]
+          test "${RELEASE_COMMENT}" = "${command} ${version} ${target_sha}"
+          echo "target_sha=${target_sha}" >>"${GITHUB_OUTPUT}"
+          echo "tag=v${version}" >>"${GITHUB_OUTPUT}"
+
+      - name: Record publication start
+        shell: bash
+        run: |
+          gh issue comment "${{ github.event.issue.number }}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --body "Release publication started for Mini AI Cloud v${RELEASE_VERSION} at commit \`${{ steps.approval.outputs.target_sha }}\`. No deployment is performed."
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.approval.outputs.target_sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Verify release target is the current default-branch head
+        shell: bash
+        env:
+          TARGET_SHA: ${{ steps.approval.outputs.target_sha }}
+        run: |
+          set -Eeuo pipefail
+          main_sha="$(git ls-remote origin refs/heads/main | cut -f1)"
+          test "${main_sha}" = "${TARGET_SHA}"
+          test "$(git rev-parse HEAD)" = "${TARGET_SHA}"
+
+      - name: Require successful CI and release security gates for the exact SHA
+        shell: bash
+        env:
+          TARGET_SHA: ${{ steps.approval.outputs.target_sha }}
+        run: |
+          set -Eeuo pipefail
+          require_success() {
+            workflow_file="$1"
+            count="$(gh api --method GET \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_file}/runs" \
+              -f head_sha="${TARGET_SHA}" \
+              -f branch=main \
+              -f event=push \
+              -f status=success \
+              -f per_page=100 \
+              --jq '.total_count')"
+            test "${count}" -ge 1 || {
+              echo "No successful main push run for ${workflow_file} at ${TARGET_SHA}" >&2
+              exit 1
+            }
+          }
+          require_success "ci.yml"
+          require_success "release-security.yml"
+
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version-file: .python-version
+
+      - name: Install locked dependencies
+        run: uv sync --frozen --all-groups
+
+      - name: Install pinned Kind and kubectl
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          tool_dir="${RUNNER_TEMP}/release-tools"
+          mkdir -p "${tool_dir}"
+          case "$(dpkg --print-architecture)" in
+            amd64) tool_arch=amd64 ;;
+            arm64) tool_arch=arm64 ;;
+            *) echo "Unsupported runner architecture" >&2; exit 1 ;;
+          esac
+
+          kind_asset="kind-linux-${tool_arch}"
+          kind_url="https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output "${tool_dir}/${kind_asset}" "${kind_url}/${kind_asset}"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output "${tool_dir}/${kind_asset}.sha256sum" \
+            "${kind_url}/${kind_asset}.sha256sum"
+          (cd "${tool_dir}" && sha256sum --check "${kind_asset}.sha256sum")
+          mv "${tool_dir}/${kind_asset}" "${tool_dir}/kind"
+
+          kubectl_url="https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${tool_arch}"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output "${tool_dir}/kubectl" "${kubectl_url}/kubectl"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output "${tool_dir}/kubectl.sha256" "${kubectl_url}/kubectl.sha256"
+          echo "$(cat "${tool_dir}/kubectl.sha256")  ${tool_dir}/kubectl" | sha256sum --check
+          chmod 0755 "${tool_dir}/kind" "${tool_dir}/kubectl"
+          echo "${tool_dir}" >>"${GITHUB_PATH}"
+
+      - name: Run complete release gate including real Kind acceptance
+        run: make test-release
+
+      - name: Run bounded restart and fencing soak
+        env:
+          CONFIRM_SOAK: "YES"
+          SOAK_ROUNDS: "3"
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          uv run python scripts/soak.py \
+            --rounds "${SOAK_ROUNDS}" \
+            --command-timeout 300 \
+            --total-timeout 2700
+
+      - name: Run isolated destructive disaster-recovery rehearsal
+        env:
+          CONFIRM_DR: "YES"
+        run: make test-dr
+
+      - name: Ensure dedicated Kind cluster and local credentials are absent
+        if: always()
+        run: make kind-serving-down
+
+      - name: Scan Git history for secrets
+        uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Scan repository dependencies, secrets and misconfiguration
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - name: Scan release candidate container
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: mini-ai-cloud:release-gate
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - name: Generate image SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: mini-ai-cloud:release-gate
+          format: spdx-json
+          output-file: build/mini-ai-cloud-image.spdx.json
+          upload-artifact: false
+
+      - name: Bind image SBOM to the release image and commit
+        shell: bash
+        env:
+          TARGET_SHA: ${{ steps.approval.outputs.target_sha }}
+        run: |
+          set -Eeuo pipefail
+          image_id="$(docker image inspect --format='{{.Id}}' mini-ai-cloud:release-gate)"
+          [[ "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          export IMAGE_SHA256="${image_id#sha256:}"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path("build/mini-ai-cloud-image.spdx.json")
+          payload = json.loads(path.read_text(encoding="utf-8"))
+          spdx_id = "SPDXRef-ReleaseImage"
+          assert all(package.get("SPDXID") != spdx_id for package in payload.get("packages", []))
+          payload.setdefault("packages", []).append(
+              {
+                  "name": "mini-ai-cloud:release-gate",
+                  "SPDXID": spdx_id,
+                  "versionInfo": os.environ["RELEASE_VERSION"],
+                  "downloadLocation": "NOASSERTION",
+                  "filesAnalyzed": False,
+                  "primaryPackagePurpose": "CONTAINER",
+                  "checksums": [
+                      {"algorithm": "SHA256", "checksumValue": os.environ["IMAGE_SHA256"]}
+                  ],
+                  "externalRefs": [
+                      {
+                          "referenceCategory": "OTHER",
+                          "referenceType": "git-sha",
+                          "referenceLocator": os.environ["TARGET_SHA"],
+                      }
+                  ],
+              }
+          )
+          describes = payload.setdefault("documentDescribes", [])
+          if spdx_id not in describes:
+              describes.append(spdx_id)
+          path.write_text(
+              json.dumps(payload, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+              newline="\n",
+          )
+          PY
+
+      - name: Prepare deterministic release assets and final notes
+        shell: bash
+        env:
+          TARGET_SHA: ${{ steps.approval.outputs.target_sha }}
+        run: |
+          set -Eeuo pipefail
+          release_dir="build/release/${TARGET_SHA}"
+          evidence_dir="build/evidence/${TARGET_SHA}"
+          test -f "${release_dir}/release-notes.md"
+          test -f "${release_dir}/release-preparation.json"
+          test -f "${release_dir}/cyclonedx-sbom.json"
+          test -f "${release_dir}/SHA256SUMS"
+          test -f "${evidence_dir}/manifest.json"
+          test -n "$(find build/soak -type f -print -quit)"
+          test -n "$(find build/dr-rehearsal -type f -print -quit)"
+          test -n "$(find build/release-wheel -maxdepth 1 -name 'mini_ai_cloud-*.whl' -print -quit)"
+
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          sha = os.environ["TARGET_SHA"]
+          source = Path("build/release") / sha / "release-notes.md"
+          text = source.read_text(encoding="utf-8")
+          text = text.replace(
+              "This file prepares release notes; it does **not** create a GitHub Release or deploy anything.",
+              "This GitHub Release was created by the repository's owner-approved publication workflow. It does **not** deploy anything.",
+          )
+          text = text.replace("GitHub Release: **NOT CREATED**.", "GitHub Release: **CREATED BY APPROVED WORKFLOW**.")
+          text += "\n## Publication record\n\n"
+          text += f"- Published from exact default-branch commit: `{sha}`\n"
+          text += "- Real NVIDIA/vLLM GPU acceptance: **NOT RUN**.\n"
+          text += "- Production deployment: **NOT DEPLOYED**.\n"
+          text += "- Bounded soak, isolated DR rehearsal, real PostgreSQL tests, Docker gates and real Kind acceptance were rerun before publication.\n"
+          Path("build/final-release-notes.md").write_text(text, encoding="utf-8", newline="\n")
+          PY
+
+          tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+            -czf "build/mini-ai-cloud-v${RELEASE_VERSION}-evidence.tar.gz" \
+            -C build "evidence/${TARGET_SHA}" "release/${TARGET_SHA}" soak dr-rehearsal
+
+          mapfile -t wheel_assets < <(
+            find build/release-wheel -maxdepth 1 -type f -name 'mini_ai_cloud-*.whl' -print | sort
+          )
+          test "${#wheel_assets[@]}" -eq 1
+          checksum_assets=(
+            "${wheel_assets[0]}"
+            "build/mini-ai-cloud-v${RELEASE_VERSION}-evidence.tar.gz"
+            "build/mini-ai-cloud-image.spdx.json"
+            "${release_dir}/cyclonedx-sbom.json"
+            "${release_dir}/release-notes.md"
+            "${release_dir}/release-preparation.json"
+            "${release_dir}/SHA256SUMS"
+          )
+          : >build/release-assets.sha256
+          for asset_path in "${checksum_assets[@]}"; do
+            digest="$(sha256sum "${asset_path}" | cut -d' ' -f1)"
+            printf '%s  %s\n' "${digest}" "$(basename "${asset_path}")" \
+              >>build/release-assets.sha256
+          done
+
+      - name: Create or repair the exact release tag and GitHub Release
+        shell: bash
+        env:
+          TARGET_SHA: ${{ steps.approval.outputs.target_sha }}
+          RELEASE_TAG: ${{ steps.approval.outputs.tag }}
+        run: |
+          set -Eeuo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --force --tags origin
+
+          main_sha="$(git ls-remote origin refs/heads/main | cut -f1)"
+          test "${main_sha}" = "${TARGET_SHA}"
+          test "$(git rev-parse HEAD)" = "${TARGET_SHA}"
+
+          if git show-ref --verify --quiet "refs/tags/${RELEASE_TAG}"; then
+            test "$(git rev-list -n1 "${RELEASE_TAG}")" = "${TARGET_SHA}"
+          else
+            git tag -a "${RELEASE_TAG}" "${TARGET_SHA}" -m "Mini AI Cloud ${RELEASE_TAG}"
+            git push origin "refs/tags/${RELEASE_TAG}"
+          fi
+
+          mapfile -t wheel_assets < <(
+            find build/release-wheel -maxdepth 1 -type f -name 'mini_ai_cloud-*.whl' -print | sort
+          )
+          test "${#wheel_assets[@]}" -eq 1
+          release_assets=(
+            "${wheel_assets[0]}"
+            "build/mini-ai-cloud-v${RELEASE_VERSION}-evidence.tar.gz"
+            "build/mini-ai-cloud-image.spdx.json"
+            "build/release/${TARGET_SHA}/cyclonedx-sbom.json"
+            "build/release/${TARGET_SHA}/release-notes.md"
+            "build/release/${TARGET_SHA}/release-preparation.json"
+            "build/release/${TARGET_SHA}/SHA256SUMS"
+            "build/release-assets.sha256"
+          )
+          expected_assets=()
+          for asset_path in "${release_assets[@]}"; do
+            test -f "${asset_path}"
+            expected_assets+=("$(basename "${asset_path}")")
+          done
+
+          release_is_draft=true
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            release_is_draft="$(
+              gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+                --json isDraft --jq '.isDraft'
+            )"
+            release_is_prerelease="$(
+              gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+                --json isPrerelease --jq '.isPrerelease'
+            )"
+            release_is_immutable="$(
+              gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+                --jq '.immutable // false'
+            )"
+            while IFS= read -r remote_asset; do
+              printf '%s\n' "${expected_assets[@]}" | grep -Fxq "${remote_asset}" || {
+                echo "Unexpected existing release asset: ${remote_asset}" >&2
+                exit 1
+              }
+            done < <(
+              gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+                --json assets --jq '.assets[].name'
+            )
+            if [ "${release_is_draft}" = "true" ] || \
+              [ "${release_is_immutable}" = "false" ]; then
+              gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+                --title "Mini AI Cloud ${RELEASE_TAG}" \
+                --notes-file build/final-release-notes.md \
+                --draft \
+                --prerelease=false
+              gh release upload "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --clobber \
+                "${release_assets[@]}"
+              release_is_draft=true
+            else
+              test "${release_is_prerelease}" = "false"
+            fi
+          else
+            gh release create "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag \
+              --draft \
+              --title "Mini AI Cloud ${RELEASE_TAG}" \
+              --notes-file build/final-release-notes.md \
+              "${release_assets[@]}"
+          fi
+
+          mapfile -t published_assets < <(
+            gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+              --json assets --jq '.assets[].name' | sort
+          )
+          mapfile -t expected_assets < <(printf '%s\n' "${expected_assets[@]}" | sort)
+          test "$(printf '%s\n' "${published_assets[@]}")" = \
+            "$(printf '%s\n' "${expected_assets[@]}")"
+
+          verification_dir="${RUNNER_TEMP}/release-asset-verification"
+          mkdir -p "${verification_dir}"
+          gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --dir "${verification_dir}" --clobber
+          (cd "${verification_dir}" && sha256sum --check --strict release-assets.sha256)
+          if [ "${release_is_draft}" = "true" ]; then
+            cmp build/release-assets.sha256 "${verification_dir}/release-assets.sha256"
+          fi
+
+          export VERIFICATION_DIR="${verification_dir}"
+          python - <<'PY'
+          import base64
+          import csv
+          import hashlib
+          import io
+          import json
+          import os
+          import re
+          import tarfile
+          import zipfile
+          from email.parser import Parser
+          from pathlib import Path, PurePosixPath
+
+          root = Path(os.environ["VERIFICATION_DIR"])
+          sha = os.environ["TARGET_SHA"]
+          version = os.environ["RELEASE_VERSION"]
+
+          wheels = list(root.glob("mini_ai_cloud-*.whl"))
+          assert len(wheels) == 1, wheels
+          with zipfile.ZipFile(wheels[0]) as wheel:
+              metadata_name = next(name for name in wheel.namelist() if name.endswith(".dist-info/METADATA"))
+              metadata = Parser().parsestr(wheel.read(metadata_name).decode("utf-8"))
+          assert metadata["Name"] == "mini-ai-cloud"
+          assert metadata["Version"] == version
+
+          generated_wheels = list(Path("build/release-wheel").glob("mini_ai_cloud-*.whl"))
+          assert len(generated_wheels) == 1, generated_wheels
+
+          def normalized_wheel_hashes(path: Path) -> dict[str, str]:
+              with zipfile.ZipFile(path) as wheel:
+                  result = {}
+                  for name in sorted(wheel.namelist()):
+                      if name.endswith(".dist-info/RECORD"):
+                          continue
+                      payload = wheel.read(name)
+                      if name.endswith(".dist-info/WHEEL"):
+                          lines = [
+                              line for line in payload.splitlines() if not line.startswith(b"Generator:")
+                          ]
+                          payload = b"\n".join(lines) + b"\n"
+                      result[name] = hashlib.sha256(payload).hexdigest()
+                  return result
+
+          def validate_wheel_record(path: Path) -> None:
+              with zipfile.ZipFile(path) as wheel:
+                  record_names = [
+                      name for name in wheel.namelist() if name.endswith(".dist-info/RECORD")
+                  ]
+                  assert len(record_names) == 1, record_names
+                  record_name = record_names[0]
+                  rows = list(
+                      csv.reader(io.StringIO(wheel.read(record_name).decode("utf-8")))
+                  )
+                  assert all(len(row) == 3 for row in rows), rows
+                  entries = {row[0]: (row[1], row[2]) for row in rows}
+                  assert len(entries) == len(rows), "duplicate RECORD path"
+                  files = {name for name in wheel.namelist() if not name.endswith("/")}
+                  assert set(entries) == files, (entries, files)
+                  for name in sorted(files):
+                      digest, size = entries[name]
+                      if name == record_name:
+                          assert digest == "" and size == ""
+                          continue
+                      payload = wheel.read(name)
+                      expected = base64.urlsafe_b64encode(
+                          hashlib.sha256(payload).digest()
+                      ).rstrip(b"=").decode("ascii")
+                      assert digest == f"sha256={expected}", name
+                      assert size == str(len(payload)), name
+
+          validate_wheel_record(wheels[0])
+          validate_wheel_record(generated_wheels[0])
+          assert normalized_wheel_hashes(wheels[0]) == normalized_wheel_hashes(generated_wheels[0])
+
+          archive = root / f"mini-ai-cloud-v{version}-evidence.tar.gz"
+          expected_checksum_names = {
+              wheels[0].name,
+              archive.name,
+              "mini-ai-cloud-image.spdx.json",
+              "cyclonedx-sbom.json",
+              "release-notes.md",
+              "release-preparation.json",
+              "SHA256SUMS",
+          }
+          checksum_entries = {}
+          for line in (root / "release-assets.sha256").read_text(encoding="utf-8").splitlines():
+              digest, separator, name = line.partition("  ")
+              assert separator and re.fullmatch(r"[0-9a-f]{64}", digest), line
+              assert name and "/" not in name and "\\" not in name, name
+              assert name not in checksum_entries, name
+              checksum_entries[name] = digest
+          assert set(checksum_entries) == expected_checksum_names, checksum_entries
+
+          image_sbom = json.loads((root / "mini-ai-cloud-image.spdx.json").read_text(encoding="utf-8"))
+          assert image_sbom.get("spdxVersion", "").startswith("SPDX-")
+          release_images = [
+              package
+              for package in image_sbom.get("packages", [])
+              if package.get("SPDXID") == "SPDXRef-ReleaseImage"
+          ]
+          assert len(release_images) == 1, release_images
+          release_image = release_images[0]
+          assert release_image["name"] == "mini-ai-cloud:release-gate"
+          assert release_image["versionInfo"] == version
+          assert "SPDXRef-ReleaseImage" in image_sbom.get("documentDescribes", [])
+          image_checksums = {
+              item["algorithm"]: item["checksumValue"]
+              for item in release_image.get("checksums", [])
+          }
+          assert re.fullmatch(r"[0-9a-f]{64}", image_checksums.get("SHA256", ""))
+          image_refs = {
+              (item["referenceCategory"], item["referenceType"]): item["referenceLocator"]
+              for item in release_image.get("externalRefs", [])
+          }
+          assert image_refs[("OTHER", "git-sha")] == sha
+
+          with tarfile.open(archive, "r:gz") as bundle:
+              members = bundle.getmembers()
+              for member in members:
+                  path = PurePosixPath(member.name)
+                  assert not path.is_absolute() and ".." not in path.parts
+              file_members = [member for member in members if member.isfile()]
+              names = {member.name for member in file_members}
+              assert len(names) == len(file_members), "duplicate regular-file member"
+
+              def read_bytes(name: str) -> bytes:
+                  fileobj = bundle.extractfile(name)
+                  assert fileobj is not None, name
+                  return fileobj.read()
+
+              def read_json(name: str) -> dict:
+                  return json.loads(read_bytes(name).decode("utf-8"))
+
+              def parse_checksums(name: str) -> dict[str, str]:
+                  entries = {}
+                  for line in read_bytes(name).decode("utf-8").splitlines():
+                      digest, separator, relative = line.partition("  ")
+                      assert separator and re.fullmatch(r"[0-9a-f]{64}", digest), line
+                      path = PurePosixPath(relative)
+                      assert relative and not path.is_absolute() and ".." not in path.parts
+                      assert "\\" not in relative and relative not in entries, relative
+                      entries[relative] = digest
+                  return entries
+
+              def validate_checksums(prefix: str, manifest_name: str) -> dict[str, str]:
+                  entries = parse_checksums(manifest_name)
+                  expected = {
+                      name.removeprefix(prefix)
+                      for name in names
+                      if name.startswith(prefix) and name != manifest_name
+                  }
+                  assert set(entries) == expected, (manifest_name, entries, expected)
+                  for relative, digest in entries.items():
+                      assert hashlib.sha256(read_bytes(prefix + relative)).hexdigest() == digest
+                  return entries
+
+              evidence = read_json(f"evidence/{sha}/manifest.json")
+              preparation = read_json(f"release/{sha}/release-preparation.json")
+              cyclonedx = read_json(f"release/{sha}/cyclonedx-sbom.json")
+              soak_summaries = sorted(
+                  name for name in names if name.startswith("soak/") and name.endswith("/summary.json")
+              )
+              dr_summaries = sorted(
+                  name for name in names if name.startswith("dr-rehearsal/") and name.endswith("/summary.json")
+              )
+              assert len(soak_summaries) == 1, soak_summaries
+              assert len(dr_summaries) == 1, dr_summaries
+              soak = read_json(soak_summaries[0])
+              dr = read_json(dr_summaries[0])
+              evidence_prefix = f"evidence/{sha}/"
+              release_prefix = f"release/{sha}/"
+              evidence_checksums = validate_checksums(
+                  evidence_prefix, evidence_prefix + "hashes.sha256"
+              )
+              validate_checksums(release_prefix, release_prefix + "SHA256SUMS")
+              expected_artifact_hashes = {
+                  relative: digest
+                  for relative, digest in evidence_checksums.items()
+                  if relative != "manifest.json"
+              }
+              assert evidence["artifact_hashes"] == expected_artifact_hashes
+              bundled_checksums = read_bytes(release_prefix + "SHA256SUMS")
+              bundled_release_notes = read_bytes(release_prefix + "release-notes.md")
+
+          assert evidence["git"]["sha"] == sha
+          assert evidence["git"]["dirty"] is False
+          assert preparation["git_sha"] == sha
+          assert preparation["dirty_tree"] is False
+          assert preparation["version"] == version
+          assert preparation["real_gpu"] == "NOT_RUN"
+          assert preparation["deployment_status"] == "NOT_DEPLOYED"
+          assert soak["git_sha"] == sha
+          assert soak["rounds_requested"] == 3 and soak["rounds_completed"] == 3
+          assert soak["status"] == "PASS" and soak["cleanup"] == "PASS"
+          assert dr["git_sha"] == sha
+          assert dr["status"] == "PASS" and dr["cleanup"] == "PASS"
+          assert cyclonedx.get("bomFormat") == "CycloneDX"
+          cyclonedx_metadata = cyclonedx["metadata"]
+          assert cyclonedx_metadata["component"]["name"] == "mini-ai-cloud"
+          assert cyclonedx_metadata["component"]["version"] == version
+          cyclonedx_properties = {
+              item["name"]: item["value"] for item in cyclonedx_metadata.get("properties", [])
+          }
+          assert cyclonedx_properties["mini-ai-cloud:git-sha"] == sha
+          assert json.loads((root / "release-preparation.json").read_text(encoding="utf-8")) == preparation
+          assert json.loads((root / "cyclonedx-sbom.json").read_text(encoding="utf-8")) == cyclonedx
+          assert (root / "SHA256SUMS").read_bytes() == bundled_checksums
+          assert (root / "release-notes.md").read_bytes() == bundled_release_notes
+          PY
+          retained_wheel="$(find "${verification_dir}" -maxdepth 1 -type f \
+            -name 'mini_ai_cloud-*.whl' -print -quit)"
+          test -n "${retained_wheel}"
+          uv venv --python python "${verification_dir}/retained-wheel-venv"
+          uv pip install --python "${verification_dir}/retained-wheel-venv/bin/python" \
+            "${retained_wheel}"
+          "${verification_dir}/retained-wheel-venv/bin/mini-cloud" --help >/dev/null
+          test "$("${verification_dir}/retained-wheel-venv/bin/python" -c \
+            'import importlib.metadata; print(importlib.metadata.version("mini-ai-cloud"))')" = \
+            "${RELEASE_VERSION}"
+
+          if [ "${release_is_draft}" = "true" ]; then
+            main_sha="$(git ls-remote origin refs/heads/main | cut -f1)"
+            test "${main_sha}" = "${TARGET_SHA}"
+            test "$(git rev-parse HEAD)" = "${TARGET_SHA}"
+            remote_tag_sha="$(
+              git ls-remote origin "refs/tags/${RELEASE_TAG}^{}" | cut -f1
+            )"
+            if [ -z "${remote_tag_sha}" ]; then
+              remote_tag_sha="$(git ls-remote origin "refs/tags/${RELEASE_TAG}" | cut -f1)"
+            fi
+            test "${remote_tag_sha}" = "${TARGET_SHA}"
+            mapfile -t final_published_assets < <(
+              gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+                --json assets --jq '.assets[].name' | sort
+            )
+            test "$(printf '%s\n' "${final_published_assets[@]}")" = \
+              "$(printf '%s\n' "${expected_assets[@]}")"
+            final_verification_dir="${RUNNER_TEMP}/release-asset-final-verification"
+            mkdir -p "${final_verification_dir}"
+            gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+              --dir "${final_verification_dir}" --clobber
+            cmp build/release-assets.sha256 \
+              "${final_verification_dir}/release-assets.sha256"
+            (cd "${final_verification_dir}" && \
+              sha256sum --check --strict release-assets.sha256)
+            remote_tag_sha="$(
+              git ls-remote origin "refs/tags/${RELEASE_TAG}^{}" | cut -f1
+            )"
+            if [ -z "${remote_tag_sha}" ]; then
+              remote_tag_sha="$(git ls-remote origin "refs/tags/${RELEASE_TAG}" | cut -f1)"
+            fi
+            test "${remote_tag_sha}" = "${TARGET_SHA}"
+            gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+              --title "Mini AI Cloud ${RELEASE_TAG}" \
+              --notes-file build/final-release-notes.md \
+              --draft=false \
+              --prerelease=false \
+              --latest
+          fi
+          test "$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --json isDraft --jq '.isDraft')" = "false"
+          test "$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --json isPrerelease --jq '.isPrerelease')" = "false"
+          test "$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --json name --jq '.name')" = "Mini AI Cloud ${RELEASE_TAG}"
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name')" = \
+            "${RELEASE_TAG}"
+          test "$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --json body --jq '.body')" = "$(cat build/final-release-notes.md)"
+
+      - name: Record successful publication
+        if: success()
+        shell: bash
+        run: |
+          gh issue comment "${{ github.event.issue.number }}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --body "✅ Published Mini AI Cloud v${RELEASE_VERSION} from \`${{ steps.approval.outputs.target_sha }}\` with wheel, SBOMs and commit-bound evidence. Production deployment remains **NOT DEPLOYED**; real NVIDIA/vLLM acceptance remains **NOT RUN**."
+
+      - name: Record publication failure
+        if: failure()
+        shell: bash
+        run: |
+          gh issue comment "${{ github.event.issue.number }}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --body "❌ Mini AI Cloud v${RELEASE_VERSION} publication failed. No production deployment was attempted. Inspect workflow run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} before retrying the same owner authorization command."

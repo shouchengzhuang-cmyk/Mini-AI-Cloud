@@ -8,6 +8,7 @@ import pytest
 from scripts.release_gate import (
     RELEASE_VERSION,
     ReleaseGateError,
+    _release_notes,
     cyclonedx_sbom,
     scan_secret_text,
     validate_action_pins,
@@ -18,6 +19,26 @@ from scripts.release_gate import (
 )
 
 ROOT = Path(__file__).parents[2]
+
+
+def test_release_notes_use_pinned_previous_tag(monkeypatch: pytest.MonkeyPatch) -> None:
+    recorded: list[tuple[str, ...]] = []
+
+    def fake_run(command: tuple[str, ...], _root: Path) -> object:
+        recorded.append(command)
+        return type("Result", (), {"stdout": "- `abc1234` prior change\n"})()
+
+    monkeypatch.setattr("scripts.release_gate.PREVIOUS_RELEASE_TAG", "v0.3.0")
+    monkeypatch.setattr("scripts.release_gate._run", fake_run)
+
+    notes = _release_notes(
+        ROOT,
+        "a" * 40,
+        {"action_dependencies": 1, "locked_packages": 2, "secret_scanned_files": 3},
+    )
+
+    assert "- Previous tag: `v0.3.0`" in notes
+    assert recorded == [("git", "log", "--format=- `%h` %s", "--no-merges", "v0.3.0..HEAD")]
 
 
 def test_release_identity_actions_dependencies_container_and_contracts_are_locked() -> None:

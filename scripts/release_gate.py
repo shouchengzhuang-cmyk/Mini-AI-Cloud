@@ -17,6 +17,8 @@ from typer.core import TyperGroup, TyperOption
 from typer.main import get_command
 
 RELEASE_VERSION = "0.4.0"
+# Pin this alongside RELEASE_VERSION so retries cannot discover a different predecessor.
+PREVIOUS_RELEASE_TAG: str | None = None
 ACTION_SHA = re.compile(r"^[0-9a-f]{40}$")
 SECRET_PATTERNS = {
     "private-key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
@@ -326,8 +328,8 @@ def prepare_release_bundle(root: Path, output_root: Path) -> Path:
 
 
 def _release_notes(root: Path, git_sha: str, validation: dict[str, int]) -> str:
-    latest_tag = _latest_tag(root)
-    revision_range = f"{latest_tag}..HEAD" if latest_tag else "HEAD"
+    previous_tag = PREVIOUS_RELEASE_TAG
+    revision_range = f"{previous_tag}..HEAD" if previous_tag else "HEAD"
     commits = _run(
         ("git", "log", "--format=- `%h` %s", "--no-merges", revision_range),
         root,
@@ -340,7 +342,7 @@ This file prepares release notes; it does **not** create a GitHub Release or dep
 
 - Version: `{RELEASE_VERSION}`
 - Git SHA: `{git_sha}`
-- Previous tag: `{latest_tag or "NONE"}`
+- Previous tag: `{previous_tag or "NONE"}`
 - Evidence: `build/evidence/{git_sha}`
 
 ## Automated gates
@@ -386,19 +388,6 @@ def wheel_smoke(root: Path, dist_dir: Path) -> None:
         )
         if result.stdout.strip() != RELEASE_VERSION:
             raise ReleaseGateError("installed wheel version does not match release version")
-
-
-def _latest_tag(root: Path) -> str | None:
-    result = subprocess.run(
-        ["git", "describe", "--tags", "--abbrev=0"],
-        cwd=root,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    value = result.stdout.strip()
-    return value if result.returncode == 0 and value else None
 
 
 def _git_sha(root: Path) -> str:

@@ -9,6 +9,7 @@ import yaml  # type: ignore[import-untyped]
 from scripts.soak import CLUSTER_NAME, CommandOutcome, SoakError, run_soak
 
 ROOT = Path(__file__).parents[2]
+GIT_SHA = "a" * 40
 
 
 class FakeRunner:
@@ -27,6 +28,8 @@ class FakeRunner:
     def __call__(self, argv: tuple[str, ...], _cwd: Path, _timeout: float) -> CommandOutcome:
         self.calls.append(argv)
         joined = " ".join(argv)
+        if argv == ("git", "rev-parse", "HEAD"):
+            return CommandOutcome(0, f"{GIT_SHA}\n")
         if argv == ("kind", "get", "clusters"):
             existing = self.existing_cluster and self.calls.count(argv) == 1
             return CommandOutcome(0, f"{CLUSTER_NAME}\n" if existing else "")
@@ -78,6 +81,7 @@ def test_soak_runs_fixed_rounds_checks_leaks_and_removes_owned_cluster(tmp_path:
     )
     assert sum("delete" in call and "pod" in call for call in fake.calls) == 2
     summary = json.loads((result.artifact_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["git_sha"] == GIT_SHA
     assert summary["rounds_completed"] == 2
     assert summary["cleanup"] == "PASS"
     assert all(snapshot["active_requests"] == 0 for snapshot in summary["snapshots"])
