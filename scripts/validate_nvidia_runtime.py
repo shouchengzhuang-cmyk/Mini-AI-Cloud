@@ -19,6 +19,10 @@ FAKE_PLUGIN_PATH = Path("deploy/nvidia-runtime/00-fake-device-plugin.yaml")
 FAKE_ALLOCATION_PATH = Path("deploy/nvidia-runtime/10-fake-device-allocation.yaml")
 TRIVY_IGNORE_PATH = Path(".trivyignore.yaml")
 EXPECTED_TRIVY_EXCEPTIONS = {"KSV-0017", "KSV-0118", "KSV-0121"}
+EXPECTED_TRIVY_PATHS = [
+    FAKE_PLUGIN_PATH.as_posix(),
+    f"app/{FAKE_PLUGIN_PATH.as_posix()}",
+]
 
 
 def validate_repository(repository_root: Path) -> NvidiaRuntimeAcceptanceContract:
@@ -108,8 +112,10 @@ def _validate_trivy_ignores(manifest: dict[str, Any]) -> None:
         exception_id = entry["id"]
         if not isinstance(exception_id, str):
             raise ValueError("Trivy exception IDs must be strings")
-        if entry["paths"] != [FAKE_PLUGIN_PATH.as_posix()]:
-            raise ValueError("Trivy exceptions must target only the fake Device Plugin manifest")
+        if entry["paths"] != EXPECTED_TRIVY_PATHS:
+            raise ValueError(
+                "Trivy exceptions must target only the source and image fake plugin paths"
+            )
         ids.add(exception_id)
     if ids != EXPECTED_TRIVY_EXCEPTIONS:
         raise ValueError("Trivy exception IDs do not match the reviewed NVIDIA CI boundary")
