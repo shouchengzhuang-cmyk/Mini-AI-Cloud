@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mini-ai-cloud-fake-device-allocation
+  namespace: mini-ai-cloud-serving
+  labels:
+    app.kubernetes.io/name: mini-ai-cloud-fake-device-allocation
+    app.kubernetes.io/part-of: mini-ai-cloud-nvidia-ci
+  annotations:
+    mini-ai-cloud/test-scope: fake-device-plugin-only
+spec:
+  automountServiceAccountToken: false
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: allocation-probe
+      image: registry.k8s.io/e2e-test-images/agnhost@sha256:541cafada1867e8684b25d24f0cb1132e76aff093401b5987490b654fbd79c0a
+      imagePullPolicy: IfNotPresent
+      command: [/agnhost]
+      args: [pause]
+      resources:
+        requests:
+          example.com/resource: "1"
+          cpu: 5m
+          memory: 8Mi
+        limits:
+          example.com/resource: "1"
+          cpu: 5m
+          memory: 8Mi
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: [ALL]
+        privileged: false
+        readOnlyRootFilesystem: true

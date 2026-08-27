@@ -692,6 +692,7 @@ class KubernetesServingRuntimeAdapter:
         liveness_probe: client.V1Probe | None = None
         runtime_class_name: str | None = None
         node_selector: dict[str, str] | None = None
+        affinity: client.V1Affinity | None = None
         tolerations: list[client.V1Toleration] | None = None
         if profile is not None:
             resource_name = profile.kubernetes.resource_name
@@ -712,6 +713,29 @@ class KubernetesServingRuntimeAdapter:
             liveness_probe = _http_probe(profile.probes.health)
             runtime_class_name = profile.kubernetes.runtime_class_name
             node_selector = dict(profile.kubernetes.node_selector)
+            if profile.kubernetes.node_affinity:
+                affinity = client.V1Affinity(
+                    node_affinity=client.V1NodeAffinity(
+                        required_during_scheduling_ignored_during_execution=client.V1NodeSelector(
+                            node_selector_terms=[
+                                client.V1NodeSelectorTerm(
+                                    match_expressions=[
+                                        client.V1NodeSelectorRequirement(
+                                            key=requirement.key,
+                                            operator=requirement.operator,
+                                            values=(
+                                                list(requirement.values)
+                                                if requirement.values
+                                                else None
+                                            ),
+                                        )
+                                        for requirement in profile.kubernetes.node_affinity
+                                    ]
+                                )
+                            ]
+                        )
+                    )
+                )
             tolerations = [
                 client.V1Toleration(
                     key=item.key,
@@ -763,6 +787,7 @@ class KubernetesServingRuntimeAdapter:
                 annotations=annotations or None,
             ),
             spec=client.V1PodSpec(
+                affinity=affinity,
                 automount_service_account_token=False,
                 containers=[container],
                 hostname=self.pod_name(spec),
@@ -1033,6 +1058,13 @@ def _pod_contract(pod: object) -> dict[str, object]:
     resources = getattr(container, "resources", None)
     probe = getattr(container, "readiness_probe", None)
     liveness_probe = getattr(container, "liveness_probe", None)
+    affinity = getattr(pod_spec, "affinity", None)
+    node_affinity = getattr(affinity, "node_affinity", None)
+    required_node_affinity = getattr(
+        node_affinity,
+        "required_during_scheduling_ignored_during_execution",
+        None,
+    )
     volumes = getattr(pod_spec, "volumes", None) or []
     volume = volumes[0] if len(volumes) == 1 else None
     empty_dir = getattr(volume, "empty_dir", None)
@@ -1073,6 +1105,29 @@ def _pod_contract(pod: object) -> dict[str, object]:
                 {
                     "runtime_class_name": getattr(pod_spec, "runtime_class_name", None),
                     "node_selector": _string_mapping(getattr(pod_spec, "node_selector", None)),
+                    "required_node_affinity": tuple(
+                        {
+                            "match_expressions": tuple(
+                                {
+                                    "key": getattr(expression, "key", None),
+                                    "operator": getattr(expression, "operator", None),
+                                    "values": tuple(getattr(expression, "values", None) or ()),
+                                }
+                                for expression in (getattr(term, "match_expressions", None) or ())
+                            ),
+                            "match_fields": tuple(
+                                {
+                                    "key": getattr(expression, "key", None),
+                                    "operator": getattr(expression, "operator", None),
+                                    "values": tuple(getattr(expression, "values", None) or ()),
+                                }
+                                for expression in (getattr(term, "match_fields", None) or ())
+                            ),
+                        }
+                        for term in (
+                            getattr(required_node_affinity, "node_selector_terms", None) or ()
+                        )
+                    ),
                     "tolerations": tuple(
                         {
                             "key": getattr(item, "key", None),

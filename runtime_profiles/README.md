@@ -62,6 +62,12 @@ The example profiles remain non-deployable after rendering support. The current 
 Kubernetes controller does not select them automatically; A7/A8 must provide independently
 validated runtime profiles and execution wiring.
 
+The production-candidate NVIDIA contract is `nvidia-vllm-k8s@2.0.0`. Its pinned image,
+GFD constraints, fake Device Plugin scope, diagnostics, and real engine acceptance entry
+are documented in [`docs/nvidia-runtime.md`](../docs/nvidia-runtime.md). Its status remains
+`REAL_HW_NOT_RUN` until the real-hardware command completes and immutable evidence is
+reviewed.
+
 ## Compatibility metadata
 
 `python: profile-owned` keeps runtime Python independent of the control-plane interpreter.

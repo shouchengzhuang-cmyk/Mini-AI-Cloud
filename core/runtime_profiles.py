@@ -128,10 +128,47 @@ class KubernetesToleration(FrozenContractModel):
         return self
 
 
+class KubernetesNodeSelectorRequirement(FrozenContractModel):
+    key: str = Field(min_length=1, max_length=253)
+    operator: Literal["In", "NotIn", "Exists", "DoesNotExist", "Gt", "Lt"]
+    values: tuple[str, ...] = Field(default=(), max_length=64)
+
+    @field_validator("key")
+    @classmethod
+    def validate_key(cls, value: str) -> str:
+        if any(character.isspace() or ord(character) < 32 for character in value):
+            raise ValueError("node affinity keys must not contain whitespace")
+        return value
+
+    @model_validator(mode="after")
+    def validate_operator_values(self) -> Self:
+        if any(
+            not value
+            or len(value) > 63
+            or any(character.isspace() or ord(character) < 32 for character in value)
+            for value in self.values
+        ):
+            raise ValueError("node affinity values must be non-empty Kubernetes label values")
+        if self.operator in {"Exists", "DoesNotExist"} and self.values:
+            raise ValueError(f"{self.operator} node affinity requirements must not set values")
+        if self.operator in {"In", "NotIn"} and not self.values:
+            raise ValueError(f"{self.operator} node affinity requirements require values")
+        if self.operator in {"Gt", "Lt"}:
+            if len(self.values) != 1 or not self.values[0].isdigit():
+                raise ValueError(f"{self.operator} node affinity requirements need one integer")
+            if str(int(self.values[0])) != self.values[0]:
+                raise ValueError("numeric node affinity values must use canonical integers")
+        return self
+
+
 class KubernetesRuntime(FrozenContractModel):
     runtime_class_name: str = Field(min_length=1, max_length=253)
     resource_name: str = Field(min_length=3, max_length=253)
     node_selector: dict[str, str] = Field(min_length=1, max_length=32)
+    node_affinity: tuple[KubernetesNodeSelectorRequirement, ...] = Field(
+        default=(),
+        max_length=32,
+    )
     tolerations: tuple[KubernetesToleration, ...] = Field(default=(), max_length=32)
     requests_equal_limits: Literal[True] = True
     security: RuntimeSecurityContext
@@ -162,6 +199,16 @@ class KubernetesRuntime(FrozenContractModel):
                 raise ValueError("node_selector keys must not contain whitespace")
             if any(character.isspace() or ord(character) < 32 for character in selector_value):
                 raise ValueError("node_selector values must not contain whitespace")
+        return value
+
+    @field_validator("node_affinity")
+    @classmethod
+    def validate_node_affinity(
+        cls, value: tuple[KubernetesNodeSelectorRequirement, ...]
+    ) -> tuple[KubernetesNodeSelectorRequirement, ...]:
+        keys = [requirement.key for requirement in value]
+        if len(set(keys)) != len(keys):
+            raise ValueError("node_affinity requirement keys must be unique")
         return value
 
 

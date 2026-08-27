@@ -32,7 +32,15 @@ def test_committed_runtime_profiles_and_generated_files_are_valid() -> None:
 
     assert {loaded.profile.vendor.value for loaded in profiles} == {"nvidia", "huawei-ascend"}
     assert all(loaded.profile.image.reference.count("@sha256:") == 1 for loaded in profiles)
-    assert all(loaded.profile.evidence_status.value == "SCHEMA_READY" for loaded in profiles)
+    assert {loaded.profile.evidence_status.value for loaded in profiles} == {
+        "SCHEMA_READY",
+        "REAL_HW_NOT_RUN",
+    }
+    assert {loaded.profile.identity for loaded in profiles} >= {
+        "nvidia-vllm-k8s@1.0.0",
+        "nvidia-vllm-k8s@2.0.0",
+        "ascend-vllm-k8s-a2@1.0.0",
+    }
 
 
 def test_runtime_profile_model_is_frozen() -> None:
@@ -94,6 +102,23 @@ def test_vendor_kind_and_node_selector_must_agree() -> None:
     payload = _profile_payload()
     payload["kubernetes"]["node_selector"]["accelerator.mini-ai-cloud/vendor"] = "huawei-ascend"
     with pytest.raises(ValidationError, match="node_selector must set"):
+        RuntimeProfile.model_validate(payload)
+
+
+def test_node_affinity_requirements_fail_closed() -> None:
+    payload = _profile_payload("nvidia-vllm-k8s.yaml")
+    payload["kubernetes"]["node_affinity"][0]["values"] = ["unexpected"]
+    with pytest.raises(ValidationError, match="must not set values"):
+        RuntimeProfile.model_validate(payload)
+
+    payload = _profile_payload("nvidia-vllm-k8s.yaml")
+    payload["kubernetes"]["node_affinity"][1]["values"] = ["01"]
+    with pytest.raises(ValidationError, match="canonical integers"):
+        RuntimeProfile.model_validate(payload)
+
+    payload = _profile_payload("nvidia-vllm-k8s.yaml")
+    payload["kubernetes"]["node_affinity"][1]["key"] = "invalid key"
+    with pytest.raises(ValidationError, match="must not contain whitespace"):
         RuntimeProfile.model_validate(payload)
 
 

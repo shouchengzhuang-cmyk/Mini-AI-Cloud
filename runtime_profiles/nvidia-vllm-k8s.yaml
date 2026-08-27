@@ -1,0 +1,102 @@
+schema_version: 1.0.0
+id: nvidia-vllm-k8s
+version: 2.0.0
+vendor: nvidia
+kind: gpu
+execution_mode: kubernetes
+engine: vllm
+
+image:
+  reference: docker.io/vllm/vllm-openai@sha256:61fc8a896b0a4fbbbdc063bc4b0dbc25ce98e02b5050c24aeb7830ac02039b14
+  digest_required: true
+
+kubernetes:
+  runtime_class_name: nvidia
+  resource_name: nvidia.com/gpu
+  node_selector:
+    accelerator.mini-ai-cloud/vendor: nvidia
+  node_affinity:
+    - key: nvidia.com/gpu.product
+      operator: Exists
+      values: []
+    - key: nvidia.com/gpu.count
+      operator: Gt
+      values: ["0"]
+    - key: nvidia.com/gpu.compute.major
+      operator: Gt
+      values: ["7"]
+    - key: nvidia.com/gpu.sharing-strategy
+      operator: In
+      values: [none]
+    - key: nvidia.com/mig.strategy
+      operator: In
+      values: [none]
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  requests_equal_limits: true
+  security:
+    privileged: false
+    hostPID: false
+    hostNetwork: false
+    hostPath: []
+    allow_privilege_escalation: false
+
+process:
+  command: [vllm, serve]
+  command_allowlist:
+    - [vllm, serve]
+  env_allowlist:
+    - VLLM_LOGGING_LEVEL
+  api_protocol: openai
+  visible_devices_source: device-plugin
+
+probes:
+  health:
+    path: /health
+    port: 8000
+    initial_delay_seconds: 120
+    period_seconds: 10
+    timeout_seconds: 5
+    failure_threshold: 18
+  readiness:
+    path: /health
+    port: 8000
+    initial_delay_seconds: 120
+    period_seconds: 5
+    timeout_seconds: 3
+    failure_threshold: 36
+
+compatibility:
+  hardware_families:
+    - NVIDIA CUDA compute capability 8.0+
+  python: profile-owned
+  vllm_version: pinned
+  vendor_plugin_version: pinned
+  driver_version: recorded-at-runtime
+  toolkit_version: recorded-at-runtime
+
+capabilities:
+  model_architectures: []
+  dtypes: [float16, bfloat16]
+  features: [streaming]
+  tensor_parallel:
+    supported: true
+    scope: single-node
+    minimum_size: 1
+    maximum_size: null
+    maximum_size_source: runtime-observation
+
+allocation_authority: kubernetes_device_plugin
+evidence_status: REAL_HW_NOT_RUN
+evidence_references:
+  - runtime_profiles/nvidia-vllm-k8s.acceptance.json
+  - https://github.com/vllm-project/vllm/releases/tag/v0.28.0
+  - https://github.com/NVIDIA/k8s-device-plugin/releases/tag/v0.20.0
+limitations:
+  - No physical NVIDIA accelerator has run this profile in Mini AI Cloud.
+  - The image manifest and embedded version metadata were inspected without pulling image layers.
+  - GPU Feature Discovery must publish the required product, count, compute, MIG, and sharing labels.
+  - MIG, time-slicing, MPS, vGPU, multi-node tensor parallel, and pipeline parallel are unsupported.
+  - Model architecture and memory fit require independent validation before admission.

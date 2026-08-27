@@ -17,6 +17,7 @@ RELEASE_WHEEL_DIR ?= build/release-wheel
 	test-e2e test-serving check config build up down ps logs migrate migrate-local run-api run-worker \
 	load-test dev observability test-chaos test-k8s kind-up kind-down kind-serving-up \
 	test-kind-serving kind-serving-down demo-fencing demo-adoption demo-sse-drain demo-all \
+	test-nvidia-fake-device-plugin \
 	test-dr test-soak test-release release-validate benchmark backup restore
 
 help: ## Show available targets.
@@ -128,6 +129,9 @@ kind-serving-up: ## Build and deploy the isolated Phase IV-A Kind serving stack.
 
 test-kind-serving: ## Run the mandatory real Kubernetes serving E2E against Kind.
 	bash scripts/kind_serving.sh test
+
+test-nvidia-fake-device-plugin: ## Run the fake extended-resource allocation test in Kind.
+	bash scripts/nvidia_fake_device_plugin.sh test
 
 kind-serving-down: ## Delete only the Phase IV-A Kind cluster and local credentials.
 	bash scripts/kind_serving.sh down
