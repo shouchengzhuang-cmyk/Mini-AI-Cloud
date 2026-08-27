@@ -38,9 +38,7 @@ def test_release_notes_use_pinned_previous_tag(monkeypatch: pytest.MonkeyPatch) 
     )
 
     assert "- Previous tag: `v0.3.0`" in notes
-    assert recorded == [
-        ("git", "log", "--format=- `%h` %s", "--no-merges", "v0.3.0..HEAD")
-    ]
+    assert recorded == [("git", "log", "--format=- `%h` %s", "--no-merges", "v0.3.0..HEAD")]
 
 
 def test_release_identity_actions_dependencies_container_and_contracts_are_locked() -> None:
