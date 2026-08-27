@@ -89,6 +89,8 @@ jobs:
             }
           }
           require_success "ci.yml"
+          # release-security.yml includes the full-history Gitleaks scan. The
+          # Gitleaks action itself rejects issue_comment-triggered workflows.
           require_success "release-security.yml"
 
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
@@ -164,11 +166,6 @@ jobs:
       - name: Ensure dedicated Kind cluster and local credentials are absent
         if: always()
         run: make kind-serving-down
-
-      - name: Scan Git history for secrets
-        uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Scan repository dependencies, secrets and misconfiguration
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
