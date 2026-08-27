@@ -219,18 +219,29 @@ trap stop_postgres EXIT
 
 "${compose[@]}" up --detach postgres
 postgres_started=true
-for _ in {1..60}; do
+postgres_ready() {
+  # The image starts a temporary PostgreSQL server while creating POSTGRES_DB.
+  # Require PID 1 to be the final postgres process before accepting a query.
   # Expand database settings inside the container, not in the host shell.
   # shellcheck disable=SC2016
-  if "${compose[@]}" exec -T postgres sh -ec \
-    'pg_isready --username="$POSTGRES_USER" --dbname="$POSTGRES_DB"' >/dev/null 2>&1; then
+  "${compose[@]}" exec -T postgres sh -ec '
+    read -r pid_one_comm </proc/1/comm
+    [ "$pid_one_comm" = postgres ]
+    psql --set ON_ERROR_STOP=1 \
+      --username="$POSTGRES_USER" \
+      --dbname="$POSTGRES_DB" \
+      --tuples-only \
+      --no-align \
+      --command "SELECT 1" >/dev/null
+  '
+}
+for _ in {1..60}; do
+  if postgres_ready >/dev/null 2>&1; then
     break
   fi
   sleep 1
 done
-# shellcheck disable=SC2016
-"${compose[@]}" exec -T postgres sh -ec \
-  'pg_isready --username="$POSTGRES_USER" --dbname="$POSTGRES_DB"' >/dev/null ||
+postgres_ready >/dev/null 2>&1 ||
   fail "PostgreSQL did not become ready"
 # shellcheck disable=SC2016
 "${compose[@]}" exec -T postgres sh -ec \
