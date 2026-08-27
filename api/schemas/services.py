@@ -13,6 +13,11 @@ from pydantic import (
     model_validator,
 )
 
+from api.schemas.accelerators import (
+    AcceleratorRequest,
+    reconcile_legacy_gpu_fields,
+    require_current_execution_support,
+)
 from api.schemas.common import PaginationMeta, RequestModel, ResponseModel
 from core.enums import RuntimeType
 from models.service import (
@@ -50,9 +55,37 @@ class ServiceCreate(RequestModel):
     image: StrictStr | None = Field(default=None, min_length=1, max_length=512)
     cpu_millicores: StrictInt = Field(default=1000, ge=1, le=1_024_000)
     memory_mb: StrictInt = Field(default=1024, ge=16, le=1_048_576)
-    gpu_count: StrictInt = Field(default=0, ge=0, le=64)
-    gpu_memory_mb: StrictInt = Field(default=0, ge=0, le=1_048_576)
-    gpu_model: StrictStr | None = Field(default=None, min_length=1, max_length=255)
+    accelerator: AcceleratorRequest | None = Field(
+        default=None,
+        exclude=True,
+        description=(
+            "Vendor-neutral accelerator request. A1 accepts the complete NVIDIA/Ascend "
+            "schema while preserving the current execution boundary."
+        ),
+    )
+    gpu_count: StrictInt = Field(
+        default=0,
+        ge=0,
+        le=64,
+        json_schema_extra={"deprecated": True},
+        description="Deprecated v0.4 NVIDIA GPU count; use accelerator.count.",
+    )
+    gpu_memory_mb: StrictInt = Field(
+        default=0,
+        ge=0,
+        le=1_048_576,
+        json_schema_extra={"deprecated": True},
+        description=(
+            "Deprecated v0.4 memory per NVIDIA GPU; use accelerator.memory_mb_per_device."
+        ),
+    )
+    gpu_model: StrictStr | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        json_schema_extra={"deprecated": True},
+        description="Deprecated v0.4 NVIDIA model; use accelerator.allowed_models.",
+    )
     tensor_parallel_size: StrictInt | None = Field(default=None, ge=1, le=64)
     dtype: VLLMDType = "auto"
     gpu_memory_utilization: StrictFloat = Field(default=0.9, gt=0, le=1)
@@ -96,6 +129,16 @@ class ServiceCreate(RequestModel):
 
     @model_validator(mode="after")
     def validate_initial_replica_count(self) -> "ServiceCreate":
+        gpu_count, gpu_memory_mb, gpu_model = reconcile_legacy_gpu_fields(
+            accelerator=self.accelerator,
+            gpu_count=self.gpu_count,
+            gpu_memory_mb=self.gpu_memory_mb,
+            gpu_model=self.gpu_model,
+            fields_set=self.model_fields_set,
+        )
+        object.__setattr__(self, "gpu_count", gpu_count)
+        object.__setattr__(self, "gpu_memory_mb", gpu_memory_mb)
+        object.__setattr__(self, "gpu_model", gpu_model)
         if self.model is None and self.registered_model_id is None:
             raise ValueError("model or registered_model_id is required")
 
@@ -141,6 +184,17 @@ class ServiceCreate(RequestModel):
         ):
             raise ValueError("replicas must be within enabled autoscaling min/max bounds")
         return self
+
+    @property
+    def effective_accelerator(self) -> AcceleratorRequest:
+        return self.accelerator or AcceleratorRequest.from_legacy_gpu(
+            gpu_count=self.gpu_count,
+            gpu_memory_mb=self.gpu_memory_mb,
+            gpu_model=self.gpu_model,
+        )
+
+    def require_current_accelerator_execution_support(self) -> None:
+        require_current_execution_support(self.accelerator)
 
 
 class ServiceScale(RequestModel):

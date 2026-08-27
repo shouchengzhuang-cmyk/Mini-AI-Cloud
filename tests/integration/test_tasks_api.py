@@ -81,6 +81,25 @@ async def test_api_persists_and_returns_structured_retry_policy(
     assert queried.json()["retry_policy"] == payload["retry_policy"]
 
 
+async def test_api_rejects_schema_ready_ascend_before_persistence_support(
+    api_client: AsyncClient,
+) -> None:
+    payload = _payload()
+    payload.pop("gpu_count")
+    payload["accelerator"] = {
+        "count": 1,
+        "memory_mb_per_device": 32_000,
+        "allowed_vendors": ["huawei-ascend"],
+        "allowed_kinds": ["npu"],
+        "selection_policy": "ascend-only",
+    }
+
+    response = await api_client.post("/api/v1/tasks", json=payload)
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "ACCELERATOR_EXECUTION_NOT_READY"
+
+
 async def test_api_idempotency_reuses_task_and_rejects_changed_payload(
     api_client: AsyncClient,
     database: Database,

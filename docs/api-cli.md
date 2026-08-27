@@ -41,6 +41,33 @@ Authorization: Bearer mkc_...
 
 以运行实例的 `/openapi.json` 为最终准绳。主要接口：
 
+### Accelerator 请求合同（M6 A1）
+
+任务与服务创建接口新增可选的 `accelerator` 对象，规范值当前只包括
+`nvidia/gpu` 与 `huawei-ascend/npu`。例如：
+
+```json
+{
+  "accelerator": {
+    "count": 1,
+    "memory_mb_per_device": 24000,
+    "allowed_vendors": ["nvidia", "huawei-ascend"],
+    "allowed_kinds": ["gpu", "npu"],
+    "allowed_models": [],
+    "required_capabilities": ["bf16"],
+    "runtime_profile": null,
+    "selection_policy": "any"
+  }
+}
+```
+
+`gpu_count`、`gpu_memory_mb` 与 `gpu_model` 在本发布周期继续接受，并映射为
+NVIDIA GPU 请求；新旧字段同时提供时必须语义一致，否则请求会被拒绝。A1
+只冻结领域和 API 合同：不能无损映射到现有 NVIDIA Docker 路径的 NPU、多厂商、
+capability 或 Runtime Profile 请求会 fail closed，直到后续 M6 持久化与调度 PR 完成。
+旧字段在 v0.5.0 全周期保留；不得早于 v0.6.0 删除，且删除前必须另行完成使用量审计、
+迁移指南与独立兼容性评审。
+
 | 资源 | 方法与路径 |
 | --- | --- |
 | Identity | `POST /api/v1/bootstrap`, `GET /api/v1/auth/whoami`, `POST /api/v1/users` |

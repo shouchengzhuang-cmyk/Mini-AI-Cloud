@@ -2,6 +2,123 @@
   "openapi": {
     "components": {
       "schemas": {
+        "AcceleratorKind": {
+          "enum": [
+            "gpu",
+            "npu"
+          ],
+          "title": "AcceleratorKind",
+          "type": "string"
+        },
+        "AcceleratorRequest": {
+          "additionalProperties": false,
+          "description": "Vendor-neutral accelerator request contract.\n\nA1 validates the complete NVIDIA/Ascend vocabulary. Until the later M6\npersistence and scheduling PRs land, only requests that can be represented\nexactly by the v0.4 NVIDIA GPU fields may enter the existing execution path.",
+          "examples": [
+            {
+              "allowed_kinds": [
+                "gpu",
+                "npu"
+              ],
+              "allowed_models": [],
+              "allowed_vendors": [
+                "nvidia",
+                "huawei-ascend"
+              ],
+              "count": 1,
+              "memory_mb_per_device": 24000,
+              "required_capabilities": [
+                "bf16"
+              ],
+              "selection_policy": "any"
+            }
+          ],
+          "properties": {
+            "allowed_kinds": {
+              "items": {
+                "$ref": "#/components/schemas/AcceleratorKind"
+              },
+              "maxItems": 2,
+              "title": "Allowed Kinds",
+              "type": "array"
+            },
+            "allowed_models": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 64,
+              "title": "Allowed Models",
+              "type": "array"
+            },
+            "allowed_vendors": {
+              "items": {
+                "$ref": "#/components/schemas/AcceleratorVendor"
+              },
+              "maxItems": 2,
+              "title": "Allowed Vendors",
+              "type": "array"
+            },
+            "count": {
+              "default": 0,
+              "maximum": 64.0,
+              "minimum": 0.0,
+              "title": "Count",
+              "type": "integer"
+            },
+            "memory_mb_per_device": {
+              "default": 0,
+              "maximum": 1048576.0,
+              "minimum": 0.0,
+              "title": "Memory Mb Per Device",
+              "type": "integer"
+            },
+            "required_capabilities": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 64,
+              "title": "Required Capabilities",
+              "type": "array"
+            },
+            "runtime_profile": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Runtime Profile"
+            },
+            "selection_policy": {
+              "$ref": "#/components/schemas/AcceleratorSelectionPolicy",
+              "default": "any"
+            }
+          },
+          "title": "AcceleratorRequest",
+          "type": "object"
+        },
+        "AcceleratorSelectionPolicy": {
+          "enum": [
+            "any",
+            "nvidia-only",
+            "ascend-only",
+            "prefer-nvidia",
+            "prefer-ascend"
+          ],
+          "title": "AcceleratorSelectionPolicy",
+          "type": "string"
+        },
+        "AcceleratorVendor": {
+          "enum": [
+            "nvidia",
+            "huawei-ascend"
+          ],
+          "title": "AcceleratorVendor",
+          "type": "string"
+        },
         "ActiveReservationResponse": {
           "additionalProperties": false,
           "properties": {
@@ -3748,6 +3865,17 @@
         "ServiceCreate": {
           "additionalProperties": false,
           "properties": {
+            "accelerator": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/AcceleratorRequest"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Vendor-neutral accelerator request. A1 accepts the complete NVIDIA/Ascend schema while preserving the current execution boundary."
+            },
             "autoscaling": {
               "anyOf": [
                 {
@@ -3780,6 +3908,8 @@
             },
             "gpu_count": {
               "default": 0,
+              "deprecated": true,
+              "description": "Deprecated v0.4 NVIDIA GPU count; use accelerator.count.",
               "maximum": 64.0,
               "minimum": 0.0,
               "title": "Gpu Count",
@@ -3787,6 +3917,8 @@
             },
             "gpu_memory_mb": {
               "default": 0,
+              "deprecated": true,
+              "description": "Deprecated v0.4 memory per NVIDIA GPU; use accelerator.memory_mb_per_device.",
               "maximum": 1048576.0,
               "minimum": 0.0,
               "title": "Gpu Memory Mb",
@@ -3810,6 +3942,8 @@
                   "type": "null"
                 }
               ],
+              "deprecated": true,
+              "description": "Deprecated v0.4 NVIDIA model; use accelerator.allowed_models.",
               "title": "Gpu Model"
             },
             "image": {
@@ -4706,6 +4840,17 @@
         "TaskCreate": {
           "additionalProperties": false,
           "properties": {
+            "accelerator": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/AcceleratorRequest"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Vendor-neutral accelerator request. A1 accepts the complete NVIDIA/Ascend schema while preserving the current execution boundary."
+            },
             "artifacts": {
               "items": {
                 "$ref": "#/components/schemas/TaskOutputArtifact"
@@ -4757,6 +4902,8 @@
             },
             "gpu_count": {
               "default": 0,
+              "deprecated": true,
+              "description": "Deprecated v0.4 NVIDIA GPU count; use accelerator.count.",
               "maximum": 64.0,
               "minimum": 0.0,
               "title": "Gpu Count",
@@ -4764,6 +4911,8 @@
             },
             "gpu_memory_mb": {
               "default": 0,
+              "deprecated": true,
+              "description": "Deprecated v0.4 memory per NVIDIA GPU; use accelerator.memory_mb_per_device.",
               "maximum": 1048576.0,
               "minimum": 0.0,
               "title": "Gpu Memory Mb",
@@ -4780,6 +4929,8 @@
                   "type": "null"
                 }
               ],
+              "deprecated": true,
+              "description": "Deprecated v0.4 NVIDIA model; use accelerator.allowed_models.",
               "title": "Gpu Model"
             },
             "image": {

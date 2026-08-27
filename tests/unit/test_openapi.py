@@ -42,6 +42,7 @@ def test_openapi_generation_covers_phase_i_and_phase_ii_resources() -> None:
 
     schemas = schema["components"]["schemas"]
     assert {
+        "AcceleratorRequest",
         "TaskCreate",
         "RetryPolicy",
         "TaskInputArtifact",
@@ -51,6 +52,14 @@ def test_openapi_generation_covers_phase_i_and_phase_ii_resources() -> None:
         "ServiceCreate",
         "BootstrapRequest",
     } <= schemas.keys()
+    task_properties = schemas["TaskCreate"]["properties"]
+    service_properties = schemas["ServiceCreate"]["properties"]
+    assert task_properties["accelerator"]["anyOf"][0]["$ref"].endswith("/AcceleratorRequest")
+    assert service_properties["accelerator"]["anyOf"][0]["$ref"].endswith("/AcceleratorRequest")
+    for properties in (task_properties, service_properties):
+        assert properties["gpu_count"]["deprecated"] is True
+        assert properties["gpu_memory_mb"]["deprecated"] is True
+        assert properties["gpu_model"]["deprecated"] is True
 
 
 def test_package_name_and_version_match_runtime_identity() -> None:

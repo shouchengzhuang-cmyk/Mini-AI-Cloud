@@ -54,6 +54,10 @@ class TaskService:
         principal: Principal | None = None,
     ) -> CreateResult:
         resolved_principal = principal or _legacy_principal(self.settings)
+        try:
+            payload.require_current_accelerator_execution_support()
+        except ValueError as exc:
+            raise ConflictError("ACCELERATOR_EXECUTION_NOT_READY", str(exc)) from exc
         if resolved_principal.project_id is None:
             raise RuntimeError("task principal has no project")
         if resolved_principal.kind == PrincipalKind.LEGACY and (

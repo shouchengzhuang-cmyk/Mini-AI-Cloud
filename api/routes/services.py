@@ -10,6 +10,7 @@ from api.dependencies import get_app_settings, get_database, require_api_permiss
 from api.errors import ConflictError, NotFoundError
 from api.pagination import encode_cursor
 from api.routes._pagination import parse_list_cursor
+from api.schemas.accelerators import LEGACY_GPU_FIELDS
 from api.schemas.common import PaginationMeta
 from api.schemas.registry import RegisteredModelRuntimeDefaults
 from api.schemas.services import (
@@ -42,6 +43,10 @@ async def create_service(
     principal: Annotated[Principal, Depends(require_api_permission(Permission.MODEL_MANAGE))],
 ) -> ServiceResponse:
     project_id = _principal_project_id(principal)
+    try:
+        payload.require_current_accelerator_execution_support()
+    except ValueError as exc:
+        raise ConflictError("ACCELERATOR_EXECUTION_NOT_READY", str(exc)) from exc
     try:
         async with database.session() as session, session.begin():
             if payload.registered_model_id is not None:
@@ -417,8 +422,11 @@ def _resolve_registered_model(
         "gpu_memory_mb": registered_model.gpu_memory_mb or 0,
         **runtime_defaults.model_dump(),
     }
+    explicitly_supplied = set(payload.model_fields_set)
+    if payload.accelerator is not None:
+        explicitly_supplied.update(LEGACY_GPU_FIELDS)
     for field_name, value in registry_values.items():
-        if field_name not in payload.model_fields_set:
+        if field_name not in explicitly_supplied:
             resolved[field_name] = value
 
     resolved_runtime = ServingRuntime(resolved["runtime"])

@@ -180,6 +180,41 @@ async def test_services_api_create_list_duplicate_and_stop(
     ]
 
 
+async def test_services_api_maps_nvidia_accelerator_and_rejects_ascend_until_later(
+    services_client: AsyncClient,
+) -> None:
+    nvidia_payload = _payload()
+    nvidia_payload["name"] = "nvidia-contract"
+    nvidia_payload["accelerator"] = {
+        "count": 1,
+        "memory_mb_per_device": 24_000,
+        "allowed_vendors": ["nvidia"],
+        "allowed_kinds": ["gpu"],
+        "allowed_models": ["NVIDIA A100"],
+        "selection_policy": "nvidia-only",
+    }
+    created = await services_client.post("/api/v1/services", json=nvidia_payload)
+
+    assert created.status_code == 201
+    assert created.json()["gpu_count"] == 1
+    assert created.json()["gpu_memory_mb"] == 24_000
+    assert created.json()["gpu_model"] == "NVIDIA A100"
+
+    ascend_payload = _payload()
+    ascend_payload["name"] = "ascend-contract"
+    ascend_payload["accelerator"] = {
+        "count": 1,
+        "memory_mb_per_device": 32_000,
+        "allowed_vendors": ["huawei-ascend"],
+        "allowed_kinds": ["npu"],
+        "selection_policy": "ascend-only",
+    }
+    rejected = await services_client.post("/api/v1/services", json=ascend_payload)
+
+    assert rejected.status_code == 409
+    assert rejected.json()["error"]["code"] == "ACCELERATOR_EXECUTION_NOT_READY"
+
+
 async def test_services_api_deploys_a_registered_model_snapshot_with_explicit_overrides(
     services_client: AsyncClient,
     database: Database,

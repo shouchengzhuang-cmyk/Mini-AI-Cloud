@@ -1,3 +1,4 @@
+from api.schemas.accelerators import AcceleratorRequest
 from api.schemas.common import (
     ErrorDetail,
     ErrorResponse,
@@ -22,6 +23,7 @@ from api.schemas.tasks import (
 from api.schemas.workers import WorkerCapacity, WorkerListResponse, WorkerRead, WorkerResponse
 
 __all__ = [
+    "AcceleratorRequest",
     "ErrorDetail",
     "ErrorResponse",
     "HealthResponse",

@@ -1,6 +1,24 @@
 from enum import StrEnum
 
 
+class AcceleratorVendor(StrEnum):
+    NVIDIA = "nvidia"
+    HUAWEI_ASCEND = "huawei-ascend"
+
+
+class AcceleratorKind(StrEnum):
+    GPU = "gpu"
+    NPU = "npu"
+
+
+class AcceleratorSelectionPolicy(StrEnum):
+    ANY = "any"
+    NVIDIA_ONLY = "nvidia-only"
+    ASCEND_ONLY = "ascend-only"
+    PREFER_NVIDIA = "prefer-nvidia"
+    PREFER_ASCEND = "prefer-ascend"
+
+
 class TaskStatus(StrEnum):
     PENDING = "pending"
     QUEUED = "queued"
