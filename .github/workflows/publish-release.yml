@@ -72,17 +72,22 @@ jobs:
         run: |
           set -Eeuo pipefail
           require_success() {
-            workflow_name="$1"
-            count="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/actions/runs" \
-              -f head_sha="${TARGET_SHA}" -f per_page=100 \
-              --jq "[.workflow_runs[] | select(.name == \"${workflow_name}\" and .conclusion == \"success\")] | length")"
+            workflow_file="$1"
+            count="$(gh api --method GET \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_file}/runs" \
+              -f head_sha="${TARGET_SHA}" \
+              -f branch=main \
+              -f event=push \
+              -f status=success \
+              -f per_page=100 \
+              --jq '.total_count')"
             test "${count}" -ge 1 || {
-              echo "No successful ${workflow_name} run found for ${TARGET_SHA}" >&2
+              echo "No successful main push run for ${workflow_file} at ${TARGET_SHA}" >&2
               exit 1
             }
           }
-          require_success "CI"
-          require_success "Release security gates"
+          require_success "ci.yml"
+          require_success "release-security.yml"
 
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
         with:
@@ -235,6 +240,10 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch --force --tags origin
 
+          main_sha="$(git ls-remote origin refs/heads/main | cut -f1)"
+          test "${main_sha}" = "${TARGET_SHA}"
+          test "$(git rev-parse HEAD)" = "${TARGET_SHA}"
+
           if git show-ref --verify --quiet "refs/tags/${RELEASE_TAG}"; then
             test "$(git rev-list -n1 "${RELEASE_TAG}")" = "${TARGET_SHA}"
           else
@@ -242,27 +251,60 @@ jobs:
             git push origin "refs/tags/${RELEASE_TAG}"
           fi
 
+          mapfile -t wheel_assets < <(
+            find build/release-wheel -maxdepth 1 -type f -name 'mini_ai_cloud-*.whl' -print | sort
+          )
+          test "${#wheel_assets[@]}" -eq 1
+          release_assets=(
+            "${wheel_assets[0]}"
+            "build/mini-ai-cloud-v${RELEASE_VERSION}-evidence.tar.gz"
+            "build/mini-ai-cloud-image.spdx.json"
+            "build/release/${TARGET_SHA}/cyclonedx-sbom.json"
+            "build/release/${TARGET_SHA}/release-preparation.json"
+            "build/release/${TARGET_SHA}/SHA256SUMS"
+            "build/release-assets.sha256"
+          )
+          expected_assets=()
+          for asset_path in "${release_assets[@]}"; do
+            test -f "${asset_path}"
+            expected_assets+=("$(basename "${asset_path}")")
+          done
+
           if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            while IFS= read -r remote_asset; do
+              printf '%s\n' "${expected_assets[@]}" | grep -Fxq "${remote_asset}" || {
+                echo "Unexpected existing release asset: ${remote_asset}" >&2
+                exit 1
+              }
+            done < <(
+              gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+                --json assets --jq '.assets[].name'
+            )
             gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
               --title "Mini AI Cloud ${RELEASE_TAG}" \
               --notes-file build/final-release-notes.md \
               --latest
+            gh release upload "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --clobber \
+              "${release_assets[@]}"
           else
             gh release create "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
               --verify-tag \
+              --draft \
               --title "Mini AI Cloud ${RELEASE_TAG}" \
               --notes-file build/final-release-notes.md \
+              "${release_assets[@]}"
+            gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+              --draft=false \
               --latest
           fi
 
-          gh release upload "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --clobber \
-            build/release-wheel/mini_ai_cloud-*.whl \
-            "build/mini-ai-cloud-v${RELEASE_VERSION}-evidence.tar.gz" \
-            build/mini-ai-cloud-image.spdx.json \
-            "build/release/${TARGET_SHA}/cyclonedx-sbom.json" \
-            "build/release/${TARGET_SHA}/release-preparation.json" \
-            "build/release/${TARGET_SHA}/SHA256SUMS" \
-            build/release-assets.sha256
+          mapfile -t published_assets < <(
+            gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+              --json assets --jq '.assets[].name' | sort
+          )
+          mapfile -t expected_assets < <(printf '%s\n' "${expected_assets[@]}" | sort)
+          test "$(printf '%s\n' "${published_assets[@]}")" = \
+            "$(printf '%s\n' "${expected_assets[@]}")"
 
       - name: Record successful publication
         if: success()
