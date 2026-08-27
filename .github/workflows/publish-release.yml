@@ -139,7 +139,13 @@ jobs:
         env:
           CONFIRM_SOAK: "YES"
           SOAK_ROUNDS: "3"
-        run: make test-soak
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          uv run python scripts/soak.py \
+            --rounds "${SOAK_ROUNDS}" \
+            --command-timeout 300 \
+            --total-timeout 2700
 
       - name: Run isolated destructive disaster-recovery rehearsal
         env:
