@@ -39,6 +39,7 @@ jobs:
           test "${version}" = "${RELEASE_VERSION}"
           test -z "${extra:-}"
           [[ "${target_sha}" =~ ^[0-9a-f]{40}$ ]]
+          test "${RELEASE_COMMENT}" = "${command} ${version} ${target_sha}"
           echo "target_sha=${target_sha}" >>"${GITHUB_OUTPUT}"
           echo "tag=v${version}" >>"${GITHUB_OUTPUT}"
 
@@ -281,7 +282,16 @@ jobs:
             expected_assets+=("$(basename "${asset_path}")")
           done
 
+          release_is_draft=true
           if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            release_is_draft="$(
+              gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+                --json isDraft --jq '.isDraft'
+            )"
+            release_is_prerelease="$(
+              gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+                --json isPrerelease --jq '.isPrerelease'
+            )"
             while IFS= read -r remote_asset; do
               printf '%s\n' "${expected_assets[@]}" | grep -Fxq "${remote_asset}" || {
                 echo "Unexpected existing release asset: ${remote_asset}" >&2
@@ -291,12 +301,17 @@ jobs:
               gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
                 --json assets --jq '.assets[].name'
             )
-            gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
-              --title "Mini AI Cloud ${RELEASE_TAG}" \
-              --notes-file build/final-release-notes.md \
-              --draft
-            gh release upload "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --clobber \
-              "${release_assets[@]}"
+            if [ "${release_is_draft}" = "true" ]; then
+              gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+                --title "Mini AI Cloud ${RELEASE_TAG}" \
+                --notes-file build/final-release-notes.md \
+                --draft \
+                --prerelease=false
+              gh release upload "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --clobber \
+                "${release_assets[@]}"
+            else
+              test "${release_is_prerelease}" = "false"
+            fi
           else
             gh release create "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
               --verify-tag \
@@ -313,9 +328,28 @@ jobs:
           mapfile -t expected_assets < <(printf '%s\n' "${expected_assets[@]}" | sort)
           test "$(printf '%s\n' "${published_assets[@]}")" = \
             "$(printf '%s\n' "${expected_assets[@]}")"
-          gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
-            --draft=false \
-            --latest
+
+          verification_dir="${RUNNER_TEMP}/release-asset-verification"
+          mkdir -p "${verification_dir}"
+          gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --dir "${verification_dir}" --clobber
+          cmp build/release-assets.sha256 "${verification_dir}/release-assets.sha256"
+          (cd "${verification_dir}" && sha256sum --check release-assets.sha256)
+
+          if [ "${release_is_draft}" = "true" ]; then
+            gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+              --draft=false \
+              --prerelease=false \
+              --latest
+          fi
+          test "$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --json isDraft --jq '.isDraft')" = "false"
+          test "$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --json isPrerelease --jq '.isPrerelease')" = "false"
+          test "$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --json name --jq '.name')" = "Mini AI Cloud ${RELEASE_TAG}"
+          test "$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --json body --jq '.body')" = "$(cat build/final-release-notes.md)"
 
       - name: Record successful publication
         if: success()
