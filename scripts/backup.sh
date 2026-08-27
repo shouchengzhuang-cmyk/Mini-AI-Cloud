@@ -55,9 +55,8 @@ archive_compose_volume() {
     --security-opt no-new-privileges \
     --tmpfs /tmp:size=16m \
     --mount "type=volume,source=$volume_name,target=/source,readonly" \
-    --mount "type=bind,source=$destination,target=/backup" \
     "$ARCHIVE_IMAGE" \
-    tar -C /source -czf "/backup/$archive_name" . ||
+    tar -C /source -czf - . >"$destination/$archive_name" ||
     fail "cannot archive the '$logical_name' volume"
   [[ -s $destination/$archive_name ]] || fail "volume archive is empty: $archive_name"
 }
