@@ -127,6 +127,15 @@ def test_dr_requires_explicit_confirmation(tmp_path: Path) -> None:
     assert list(tmp_path.iterdir()) == []
 
 
+def test_restore_waits_for_final_queryable_postgres_process() -> None:
+    restore_script = (ROOT / "scripts" / "restore.sh").read_text(encoding="utf-8")
+
+    assert "read -r pid_one_comm </proc/1/comm" in restore_script
+    assert '[ "$pid_one_comm" = postgres ]' in restore_script
+    assert '--command "SELECT 1"' in restore_script
+    assert "if postgres_ready >/dev/null 2>&1; then" in restore_script
+
+
 def test_isolated_rehearsal_deletes_only_validated_volumes_and_cleans_project(
     tmp_path: Path,
 ) -> None:
