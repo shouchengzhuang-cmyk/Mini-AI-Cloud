@@ -1,3 +1,5 @@
+# CI-only Device Plugin registration requires root, privileged mode, and the pinned host
+# paths below. These exceptions do not apply to the allocation or Runtime Profile workloads.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -33,6 +35,7 @@ spec:
               value: /var/lib/kubelet/device-plugins
           securityContext:
             privileged: true
+            readOnlyRootFilesystem: true
           volumeMounts:
             - name: device-plugin
               mountPath: /var/lib/kubelet/device-plugins

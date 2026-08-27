@@ -57,8 +57,11 @@ The successful no-GPU CI status is `MANIFEST_VALIDATED`; the real-hardware bound
 
 The fake Device Plugin DaemonSet is privileged because it is test infrastructure that
 registers with kubelet. The allocation workload remains non-privileged and has no hostPath
-or service-account token. This exception never changes the Runtime Profile workload
-security baseline.
+or service-account token. The infrastructure container uses a read-only root filesystem;
+its narrowly scoped Trivy exceptions cover only the root/privileged/hostPath access required
+to register the pinned sample plugin. `.trivyignore.yaml` is path-scoped to this single
+manifest, and the NVIDIA contract validator rejects broader IDs or paths. This exception
+never changes the Runtime Profile workload security baseline.
 
 ## Real hardware entry
 

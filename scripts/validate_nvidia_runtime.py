@@ -17,6 +17,8 @@ NVIDIA_PROFILE_PATH = Path("runtime_profiles/nvidia-vllm-k8s.yaml")
 NVIDIA_ACCEPTANCE_PATH = Path("runtime_profiles/nvidia-vllm-k8s.acceptance.json")
 FAKE_PLUGIN_PATH = Path("deploy/nvidia-runtime/00-fake-device-plugin.yaml")
 FAKE_ALLOCATION_PATH = Path("deploy/nvidia-runtime/10-fake-device-allocation.yaml")
+TRIVY_IGNORE_PATH = Path(".trivyignore.yaml")
+EXPECTED_TRIVY_EXCEPTIONS = {"KSV-0017", "KSV-0118", "KSV-0121"}
 
 
 def validate_repository(repository_root: Path) -> NvidiaRuntimeAcceptanceContract:
@@ -26,8 +28,10 @@ def validate_repository(repository_root: Path) -> NvidiaRuntimeAcceptanceContrac
 
     plugin = _load_single_yaml(repository_root / FAKE_PLUGIN_PATH)
     allocation = _load_single_yaml(repository_root / FAKE_ALLOCATION_PATH)
+    trivy_ignores = _load_single_yaml(repository_root / TRIVY_IGNORE_PATH)
     _validate_fake_device_plugin(plugin, contract)
     _validate_fake_allocation(allocation, contract)
+    _validate_trivy_ignores(trivy_ignores)
     return contract
 
 
@@ -53,6 +57,8 @@ def _validate_fake_device_plugin(
         raise ValueError("fake device plugin image does not match the pinned acceptance contract")
     if container.get("securityContext", {}).get("privileged") is not True:
         raise ValueError("Kubernetes sample device plugin requires an explicit privileged boundary")
+    if container.get("securityContext", {}).get("readOnlyRootFilesystem") is not True:
+        raise ValueError("fake device plugin root filesystem must be read-only")
     annotation = manifest["spec"]["template"]["metadata"].get("annotations", {})
     if annotation.get("mini-ai-cloud/test-scope") != "fake-device-plugin-only":
         raise ValueError("fake device plugin manifest must declare its evidence scope")
@@ -87,6 +93,26 @@ def _validate_fake_allocation(
         raise ValueError("fake allocation workload must remain non-privileged")
     if pod_spec.get("automountServiceAccountToken") is not False:
         raise ValueError("fake allocation workload must not mount a service account token")
+
+
+def _validate_trivy_ignores(manifest: dict[str, Any]) -> None:
+    if set(manifest) != {"misconfigurations"}:
+        raise ValueError("Trivy exception file may contain only misconfiguration entries")
+    entries = manifest["misconfigurations"]
+    if not isinstance(entries, list) or len(entries) != len(EXPECTED_TRIVY_EXCEPTIONS):
+        raise ValueError("Trivy exception file must contain exactly three NVIDIA CI entries")
+    ids: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"id", "paths"}:
+            raise ValueError("Trivy exception entries may contain only id and paths")
+        exception_id = entry["id"]
+        if not isinstance(exception_id, str):
+            raise ValueError("Trivy exception IDs must be strings")
+        if entry["paths"] != [FAKE_PLUGIN_PATH.as_posix()]:
+            raise ValueError("Trivy exceptions must target only the fake Device Plugin manifest")
+        ids.add(exception_id)
+    if ids != EXPECTED_TRIVY_EXCEPTIONS:
+        raise ValueError("Trivy exception IDs do not match the reviewed NVIDIA CI boundary")
 
 
 def main(argv: list[str] | None = None) -> None:
