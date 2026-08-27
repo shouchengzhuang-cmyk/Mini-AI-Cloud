@@ -1,6 +1,7 @@
 import re
 import uuid
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -8,7 +9,13 @@ from unittest.mock import AsyncMock
 import pytest
 from kubernetes_asyncio.client.exceptions import ApiException
 
+from scripts.validate_runtime_profiles import load_profile
 from worker.kubernetes_serving_runtime import (
+    ACCELERATOR_COUNT_ANNOTATION,
+    ACCELERATOR_KIND_LABEL,
+    ACCELERATOR_RESOURCE_ANNOTATION,
+    ACCELERATOR_VENDOR_LABEL,
+    ALLOCATION_AUTHORITY_ANNOTATION,
     CLUSTER_ID_LABEL,
     EXECUTION_ID_LABEL,
     GENERATION_LABEL,
@@ -20,10 +27,15 @@ from worker.kubernetes_serving_runtime import (
     RESOURCE_KIND_LABEL,
     RUNTIME_LABEL,
     RUNTIME_LABEL_VALUE,
+    RUNTIME_PROFILE_DIGEST_ANNOTATION,
+    RUNTIME_PROFILE_DIGEST_LABEL,
+    RUNTIME_PROFILE_ID_LABEL,
+    RUNTIME_PROFILE_VERSION_LABEL,
     SERVICE_ID_LABEL,
     SPEC_HASH_LABEL,
     WORKER_ID_LABEL,
     WORKER_SESSION_ID_LABEL,
+    KubernetesObservedAllocation,
     KubernetesServingHandle,
     KubernetesServingLaunchSpec,
     KubernetesServingOwnershipError,
@@ -37,6 +49,7 @@ REPLICA_ID = uuid.UUID("22222222-2222-2222-2222-222222222222")
 PROJECT_ID = uuid.UUID("33333333-3333-3333-3333-333333333333")
 EXECUTION_ID = uuid.UUID("44444444-4444-4444-4444-444444444444")
 WORKER_SESSION_ID = uuid.UUID("55555555-5555-5555-5555-555555555555")
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _spec() -> KubernetesServingLaunchSpec:
@@ -52,6 +65,18 @@ def _spec() -> KubernetesServingLaunchSpec:
         memory_mb=256,
         startup_delay_seconds=1.5,
         chunk_delay_seconds=0.05,
+    )
+
+
+def _accelerator_spec(profile_name: str, *, count: int = 2) -> KubernetesServingLaunchSpec:
+    profile = load_profile(REPOSITORY_ROOT / "runtime_profiles" / profile_name)
+    return replace(
+        _spec(),
+        image=profile.image.reference,
+        accelerator_count=count,
+        tensor_parallel_size=count,
+        runtime_profile=profile,
+        profile_environment=(("VLLM_LOGGING_LEVEL", "INFO"),),
     )
 
 
@@ -150,6 +175,16 @@ def test_resource_names_are_deterministic_bounded_dns_1123_and_fenced() -> None:
     ) != KubernetesServingRuntimeAdapter.service_name(spec)
 
 
+def test_nonaccelerator_contract_hash_remains_compatible_with_a4() -> None:
+    selector = _runtime(SimpleNamespace())._selector_labels(
+        _spec(),
+        worker_id="k8s-serving-worker",
+        worker_session_id=WORKER_SESSION_ID,
+    )
+
+    assert selector[SPEC_HASH_LABEL] == "9ae65e930dfffd128522b1a3d56861f6"
+
+
 async def test_prepare_builds_secure_fenced_pod_with_static_headless_dns() -> None:
     api = _prepare_api()
     runtime = _runtime(api)
@@ -215,6 +250,265 @@ async def test_prepare_builds_secure_fenced_pod_with_static_headless_dns() -> No
     assert handle.endpoint_url == (
         f"http://{pod.metadata.name}.{HEADLESS_SERVICE_NAME}.serving-tests.svc.cluster.local:8000"
     )
+
+
+@pytest.mark.parametrize(
+    ("profile_name", "vendor", "kind", "resource_name", "runtime_class_name"),
+    [
+        ("nvidia-vllm-k8s.example.yaml", "nvidia", "gpu", "nvidia.com/gpu", "nvidia"),
+        (
+            "ascend-vllm-k8s.example.yaml",
+            "huawei-ascend",
+            "npu",
+            "huawei.com/Ascend910",
+            "ascend",
+        ),
+    ],
+)
+async def test_prepare_renders_accelerator_pod_from_runtime_profile(
+    profile_name: str,
+    vendor: str,
+    kind: str,
+    resource_name: str,
+    runtime_class_name: str,
+) -> None:
+    api = _prepare_api()
+    runtime = _runtime(api)
+    spec = _accelerator_spec(profile_name)
+
+    await runtime.prepare(
+        spec,
+        worker_id="k8s-serving-worker",
+        worker_session_id=WORKER_SESSION_ID,
+    )
+
+    pod = api.create_namespaced_pod.call_args.kwargs["body"]
+    container = pod.spec.containers[0]
+    profile = spec.runtime_profile
+    assert profile is not None
+    assert container.image == profile.image.reference
+    assert container.command == list(profile.process.command)
+    assert container.args[-2:] == ["--tensor-parallel-size", "2"]
+    assert [(item.name, item.value) for item in container.env][-1] == (
+        "VLLM_LOGGING_LEVEL",
+        "INFO",
+    )
+    assert container.resources.requests[resource_name] == "2"
+    assert container.resources.requests == container.resources.limits
+    assert pod.spec.runtime_class_name == runtime_class_name
+    assert pod.spec.node_selector == dict(profile.kubernetes.node_selector)
+    assert pod.spec.tolerations == []
+    assert pod.spec.host_network is False
+    assert pod.spec.host_pid is False
+    assert pod.spec.volumes[0].host_path is None
+    assert container.security_context.privileged is False
+    assert pod.metadata.labels[ACCELERATOR_VENDOR_LABEL] == vendor
+    assert pod.metadata.labels[ACCELERATOR_KIND_LABEL] == kind
+    assert pod.metadata.labels[RUNTIME_PROFILE_ID_LABEL] == profile.id
+    assert pod.metadata.labels[RUNTIME_PROFILE_VERSION_LABEL] == profile.version
+    assert len(pod.metadata.labels[RUNTIME_PROFILE_DIGEST_LABEL]) == 52
+    assert pod.metadata.annotations == {
+        RUNTIME_PROFILE_DIGEST_ANNOTATION: profile.semantic_digest(),
+        ACCELERATOR_RESOURCE_ANNOTATION: resource_name,
+        ACCELERATOR_COUNT_ANNOTATION: "2",
+        ALLOCATION_AUTHORITY_ANNOTATION: "kubernetes_device_plugin",
+    }
+    assert container.liveness_probe.http_get.path == profile.probes.health.path
+    assert container.readiness_probe.http_get.path == profile.probes.readiness.path
+
+
+@pytest.mark.parametrize(
+    ("spec", "message"),
+    [
+        (replace(_spec(), accelerator_count=2), "requires a runtime_profile"),
+        (replace(_spec(), tensor_parallel_size=2), "tensor_parallel_size=1"),
+    ],
+)
+async def test_prepare_rejects_incomplete_accelerator_launch_contract(
+    spec: KubernetesServingLaunchSpec,
+    message: str,
+) -> None:
+    runtime = _runtime(_prepare_api())
+    with pytest.raises(ValueError, match=message):
+        await runtime.prepare(
+            spec,
+            worker_id="k8s-serving-worker",
+            worker_session_id=WORKER_SESSION_ID,
+        )
+
+
+async def test_prepare_rejects_accelerator_count_that_differs_from_tensor_parallel_size() -> None:
+    runtime = _runtime(_prepare_api())
+    spec = replace(
+        _accelerator_spec("nvidia-vllm-k8s.example.yaml"),
+        tensor_parallel_size=1,
+    )
+
+    with pytest.raises(ValueError, match="accelerator_count must equal tensor_parallel_size"):
+        await runtime.prepare(
+            spec,
+            worker_id="k8s-serving-worker",
+            worker_session_id=WORKER_SESSION_ID,
+        )
+
+
+async def test_prepare_rejects_profile_environment_outside_allowlist() -> None:
+    runtime = _runtime(_prepare_api())
+    spec = replace(
+        _accelerator_spec("nvidia-vllm-k8s.example.yaml"),
+        profile_environment=(("NVIDIA_VISIBLE_DEVICES", "all"),),
+    )
+
+    with pytest.raises(ValueError, match="not allowlisted"):
+        await runtime.prepare(
+            spec,
+            worker_id="k8s-serving-worker",
+            worker_session_id=WORKER_SESSION_ID,
+        )
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "profile",
+        "resource",
+        "asymmetric_resource",
+        "runtime_class",
+        "node_selector",
+        "tensor_parallel",
+    ],
+)
+async def test_prepare_rejects_accelerator_profile_drift(drift: str) -> None:
+    api = _prepare_api()
+    runtime = _runtime(api)
+    spec = _accelerator_spec("nvidia-vllm-k8s.example.yaml")
+    selector = runtime._selector_labels(
+        spec,
+        worker_id="k8s-serving-worker",
+        worker_session_id=WORKER_SESSION_ID,
+    )
+    pod = runtime._build_pod(spec, selector)
+    if drift == "profile":
+        pod.metadata.labels[RUNTIME_PROFILE_ID_LABEL] = "different-profile"
+    elif drift == "resource":
+        pod.spec.containers[0].resources.requests = {
+            "cpu": "250m",
+            "memory": "256Mi",
+            "huawei.com/Ascend910": "2",
+        }
+        pod.spec.containers[0].resources.limits = dict(pod.spec.containers[0].resources.requests)
+    elif drift == "asymmetric_resource":
+        pod.spec.containers[0].resources.requests.pop("nvidia.com/gpu")
+    elif drift == "runtime_class":
+        pod.spec.runtime_class_name = "different"
+    elif drift == "node_selector":
+        pod.spec.node_selector = {"accelerator.mini-ai-cloud/vendor": "huawei-ascend"}
+    elif drift == "tensor_parallel":
+        pod.spec.containers[0].args[-1] = "1"
+    api.create_namespaced_pod.side_effect = ApiException(status=409)
+    api.read_namespaced_pod = AsyncMock(return_value=pod)
+
+    with pytest.raises(KubernetesServingOwnershipError):
+        await runtime.prepare(
+            spec,
+            worker_id="k8s-serving-worker",
+            worker_session_id=WORKER_SESSION_ID,
+        )
+
+
+async def test_prepare_renders_profile_declared_resource_without_vendor_branching() -> None:
+    api = _prepare_api()
+    runtime = _runtime(api)
+    spec = _accelerator_spec("nvidia-vllm-k8s.example.yaml")
+    assert spec.runtime_profile is not None
+    unknown_kubernetes = spec.runtime_profile.kubernetes.model_copy(
+        update={"resource_name": "example.com/gpu"}
+    )
+    unknown_profile = spec.runtime_profile.model_copy(update={"kubernetes": unknown_kubernetes})
+
+    await runtime.prepare(
+        replace(spec, runtime_profile=unknown_profile),
+        worker_id="k8s-serving-worker",
+        worker_session_id=WORKER_SESSION_ID,
+    )
+
+    pod = api.create_namespaced_pod.call_args.kwargs["body"]
+    assert pod.spec.containers[0].resources.requests["example.com/gpu"] == "2"
+    assert pod.metadata.annotations[ACCELERATOR_RESOURCE_ANNOTATION] == "example.com/gpu"
+
+
+@pytest.mark.parametrize(
+    "security_update",
+    [
+        {"privileged": True},
+        {"host_path": ("/dev",)},
+    ],
+)
+async def test_prepare_rejects_profile_that_relaxes_security_before_creating_pod(
+    security_update: dict[str, object],
+) -> None:
+    api = _prepare_api()
+    runtime = _runtime(api)
+    spec = _accelerator_spec("nvidia-vllm-k8s.example.yaml")
+    assert spec.runtime_profile is not None
+    unsafe_security = spec.runtime_profile.kubernetes.security.model_copy(update=security_update)
+    unsafe_kubernetes = spec.runtime_profile.kubernetes.model_copy(
+        update={"security": unsafe_security}
+    )
+    unsafe_profile = spec.runtime_profile.model_copy(update={"kubernetes": unsafe_kubernetes})
+
+    with pytest.raises(ValueError, match="cannot relax"):
+        await runtime.prepare(
+            replace(spec, runtime_profile=unsafe_profile),
+            worker_id="k8s-serving-worker",
+            worker_session_id=WORKER_SESSION_ID,
+        )
+
+    api.create_namespaced_pod.assert_not_awaited()
+
+
+async def test_ready_accelerator_pod_publishes_authoritative_allocation_observation() -> None:
+    observations: list[KubernetesObservedAllocation] = []
+    api = _prepare_api()
+    runtime = KubernetesServingRuntimeAdapter(
+        namespace="serving-tests",
+        cluster_id="kind-serving-test",
+        api=api,
+        allocation_observer=observations.append,
+    )
+    spec = _accelerator_spec("ascend-vllm-k8s.example.yaml")
+    handle = await runtime.prepare(
+        spec,
+        worker_id="k8s-serving-worker",
+        worker_session_id=WORKER_SESSION_ID,
+    )
+    pod = api.create_namespaced_pod.call_args.kwargs["body"]
+    pod.status = SimpleNamespace(
+        phase="Running",
+        conditions=[SimpleNamespace(type="Ready", status="True")],
+        container_statuses=[],
+    )
+    api.read_namespaced_pod_status = AsyncMock(return_value=pod)
+
+    state = await runtime.inspect(handle)
+
+    assert state.ready is True
+    assert spec.runtime_profile is not None
+    assert observations == [
+        KubernetesObservedAllocation(
+            service_id=SERVICE_ID,
+            replica_id=REPLICA_ID,
+            execution_id=EXECUTION_ID,
+            vendor="huawei-ascend",
+            kind="npu",
+            resource_name="huawei.com/Ascend910",
+            count=2,
+            runtime_profile_id="ascend-vllm-k8s-a2",
+            runtime_profile_version="1.0.0",
+            runtime_profile_digest=spec.runtime_profile.semantic_digest(),
+            allocation_authority="kubernetes_device_plugin",
+        )
+    ]
 
 
 async def test_prepare_adopts_only_exact_pod_after_conflict() -> None:
@@ -539,6 +833,32 @@ async def test_list_managed_uses_bounded_selector_and_recovers_pod_dns_identity(
     assert {conflict.resource_kind for conflict in runtime.recovery_conflicts} == {"pod"}
     assert all(conflict.reason == "ownership_conflict" for conflict in runtime.recovery_conflicts)
     assert all(conflict.ownership is None for conflict in runtime.recovery_conflicts)
+
+
+async def test_list_managed_recovers_accelerator_pod_and_quarantines_tp_drift() -> None:
+    api = _prepare_api()
+    runtime = _runtime(api)
+    spec = _accelerator_spec("nvidia-vllm-k8s.example.yaml")
+    handle = await runtime.prepare(
+        spec,
+        worker_id="k8s-serving-worker",
+        worker_session_id=WORKER_SESSION_ID,
+    )
+    pod = api.create_namespaced_pod.call_args.kwargs["body"]
+    api.list_namespaced_pod = AsyncMock(return_value=SimpleNamespace(items=[pod]))
+
+    recovered = await runtime.list_managed(worker_id="k8s-serving-worker")
+
+    assert [item.object_id for item in recovered] == [handle.object_id]
+    assert runtime.recovery_conflicts == ()
+
+    pod.spec.containers[0].args[-1] = "1"
+    quarantined = await runtime.list_managed(worker_id="k8s-serving-worker")
+
+    assert quarantined == ()
+    assert len(runtime.recovery_conflicts) == 1
+    assert "tensor parallel size differs" in runtime.recovery_conflicts[0].message
+    assert runtime.recovery_conflicts[0].ownership is not None
 
 
 async def test_list_managed_isolates_one_drifted_pod_and_recovers_other_resources() -> None:

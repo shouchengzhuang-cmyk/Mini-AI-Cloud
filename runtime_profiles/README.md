@@ -35,6 +35,33 @@ Profile files never contain environment values. In particular, cloud credentials
 registry tokens, API keys, and device visibility values belong to separate secret and
 device-plugin paths.
 
+## Kubernetes serving rendering
+
+The Kubernetes serving adapter accepts an already validated `RuntimeProfile` with an
+accelerator count, tensor-parallel size, and explicit environment values. It renders the
+profile image, base command, extended resource, RuntimeClass, node selector, tolerations,
+and probes. Environment values are accepted only when their names appear in the profile
+allowlist. The control plane still owns the generated model, host, port, and tensor-parallel
+arguments.
+
+The renderer fails before Pod creation unless the accelerator count equals the
+tensor-parallel size and the profile security contract remains within the hard-coded
+non-privileged baseline. The selected extended resource appears in both requests and
+limits with the same count. During adoption, any additional or substituted extended
+resource, asymmetric request/limit, profile identity drift, RuntimeClass drift, or
+tensor-parallel mismatch quarantines the Pod instead of silently accepting it.
+
+Profile vendor, kind, ID, version, and semantic digest participate in the owned Pod
+contract hash. The full `sha256:` digest and configured resource name are annotations; an
+equivalent Base32 digest is used for the Kubernetes label because a 64-character hex
+digest exceeds the label value limit. Ready accelerator Pods may emit an observed
+allocation callback. The callback reports the device-plugin-owned resource and count but
+does not invent physical device IDs that the standard Pod API did not expose.
+
+The example profiles remain non-deployable after rendering support. The current Fake
+Kubernetes controller does not select them automatically; A7/A8 must provide independently
+validated runtime profiles and execution wiring.
+
 ## Compatibility metadata
 
 `python: profile-owned` keeps runtime Python independent of the control-plane interpreter.

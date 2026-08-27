@@ -1,19 +1,24 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import inspect
 import json
 import math
 import re
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
 
 from kubernetes_asyncio import client, config
 from kubernetes_asyncio.client.exceptions import ApiException
+
+from core.accelerators import vendor_kind_is_compatible
+from core.enums import AcceleratorKind, AcceleratorVendor
+from core.runtime_profiles import HttpProbe, RuntimeProfile
 
 SERVICE_ID_LABEL = "mini-ai-cloud/service-id"
 REPLICA_ID_LABEL = "mini-ai-cloud/replica-id"
@@ -27,6 +32,16 @@ WORKER_SESSION_ID_LABEL = "mini-ai-cloud/worker-session-id"
 RUNTIME_LABEL = "mini-ai-cloud/runtime"
 RESOURCE_KIND_LABEL = "mini-ai-cloud/resource-kind"
 SPEC_HASH_LABEL = "mini-ai-cloud/spec-hash"
+ACCELERATOR_VENDOR_LABEL = "mini-ai-cloud/accelerator-vendor"
+ACCELERATOR_KIND_LABEL = "mini-ai-cloud/accelerator-kind"
+RUNTIME_PROFILE_ID_LABEL = "mini-ai-cloud/runtime-profile-id"
+RUNTIME_PROFILE_VERSION_LABEL = "mini-ai-cloud/runtime-profile-version"
+RUNTIME_PROFILE_DIGEST_LABEL = "mini-ai-cloud/runtime-profile-digest"
+
+RUNTIME_PROFILE_DIGEST_ANNOTATION = "mini-ai-cloud/runtime-profile-digest"
+ACCELERATOR_RESOURCE_ANNOTATION = "mini-ai-cloud/accelerator-resource"
+ACCELERATOR_COUNT_ANNOTATION = "mini-ai-cloud/accelerator-count"
+ALLOCATION_AUTHORITY_ANNOTATION = "mini-ai-cloud/allocation-authority"
 
 RUNTIME_LABEL_VALUE = "kubernetes-serving"
 POD_RESOURCE_KIND = "serving-pod"
@@ -39,7 +54,7 @@ _LABEL_VALUE = re.compile(r"^[A-Za-z0-9](?:[-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$")
 _IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _MAX_ERROR_LENGTH = 512
 _MAX_RESOURCE_NAME_LENGTH = 128
-_CONTRACT_LABEL_KEYS = (
+_BASE_CONTRACT_LABEL_KEYS = (
     SERVICE_ID_LABEL,
     REPLICA_ID_LABEL,
     PROJECT_ID_LABEL,
@@ -50,6 +65,13 @@ _CONTRACT_LABEL_KEYS = (
     WORKER_ID_LABEL,
     WORKER_SESSION_ID_LABEL,
     RUNTIME_LABEL,
+)
+_ACCELERATOR_CONTRACT_LABEL_KEYS = (
+    ACCELERATOR_VENDOR_LABEL,
+    ACCELERATOR_KIND_LABEL,
+    RUNTIME_PROFILE_ID_LABEL,
+    RUNTIME_PROFILE_VERSION_LABEL,
+    RUNTIME_PROFILE_DIGEST_LABEL,
 )
 
 
@@ -67,6 +89,33 @@ class KubernetesServingLaunchSpec:
     startup_delay_seconds: float = 0.0
     chunk_delay_seconds: float = 0.0
     container_port: int = 8000
+    accelerator_count: int = 0
+    tensor_parallel_size: int = 1
+    runtime_profile: RuntimeProfile | None = None
+    profile_environment: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class KubernetesObservedAllocation:
+    """Device-plugin-owned allocation observed after a Pod becomes ready.
+
+    Kubernetes' standard Pod API exposes the allocated resource count, but not
+    portable physical device identifiers.  ``device_ids`` therefore remains
+    empty until a vendor-specific evidence collector supplies authoritative IDs.
+    """
+
+    service_id: uuid.UUID
+    replica_id: uuid.UUID
+    execution_id: uuid.UUID
+    vendor: str
+    kind: str
+    resource_name: str
+    count: int
+    runtime_profile_id: str
+    runtime_profile_version: str
+    runtime_profile_digest: str
+    allocation_authority: str
+    device_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +232,7 @@ class KubernetesServingRuntimeAdapter:
         readiness_probe_period_seconds: float = 1.0,
         api: Any | None = None,
         version_api: Any | None = None,
+        allocation_observer: Callable[[KubernetesObservedAllocation], object] | None = None,
     ) -> None:
         normalized_namespace = namespace.strip()
         normalized_cluster_id = cluster_id.strip()
@@ -214,6 +264,7 @@ class KubernetesServingRuntimeAdapter:
         self.readiness_probe_period_seconds = math.ceil(readiness_probe_period_seconds)
         self._api = api
         self._version_api = version_api
+        self._allocation_observer = allocation_observer
         self._owns_api = api is None
         self._client_lock = asyncio.Lock()
         self._recovery_conflicts: list[KubernetesServingRecoveryConflict] = []
@@ -296,6 +347,8 @@ class KubernetesServingRuntimeAdapter:
         deleting = _deleting(pod)
         ready = _pod_ready(status) and not deleting
         exit_code, oom_killed, reason, message = _pod_failure(status)
+        if ready:
+            await self._observe_allocation(pod)
         return KubernetesServingState(
             phase=phase,
             running=phase.lower() == "running" and not deleting,
@@ -593,6 +646,20 @@ class KubernetesServingRuntimeAdapter:
             WORKER_SESSION_ID_LABEL: str(worker_session_id),
             RUNTIME_LABEL: RUNTIME_LABEL_VALUE,
         }
+        if spec.runtime_profile is not None:
+            profile = spec.runtime_profile
+            for value in (profile.id, profile.version, profile.vendor.value, profile.kind.value):
+                if not _LABEL_VALUE.fullmatch(value):
+                    raise ValueError("runtime profile identity must be a Kubernetes label value")
+            selector.update(
+                {
+                    ACCELERATOR_VENDOR_LABEL: profile.vendor.value,
+                    ACCELERATOR_KIND_LABEL: profile.kind.value,
+                    RUNTIME_PROFILE_ID_LABEL: profile.id,
+                    RUNTIME_PROFILE_VERSION_LABEL: profile.version,
+                    RUNTIME_PROFILE_DIGEST_LABEL: _profile_digest_label(profile.semantic_digest()),
+                }
+            )
         expected_pod = self._build_pod(spec, selector)
         selector[SPEC_HASH_LABEL] = _pod_contract_hash(expected_pod)
         return selector
@@ -606,24 +673,76 @@ class KubernetesServingRuntimeAdapter:
             "cpu": f"{spec.cpu_millicores}m",
             "memory": f"{spec.memory_mb}Mi",
         }
+        profile = spec.runtime_profile
+        annotations: dict[str, str] = {}
+        image = spec.image
+        command = list(_fake_inference_command(spec))
+        environment = [
+            client.V1EnvVar(name="PYTHONDONTWRITEBYTECODE", value="1"),
+            client.V1EnvVar(name="TMPDIR", value="/tmp"),
+        ]
+        readiness_probe = client.V1Probe(
+            http_get=client.V1HTTPGetAction(path="/health", port=spec.container_port),
+            initial_delay_seconds=0,
+            period_seconds=self.readiness_probe_period_seconds,
+            timeout_seconds=self.readiness_probe_timeout_seconds,
+            failure_threshold=1,
+            success_threshold=1,
+        )
+        liveness_probe: client.V1Probe | None = None
+        runtime_class_name: str | None = None
+        node_selector: dict[str, str] | None = None
+        tolerations: list[client.V1Toleration] | None = None
+        if profile is not None:
+            resource_name = profile.kubernetes.resource_name
+            resources[resource_name] = str(spec.accelerator_count)
+            digest = profile.semantic_digest()
+            annotations = {
+                RUNTIME_PROFILE_DIGEST_ANNOTATION: digest,
+                ACCELERATOR_RESOURCE_ANNOTATION: resource_name,
+                ACCELERATOR_COUNT_ANNOTATION: str(spec.accelerator_count),
+                ALLOCATION_AUTHORITY_ANNOTATION: profile.allocation_authority.value,
+            }
+            image = profile.image.reference
+            command = list(profile.process.command)
+            environment.extend(
+                client.V1EnvVar(name=name, value=value) for name, value in spec.profile_environment
+            )
+            readiness_probe = _http_probe(profile.probes.readiness)
+            liveness_probe = _http_probe(profile.probes.health)
+            runtime_class_name = profile.kubernetes.runtime_class_name
+            node_selector = dict(profile.kubernetes.node_selector)
+            tolerations = [
+                client.V1Toleration(
+                    key=item.key,
+                    operator=item.operator,
+                    value=item.value,
+                    effect=item.effect,
+                )
+                for item in profile.kubernetes.tolerations
+            ]
         container = client.V1Container(
             name=CONTAINER_NAME,
-            image=spec.image,
+            image=image,
             image_pull_policy="IfNotPresent",
-            command=list(_fake_inference_command(spec)),
-            env=[
-                client.V1EnvVar(name="PYTHONDONTWRITEBYTECODE", value="1"),
-                client.V1EnvVar(name="TMPDIR", value="/tmp"),
-            ],
-            ports=[client.V1ContainerPort(name="http", container_port=spec.container_port)],
-            readiness_probe=client.V1Probe(
-                http_get=client.V1HTTPGetAction(path="/health", port=spec.container_port),
-                initial_delay_seconds=0,
-                period_seconds=self.readiness_probe_period_seconds,
-                timeout_seconds=self.readiness_probe_timeout_seconds,
-                failure_threshold=1,
-                success_threshold=1,
+            command=command,
+            args=(
+                [
+                    spec.model,
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    str(spec.container_port),
+                    "--tensor-parallel-size",
+                    str(spec.tensor_parallel_size),
+                ]
+                if profile is not None
+                else None
             ),
+            env=environment,
+            ports=[client.V1ContainerPort(name="http", container_port=spec.container_port)],
+            liveness_probe=liveness_probe,
+            readiness_probe=readiness_probe,
             resources=client.V1ResourceRequirements(
                 requests=dict(resources),
                 limits=dict(resources),
@@ -641,6 +760,7 @@ class KubernetesServingRuntimeAdapter:
             metadata=client.V1ObjectMeta(
                 name=self.pod_name(spec),
                 labels={**dict(selector), RESOURCE_KIND_LABEL: POD_RESOURCE_KIND},
+                annotations=annotations or None,
             ),
             spec=client.V1PodSpec(
                 automount_service_account_token=False,
@@ -650,6 +770,7 @@ class KubernetesServingRuntimeAdapter:
                 host_network=False,
                 host_pid=False,
                 restart_policy="Never",
+                runtime_class_name=runtime_class_name,
                 security_context=client.V1PodSecurityContext(
                     run_as_non_root=True,
                     run_as_user=10001,
@@ -658,6 +779,8 @@ class KubernetesServingRuntimeAdapter:
                 ),
                 subdomain=HEADLESS_SERVICE_NAME,
                 termination_grace_period_seconds=self.termination_grace_seconds,
+                node_selector=node_selector,
+                tolerations=tolerations,
                 volumes=[
                     client.V1Volume(
                         name=TMP_VOLUME_NAME,
@@ -728,6 +851,7 @@ class KubernetesServingRuntimeAdapter:
             raise KubernetesServingOwnershipError(
                 "refusing to adopt Kubernetes serving Pod without equal requests and limits"
             )
+        _validate_observed_accelerator_contract(pod)
         observed_contract = _pod_contract(pod)
         observed_hash = _pod_contract_hash(pod)
         if expected_spec is None:
@@ -825,6 +949,16 @@ class KubernetesServingRuntimeAdapter:
             raise ValueError("service CPU and memory limits are invalid")
         if spec.container_port < 1 or spec.container_port > 65535:
             raise ValueError("container_port must be between 1 and 65535")
+        profile = spec.runtime_profile
+        if profile is None:
+            if spec.accelerator_count != 0:
+                raise ValueError("accelerator_count requires a runtime_profile")
+            if spec.tensor_parallel_size != 1:
+                raise ValueError("non-accelerator Pods require tensor_parallel_size=1")
+            if spec.profile_environment:
+                raise ValueError("profile_environment requires a runtime_profile")
+        else:
+            _validate_accelerator_launch_spec(spec, profile)
         if (
             isinstance(spec.startup_delay_seconds, bool)
             or isinstance(spec.chunk_delay_seconds, bool)
@@ -839,6 +973,16 @@ class KubernetesServingRuntimeAdapter:
     def _operation_error(operation: str, exc: ApiException) -> KubernetesServingRuntimeError:
         detail = exc.reason or exc.body or str(exc)
         return KubernetesServingRuntimeError(f"failed to {operation}: {_bounded(str(detail))}")
+
+    async def _observe_allocation(self, pod: object) -> None:
+        if self._allocation_observer is None:
+            return
+        observation = _observed_allocation(pod)
+        if observation is None:
+            return
+        result = self._allocation_observer(observation)
+        if inspect.isawaitable(result):
+            await result
 
 
 def _resource_name(
@@ -878,6 +1022,7 @@ def _pod_contract(pod: object) -> dict[str, object]:
     """
 
     labels = _resource_labels(pod)
+    annotations = _resource_annotations(pod)
     pod_spec = getattr(pod, "spec", None)
     containers = getattr(pod_spec, "containers", None) or []
     container = containers[0] if len(containers) == 1 else None
@@ -887,14 +1032,33 @@ def _pod_contract(pod: object) -> dict[str, object]:
     capabilities = getattr(container_security, "capabilities", None)
     resources = getattr(container, "resources", None)
     probe = getattr(container, "readiness_probe", None)
-    http_get = getattr(probe, "http_get", None)
+    liveness_probe = getattr(container, "liveness_probe", None)
     volumes = getattr(pod_spec, "volumes", None) or []
     volume = volumes[0] if len(volumes) == 1 else None
     empty_dir = getattr(volume, "empty_dir", None)
     volume_mounts = getattr(container, "volume_mounts", None) or []
+    accelerator_contract = annotations.get(ACCELERATOR_RESOURCE_ANNOTATION) is not None
+    contract_label_keys = _BASE_CONTRACT_LABEL_KEYS + (
+        _ACCELERATOR_CONTRACT_LABEL_KEYS if accelerator_contract else ()
+    )
 
     return {
-        "fencing_labels": {key: labels.get(key) for key in _CONTRACT_LABEL_KEYS},
+        "fencing_labels": {key: labels.get(key) for key in contract_label_keys},
+        **(
+            {
+                "accelerator_annotations": {
+                    key: annotations.get(key)
+                    for key in (
+                        RUNTIME_PROFILE_DIGEST_ANNOTATION,
+                        ACCELERATOR_RESOURCE_ANNOTATION,
+                        ACCELERATOR_COUNT_ANNOTATION,
+                        ALLOCATION_AUTHORITY_ANNOTATION,
+                    )
+                }
+            }
+            if accelerator_contract
+            else {}
+        ),
         "pod": {
             "automount_service_account_token": getattr(
                 pod_spec, "automount_service_account_token", None
@@ -905,6 +1069,24 @@ def _pod_contract(pod: object) -> dict[str, object]:
             "host_pid": getattr(pod_spec, "host_pid", None) is True,
             "share_process_namespace": getattr(pod_spec, "share_process_namespace", None) is True,
             "restart_policy": getattr(pod_spec, "restart_policy", None),
+            **(
+                {
+                    "runtime_class_name": getattr(pod_spec, "runtime_class_name", None),
+                    "node_selector": _string_mapping(getattr(pod_spec, "node_selector", None)),
+                    "tolerations": tuple(
+                        {
+                            "key": getattr(item, "key", None),
+                            "operator": getattr(item, "operator", None),
+                            "value": getattr(item, "value", None),
+                            "effect": getattr(item, "effect", None),
+                            "toleration_seconds": getattr(item, "toleration_seconds", None),
+                        }
+                        for item in (getattr(pod_spec, "tolerations", None) or [])
+                    ),
+                }
+                if accelerator_contract
+                else {}
+            ),
             "subdomain": getattr(pod_spec, "subdomain", None),
             "termination_grace_period_seconds": getattr(
                 pod_spec, "termination_grace_period_seconds", None
@@ -955,27 +1137,10 @@ def _pod_contract(pod: object) -> dict[str, object]:
                 "limits": _string_mapping(getattr(resources, "limits", None)),
                 "claims": tuple(str(item) for item in (getattr(resources, "claims", None) or [])),
             },
-            "readiness_probe": {
-                "present": probe is not None,
-                "http_path": getattr(http_get, "path", None),
-                "http_port": getattr(http_get, "port", None),
-                "http_host": getattr(http_get, "host", None) or "",
-                "http_scheme": getattr(http_get, "scheme", None) or "HTTP",
-                "http_header_count": len(getattr(http_get, "http_headers", None) or []),
-                "exec_present": getattr(probe, "_exec", None) is not None,
-                "grpc_present": getattr(probe, "grpc", None) is not None,
-                "tcp_socket_present": getattr(probe, "tcp_socket", None) is not None,
-                "initial_delay_seconds": getattr(probe, "initial_delay_seconds", None) or 0,
-                "period_seconds": getattr(probe, "period_seconds", None),
-                "timeout_seconds": getattr(probe, "timeout_seconds", None),
-                "failure_threshold": getattr(probe, "failure_threshold", None),
-                "success_threshold": getattr(probe, "success_threshold", None),
-                "termination_grace_period_seconds": getattr(
-                    probe, "termination_grace_period_seconds", None
-                ),
-            },
+            "readiness_probe": _probe_contract(probe),
+            **({"liveness_probe": _probe_contract(liveness_probe)} if accelerator_contract else {}),
             "other_probes": {
-                "liveness": getattr(container, "liveness_probe", None) is not None,
+                "liveness": liveness_probe is not None,
                 "startup": getattr(container, "startup_probe", None) is not None,
             },
             "lifecycle_present": getattr(container, "lifecycle", None) is not None,
@@ -1032,6 +1197,228 @@ def _string_mapping(value: object) -> dict[str, str]:
     return {str(key): str(item) for key, item in value.items()}
 
 
+def _probe_contract(probe: object) -> dict[str, object]:
+    http_get = getattr(probe, "http_get", None)
+    return {
+        "present": probe is not None,
+        "http_path": getattr(http_get, "path", None),
+        "http_port": getattr(http_get, "port", None),
+        "http_host": getattr(http_get, "host", None) or "",
+        "http_scheme": getattr(http_get, "scheme", None) or "HTTP",
+        "http_header_count": len(getattr(http_get, "http_headers", None) or []),
+        "exec_present": getattr(probe, "_exec", None) is not None,
+        "grpc_present": getattr(probe, "grpc", None) is not None,
+        "tcp_socket_present": getattr(probe, "tcp_socket", None) is not None,
+        "initial_delay_seconds": getattr(probe, "initial_delay_seconds", None) or 0,
+        "period_seconds": getattr(probe, "period_seconds", None),
+        "timeout_seconds": getattr(probe, "timeout_seconds", None),
+        "failure_threshold": getattr(probe, "failure_threshold", None),
+        "success_threshold": getattr(probe, "success_threshold", None),
+        "termination_grace_period_seconds": getattr(
+            probe, "termination_grace_period_seconds", None
+        ),
+    }
+
+
+def _http_probe(probe: HttpProbe) -> client.V1Probe:
+    return client.V1Probe(
+        http_get=client.V1HTTPGetAction(
+            path=probe.path,
+            port=probe.port,
+        ),
+        initial_delay_seconds=probe.initial_delay_seconds,
+        period_seconds=probe.period_seconds,
+        timeout_seconds=probe.timeout_seconds,
+        failure_threshold=probe.failure_threshold,
+        success_threshold=1,
+    )
+
+
+def _profile_digest_label(digest: str) -> str:
+    prefix = "sha256:"
+    if not digest.startswith(prefix) or not _IMAGE_DIGEST.fullmatch(digest):
+        raise ValueError("runtime profile digest must be canonical sha256")
+    encoded = base64.b32encode(bytes.fromhex(digest.removeprefix(prefix)))
+    return encoded.decode("ascii").rstrip("=").lower()
+
+
+def _validate_accelerator_launch_spec(
+    spec: KubernetesServingLaunchSpec,
+    profile: RuntimeProfile,
+) -> None:
+    if spec.image != profile.image.reference:
+        raise ValueError("accelerator Pod image must equal the runtime profile image")
+    if spec.accelerator_count < 1:
+        raise ValueError("accelerator runtime profiles require accelerator_count greater than zero")
+    if spec.tensor_parallel_size != spec.accelerator_count:
+        raise ValueError("accelerator_count must equal tensor_parallel_size")
+    capability = profile.capabilities.tensor_parallel
+    if spec.tensor_parallel_size < capability.minimum_size:
+        raise ValueError("tensor_parallel_size is below the runtime profile minimum")
+    if capability.maximum_size is not None and spec.tensor_parallel_size > capability.maximum_size:
+        raise ValueError("tensor_parallel_size exceeds the runtime profile maximum")
+    if not capability.supported and spec.tensor_parallel_size != 1:
+        raise ValueError("runtime profile does not support tensor parallel execution")
+    if (
+        profile.probes.health.port != spec.container_port
+        or profile.probes.readiness.port != spec.container_port
+    ):
+        raise ValueError("runtime profile probe ports must equal container_port")
+    security = profile.kubernetes.security
+    if (
+        security.privileged
+        or security.host_pid
+        or security.host_network
+        or security.host_path
+        or security.allow_privilege_escalation
+    ):
+        raise ValueError("runtime profile cannot relax the Kubernetes security baseline")
+    environment_names = [name for name, _value in spec.profile_environment]
+    if len(set(environment_names)) != len(environment_names):
+        raise ValueError("profile_environment names must be unique")
+    allowed_environment = set(profile.process.env_allowlist)
+    for name, value in spec.profile_environment:
+        if name not in allowed_environment:
+            raise ValueError(f"profile_environment variable is not allowlisted: {name}")
+        if len(value) > 4096 or any(ord(character) < 32 for character in value):
+            raise ValueError(f"profile_environment value is invalid: {name}")
+
+
+def _validate_observed_accelerator_contract(pod: object) -> None:
+    labels = _resource_labels(pod)
+    annotations = _resource_annotations(pod)
+    pod_spec = getattr(pod, "spec", None)
+    containers = getattr(pod_spec, "containers", None) or []
+    container = containers[0] if len(containers) == 1 else None
+    resources = getattr(container, "resources", None)
+    requests = _string_mapping(getattr(resources, "requests", None))
+    limits = _string_mapping(getattr(resources, "limits", None))
+    extended_requests = {key: value for key, value in requests.items() if "/" in key}
+    extended_limits = {key: value for key, value in limits.items() if "/" in key}
+    resource_name = annotations.get(ACCELERATOR_RESOURCE_ANNOTATION)
+    profile_fields = {
+        ACCELERATOR_VENDOR_LABEL: labels.get(ACCELERATOR_VENDOR_LABEL),
+        ACCELERATOR_KIND_LABEL: labels.get(ACCELERATOR_KIND_LABEL),
+        RUNTIME_PROFILE_ID_LABEL: labels.get(RUNTIME_PROFILE_ID_LABEL),
+        RUNTIME_PROFILE_VERSION_LABEL: labels.get(RUNTIME_PROFILE_VERSION_LABEL),
+        RUNTIME_PROFILE_DIGEST_LABEL: labels.get(RUNTIME_PROFILE_DIGEST_LABEL),
+    }
+    if resource_name is None:
+        accelerator_annotations = {
+            key: annotations.get(key)
+            for key in (
+                RUNTIME_PROFILE_DIGEST_ANNOTATION,
+                ACCELERATOR_RESOURCE_ANNOTATION,
+                ACCELERATOR_COUNT_ANNOTATION,
+                ALLOCATION_AUTHORITY_ANNOTATION,
+            )
+        }
+        if (
+            extended_requests
+            or extended_limits
+            or any(profile_fields.values())
+            or any(accelerator_annotations.values())
+        ):
+            raise KubernetesServingOwnershipError(
+                "refusing to adopt Kubernetes serving Pod with incomplete accelerator contract"
+            )
+        return
+    required_annotations = {
+        RUNTIME_PROFILE_DIGEST_ANNOTATION,
+        ACCELERATOR_RESOURCE_ANNOTATION,
+        ACCELERATOR_COUNT_ANNOTATION,
+        ALLOCATION_AUTHORITY_ANNOTATION,
+    }
+    if any(not annotations.get(key) for key in required_annotations) or any(
+        not value for value in profile_fields.values()
+    ):
+        raise KubernetesServingOwnershipError(
+            "refusing to adopt Kubernetes serving Pod with incomplete accelerator metadata"
+        )
+    try:
+        digest_label = _profile_digest_label(annotations[RUNTIME_PROFILE_DIGEST_ANNOTATION])
+    except ValueError as error:
+        raise KubernetesServingOwnershipError(
+            "refusing to adopt Kubernetes serving Pod with invalid runtime profile digest"
+        ) from error
+    if digest_label != labels.get(RUNTIME_PROFILE_DIGEST_LABEL):
+        raise KubernetesServingOwnershipError(
+            "refusing to adopt Kubernetes serving Pod with mismatched runtime profile digest"
+        )
+    count = annotations[ACCELERATOR_COUNT_ANNOTATION]
+    if extended_requests != {resource_name: count} or extended_limits != {resource_name: count}:
+        raise KubernetesServingOwnershipError(
+            "refusing to adopt Kubernetes serving Pod with unknown or asymmetric "
+            "accelerator resources"
+        )
+    try:
+        if int(count) < 1 or str(int(count)) != count:
+            raise ValueError
+    except ValueError as error:
+        raise KubernetesServingOwnershipError(
+            "refusing to adopt Kubernetes serving Pod with invalid accelerator count"
+        ) from error
+    vendor = labels[ACCELERATOR_VENDOR_LABEL]
+    kind = labels[ACCELERATOR_KIND_LABEL]
+    try:
+        vendor_value = AcceleratorVendor(vendor)
+        kind_value = AcceleratorKind(kind)
+    except ValueError as error:
+        raise KubernetesServingOwnershipError(
+            "refusing to adopt Pod with an unknown vendor and accelerator kind contract"
+        ) from error
+    if not vendor_kind_is_compatible(vendor_value, kind_value):
+        raise KubernetesServingOwnershipError(
+            "refusing to adopt Pod with an incompatible vendor and accelerator kind contract"
+        )
+    if annotations[ALLOCATION_AUTHORITY_ANNOTATION] != "kubernetes_device_plugin":
+        raise KubernetesServingOwnershipError(
+            "refusing to adopt Pod without Kubernetes device-plugin allocation authority"
+        )
+    if getattr(pod_spec, "runtime_class_name", None) in (None, ""):
+        raise KubernetesServingOwnershipError(
+            "refusing to adopt accelerator Pod without RuntimeClass"
+        )
+    node_selector = _string_mapping(getattr(pod_spec, "node_selector", None))
+    if node_selector.get("accelerator.mini-ai-cloud/vendor") != vendor:
+        raise KubernetesServingOwnershipError(
+            "refusing to adopt accelerator Pod with mismatched vendor node selector"
+        )
+    args = tuple(str(item) for item in (getattr(container, "args", None) or ()))
+    if _unique_argument_value(args, "--tensor-parallel-size") != count:
+        raise KubernetesServingOwnershipError(
+            "refusing to adopt accelerator Pod whose tensor parallel size differs from count"
+        )
+
+
+def _observed_allocation(pod: object) -> KubernetesObservedAllocation | None:
+    annotations = _resource_annotations(pod)
+    resource_name = annotations.get(ACCELERATOR_RESOURCE_ANNOTATION)
+    if resource_name is None:
+        return None
+    labels = _resource_labels(pod)
+    return KubernetesObservedAllocation(
+        service_id=uuid.UUID(labels[SERVICE_ID_LABEL]),
+        replica_id=uuid.UUID(labels[REPLICA_ID_LABEL]),
+        execution_id=uuid.UUID(labels[EXECUTION_ID_LABEL]),
+        vendor=labels[ACCELERATOR_VENDOR_LABEL],
+        kind=labels[ACCELERATOR_KIND_LABEL],
+        resource_name=resource_name,
+        count=int(annotations[ACCELERATOR_COUNT_ANNOTATION]),
+        runtime_profile_id=labels[RUNTIME_PROFILE_ID_LABEL],
+        runtime_profile_version=labels[RUNTIME_PROFILE_VERSION_LABEL],
+        runtime_profile_digest=annotations[RUNTIME_PROFILE_DIGEST_ANNOTATION],
+        allocation_authority=annotations[ALLOCATION_AUTHORITY_ANNOTATION],
+    )
+
+
+def _unique_argument_value(arguments: tuple[str, ...], name: str) -> str | None:
+    positions = [index for index, value in enumerate(arguments) if value == name]
+    if len(positions) != 1 or positions[0] + 1 >= len(arguments):
+        return None
+    return arguments[positions[0] + 1]
+
+
 def _volume_sources(volume: object) -> tuple[str, ...]:
     attribute_map = getattr(volume, "attribute_map", None)
     if not isinstance(attribute_map, Mapping):
@@ -1080,6 +1467,16 @@ def _resource_labels(resource: object) -> dict[str, str]:
             "Kubernetes serving resource labels are not a mapping"
         )
     return {str(key): str(value) for key, value in raw_labels.items()}
+
+
+def _resource_annotations(resource: object) -> dict[str, str]:
+    metadata = getattr(resource, "metadata", None)
+    raw_annotations = getattr(metadata, "annotations", None) or {}
+    if not isinstance(raw_annotations, Mapping):
+        raise KubernetesServingOwnershipError(
+            "Kubernetes serving resource annotations are not a mapping"
+        )
+    return {str(key): str(value) for key, value in raw_annotations.items()}
 
 
 def _observed_resource_name(resource: object) -> str:
