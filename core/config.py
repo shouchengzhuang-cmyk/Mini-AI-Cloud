@@ -1,5 +1,6 @@
 import json
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated
 
 from pydantic import BeforeValidator, Field, model_validator
@@ -8,6 +9,9 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 _LOCAL_API_KEY_PEPPER = "local-development-api-key-pepper-change-me"
 _LOCAL_WORKER_AUTH_TOKEN = "local-development-worker-token"
 _PRODUCTION_CREDENTIAL_MIN_BYTES = 32
+_DEFAULT_RUNTIME_PROFILE_MANIFEST = str(
+    Path(__file__).parents[1] / "runtime_profiles" / "manifest.json"
+)
 
 
 def _parse_labels(value: object) -> dict[str, str]:
@@ -141,6 +145,7 @@ class Settings(BaseSettings):
     kubernetes_kubeconfig: str | None = None
     kubernetes_in_cluster: bool = False
     kubernetes_cleanup_grace_seconds: int = Field(default=30, ge=0, le=3600)
+    runtime_profile_manifest_path: str = _DEFAULT_RUNTIME_PROFILE_MANIFEST
 
     kubernetes_serving_enabled: bool = False
     kubernetes_serving_fake_enabled: bool = False

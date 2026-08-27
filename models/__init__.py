@@ -8,6 +8,7 @@ from models.artifact import (
 )
 from models.base import Base
 from models.identity import ApiKey, Project, ProjectMembership, User
+from models.model_variant import LogicalModel, LogicalModelStatusEvent, ModelVariant
 from models.outbox import OutboxEvent
 from models.registry import (
     ImagePolicy,
@@ -49,7 +50,10 @@ __all__ = [
     "ImagePolicy",
     "ImagePolicyRule",
     "JobGroup",
+    "LogicalModel",
+    "LogicalModelStatusEvent",
     "ModelService",
+    "ModelVariant",
     "OutboxEvent",
     "PlacementAttempt",
     "PreemptionPlan",

@@ -57,6 +57,9 @@ Security = "https://github.com/shouchengzhuang-cmyk/Mini-AI-Cloud/security/polic
 [tool.hatch.build.targets.wheel]
 packages = ["api", "cli", "core", "models", "repositories", "scheduler", "worker"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"runtime_profiles" = "runtime_profiles"
+
 [tool.ruff]
 target-version = "py312"
 line-length = 100

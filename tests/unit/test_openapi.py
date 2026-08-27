@@ -21,6 +21,7 @@ def test_openapi_generation_covers_phase_i_and_phase_ii_resources() -> None:
         "/api/v1/projects/{project_id}/quota",
         "/api/v1/projects/{project_id}/secrets",
         "/api/v1/projects/{project_id}/datasets",
+        "/api/v1/projects/{project_id}/logical-models",
         "/api/v1/artifacts",
         "/api/v1/services",
         "/api/v1/projects/{project_id}/job-groups",
@@ -49,6 +50,8 @@ def test_openapi_generation_covers_phase_i_and_phase_ii_resources() -> None:
         "TaskOutputArtifact",
         "ArtifactCreate",
         "DatasetCreate",
+        "LogicalModelCreate",
+        "ModelVariantCreate",
         "ServiceCreate",
         "BootstrapRequest",
     } <= schemas.keys()

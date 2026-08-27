@@ -1,14 +1,45 @@
 {
   "profiles": [
     {
+      "dtypes": [
+        "bfloat16"
+      ],
+      "engine": "vllm-ascend",
+      "evidence_status": "SCHEMA_READY",
+      "features": [
+        "streaming"
+      ],
+      "hardware_families": [
+        "Atlas A2",
+        "Atlas A3"
+      ],
       "identity": "ascend-vllm-k8s-a2@1.0.0",
+      "kind": "npu",
+      "model_architectures": [],
       "path": "runtime_profiles/ascend-vllm-k8s.example.yaml",
-      "semantic_digest": "sha256:a59a59dcb05548eb95594136ec9cb8b49aae63d1cf1c6d56bafb74b7afbc970d"
+      "profile_id": "ascend-vllm-k8s-a2",
+      "profile_version": "1.0.0",
+      "semantic_digest": "sha256:a59a59dcb05548eb95594136ec9cb8b49aae63d1cf1c6d56bafb74b7afbc970d",
+      "vendor": "huawei-ascend"
     },
     {
+      "dtypes": [
+        "bfloat16"
+      ],
+      "engine": "vllm",
+      "evidence_status": "SCHEMA_READY",
+      "features": [
+        "streaming"
+      ],
+      "hardware_families": [],
       "identity": "nvidia-vllm-k8s@1.0.0",
+      "kind": "gpu",
+      "model_architectures": [],
       "path": "runtime_profiles/nvidia-vllm-k8s.example.yaml",
-      "semantic_digest": "sha256:af029737b4bcda648b00ed700237f14febea4d8dddbaae678aa4b7e2cd2cd16b"
+      "profile_id": "nvidia-vllm-k8s",
+      "profile_version": "1.0.0",
+      "semantic_digest": "sha256:af029737b4bcda648b00ed700237f14febea4d8dddbaae678aa4b7e2cd2cd16b",
+      "vendor": "nvidia"
     }
   ],
   "schema_version": "1.0.0"
