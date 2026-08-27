@@ -627,6 +627,27 @@ jobs:
               remote_tag_sha="$(git ls-remote origin "refs/tags/${RELEASE_TAG}" | cut -f1)"
             fi
             test "${remote_tag_sha}" = "${TARGET_SHA}"
+            mapfile -t final_published_assets < <(
+              gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+                --json assets --jq '.assets[].name' | sort
+            )
+            test "$(printf '%s\n' "${final_published_assets[@]}")" = \
+              "$(printf '%s\n' "${expected_assets[@]}")"
+            final_verification_dir="${RUNNER_TEMP}/release-asset-final-verification"
+            mkdir -p "${final_verification_dir}"
+            gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+              --dir "${final_verification_dir}" --clobber
+            cmp build/release-assets.sha256 \
+              "${final_verification_dir}/release-assets.sha256"
+            (cd "${final_verification_dir}" && \
+              sha256sum --check --strict release-assets.sha256)
+            remote_tag_sha="$(
+              git ls-remote origin "refs/tags/${RELEASE_TAG}^{}" | cut -f1
+            )"
+            if [ -z "${remote_tag_sha}" ]; then
+              remote_tag_sha="$(git ls-remote origin "refs/tags/${RELEASE_TAG}" | cut -f1)"
+            fi
+            test "${remote_tag_sha}" = "${TARGET_SHA}"
             gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
               --draft=false \
               --prerelease=false \
