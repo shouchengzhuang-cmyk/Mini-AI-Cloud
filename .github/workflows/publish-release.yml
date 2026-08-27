@@ -410,6 +410,26 @@ jobs:
           assert metadata["Name"] == "mini-ai-cloud"
           assert metadata["Version"] == version
 
+          generated_wheels = list(Path("build/release-wheel").glob("mini_ai_cloud-*.whl"))
+          assert len(generated_wheels) == 1, generated_wheels
+
+          def normalized_wheel_hashes(path: Path) -> dict[str, str]:
+              with zipfile.ZipFile(path) as wheel:
+                  result = {}
+                  for name in sorted(wheel.namelist()):
+                      if name.endswith(".dist-info/RECORD"):
+                          continue
+                      payload = wheel.read(name)
+                      if name.endswith(".dist-info/WHEEL"):
+                          lines = [
+                              line for line in payload.splitlines() if not line.startswith(b"Generator:")
+                          ]
+                          payload = b"\n".join(lines) + b"\n"
+                      result[name] = hashlib.sha256(payload).hexdigest()
+                  return result
+
+          assert normalized_wheel_hashes(wheels[0]) == normalized_wheel_hashes(generated_wheels[0])
+
           archive = root / f"mini-ai-cloud-v{version}-evidence.tar.gz"
           expected_checksum_names = {
               wheels[0].name,
