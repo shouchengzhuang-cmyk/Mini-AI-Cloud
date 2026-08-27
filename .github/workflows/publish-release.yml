@@ -333,8 +333,81 @@ jobs:
           mkdir -p "${verification_dir}"
           gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
             --dir "${verification_dir}" --clobber
-          cmp build/release-assets.sha256 "${verification_dir}/release-assets.sha256"
           (cd "${verification_dir}" && sha256sum --check release-assets.sha256)
+          if [ "${release_is_draft}" = "true" ]; then
+            cmp build/release-assets.sha256 "${verification_dir}/release-assets.sha256"
+          fi
+
+          export VERIFICATION_DIR="${verification_dir}"
+          python - <<'PY'
+          import json
+          import os
+          import tarfile
+          import zipfile
+          from email.parser import Parser
+          from pathlib import Path, PurePosixPath
+
+          root = Path(os.environ["VERIFICATION_DIR"])
+          sha = os.environ["TARGET_SHA"]
+          version = os.environ["RELEASE_VERSION"]
+
+          wheels = list(root.glob("mini_ai_cloud-*.whl"))
+          assert len(wheels) == 1, wheels
+          with zipfile.ZipFile(wheels[0]) as wheel:
+              metadata_name = next(name for name in wheel.namelist() if name.endswith(".dist-info/METADATA"))
+              metadata = Parser().parsestr(wheel.read(metadata_name).decode("utf-8"))
+          assert metadata["Name"] == "mini-ai-cloud"
+          assert metadata["Version"] == version
+
+          image_sbom = json.loads((root / "mini-ai-cloud-image.spdx.json").read_text(encoding="utf-8"))
+          assert image_sbom.get("spdxVersion", "").startswith("SPDX-")
+
+          archive = root / f"mini-ai-cloud-v{version}-evidence.tar.gz"
+          with tarfile.open(archive, "r:gz") as bundle:
+              members = bundle.getmembers()
+              for member in members:
+                  path = PurePosixPath(member.name)
+                  assert not path.is_absolute() and ".." not in path.parts
+              names = {member.name for member in members}
+
+              def read_json(name: str) -> dict:
+                  fileobj = bundle.extractfile(name)
+                  assert fileobj is not None, name
+                  return json.loads(fileobj.read().decode("utf-8"))
+
+              evidence = read_json(f"evidence/{sha}/manifest.json")
+              preparation = read_json(f"release/{sha}/release-preparation.json")
+              cyclonedx = read_json(f"release/{sha}/cyclonedx-sbom.json")
+              soak_summaries = sorted(
+                  name for name in names if name.startswith("soak/") and name.endswith("/summary.json")
+              )
+              dr_summaries = sorted(
+                  name for name in names if name.startswith("dr-rehearsal/") and name.endswith("/summary.json")
+              )
+              assert len(soak_summaries) == 1, soak_summaries
+              assert len(dr_summaries) == 1, dr_summaries
+              soak = read_json(soak_summaries[0])
+              dr = read_json(dr_summaries[0])
+
+              checksum_member = bundle.extractfile(f"release/{sha}/SHA256SUMS")
+              assert checksum_member is not None
+              bundled_checksums = checksum_member.read()
+
+          assert evidence["git"]["sha"] == sha
+          assert evidence["git"]["dirty"] is False
+          assert preparation["git_sha"] == sha
+          assert preparation["dirty_tree"] is False
+          assert preparation["version"] == version
+          assert preparation["real_gpu"] == "NOT_RUN"
+          assert preparation["deployment_status"] == "NOT_DEPLOYED"
+          assert soak["status"] == "PASS" and soak["cleanup"] == "PASS"
+          assert dr["git_sha"] == sha
+          assert dr["status"] == "PASS" and dr["cleanup"] == "PASS"
+          assert cyclonedx.get("bomFormat") == "CycloneDX"
+          assert json.loads((root / "release-preparation.json").read_text(encoding="utf-8")) == preparation
+          assert json.loads((root / "cyclonedx-sbom.json").read_text(encoding="utf-8")) == cyclonedx
+          assert (root / "SHA256SUMS").read_bytes() == bundled_checksums
+          PY
 
           if [ "${release_is_draft}" = "true" ]; then
             gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
