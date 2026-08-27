@@ -16,11 +16,15 @@ from repositories.tasks import TaskRepository
 from repositories.workers import WorkerRepository
 from scheduler import Scheduler, TaskAssignment
 from worker.artifact_workspace import ArtifactWorkspaceManager
-from worker.capabilities import detect_capabilities, detect_gpu_devices
+from worker.capabilities import detect_capabilities
 from worker.docker_runtime import DockerRuntime
 from worker.executor import TaskExecutor
 from worker.fake_runtime import FakeComputeRuntime
-from worker.gpu_inventory import NoGPUInventoryProvider, build_gpu_inventory_provider
+from worker.gpu_inventory import (
+    InventoryStatus,
+    NoGPUInventoryProvider,
+    build_accelerator_inventory_registry,
+)
 from worker.heartbeat import ActiveExecution, Heartbeat
 from worker.kubernetes_runtime import KubernetesRuntime
 from worker.runtime import ComputeRuntime
@@ -38,14 +42,18 @@ class WorkerService:
             ready_stream_maxlen=settings.ready_stream_maxlen,
             socket_timeout=settings.redis_socket_timeout,
         )
+        self.logger = get_logger("worker")
         self.capabilities = detect_capabilities(NoGPUInventoryProvider())
         self.worker_id = settings.worker_id or (
             f"{self.capabilities.hostname}-{uuid.uuid4().hex[:12]}"
         )
         self.worker_session_id = uuid.uuid4()
-        self.gpu_devices = detect_gpu_devices(
-            build_gpu_inventory_provider(settings, worker_id=self.worker_id)
+        inventory_registry = build_accelerator_inventory_registry(
+            settings, worker_id=self.worker_id
         )
+        inventory_snapshot = inventory_registry.snapshot()
+        self.inventory_provider_results = inventory_snapshot.provider_results
+        self.gpu_devices = inventory_snapshot.devices
         self.capabilities = replace(
             self.capabilities,
             gpu_count=len(self.gpu_devices),
@@ -109,9 +117,22 @@ class WorkerService:
         self.stop_requested = asyncio.Event()
         self.heartbeat_stop = asyncio.Event()
         self.next_orphan_reconcile = 0.0
-        self.logger = get_logger("worker")
 
     async def run(self) -> None:
+        for result in self.inventory_provider_results:
+            log = (
+                self.logger.info
+                if result.status == InventoryStatus.AVAILABLE
+                else self.logger.warning
+            )
+            log(
+                "accelerator inventory discovery",
+                provider=result.provider,
+                status=result.status.value,
+                device_count=len(result.devices),
+                rejected_rows=result.rejected_rows,
+                reason=result.message,
+            )
         docker_version = (
             await self.docker_runtime.version() if self.docker_runtime is not None else None
         )
@@ -296,11 +317,16 @@ class WorkerService:
                     {
                         "uuid": item.uuid,
                         "index": item.index,
-                        "vendor": item.vendor,
+                        "vendor": item.vendor.value,
+                        "accelerator_kind": item.kind.value,
                         "model": item.model,
                         "memory_total_mb": item.memory_total_mb,
                         "memory_free_mb": item.memory_free_mb,
                         "compute_capability": item.compute_capability,
+                        "compute_arch": item.compute_arch,
+                        "runtime_profile_ids": list(item.runtime_profile_ids),
+                        "capabilities": list(item.capabilities),
+                        "kubernetes_resource_name": item.kubernetes_resource_name,
                         "fake": item.fake,
                     }
                     for item in self.gpu_devices

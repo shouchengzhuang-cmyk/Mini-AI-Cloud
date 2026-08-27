@@ -1,36 +1,187 @@
 import csv
 import io
+import json
+import re
 import subprocess
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import Protocol
+from enum import StrEnum
+from typing import Any, Protocol
 
+from core.accelerators import AcceleratorDevice, kind_for_vendor
 from core.config import Settings
+from core.enums import AcceleratorKind, AcceleratorVendor
+
+MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024
+MAX_INVENTORY_ROWS = 256
+
+
+class InventoryStatus(StrEnum):
+    AVAILABLE = "available"
+    DEGRADED = "degraded"
+    UNAVAILABLE = "unavailable"
 
 
 @dataclass(frozen=True, slots=True)
-class GPUDevice:
-    uuid: str
-    index: int
-    vendor: str
-    model: str
-    memory_total_mb: int
-    memory_free_mb: int
-    compute_capability: str | None
-    fake: bool = False
+class InventoryProviderResult:
+    provider: str
+    status: InventoryStatus
+    devices: tuple[AcceleratorDevice, ...] = ()
+    message: str | None = None
+    rejected_rows: int = 0
 
 
-class GPUInventoryProvider(Protocol):
-    def list_devices(self) -> tuple[GPUDevice, ...]: ...
+@dataclass(frozen=True, slots=True)
+class InventorySnapshot:
+    devices: tuple[AcceleratorDevice, ...]
+    provider_results: tuple[InventoryProviderResult, ...]
+
+    @property
+    def status(self) -> InventoryStatus:
+        if not self.provider_results:
+            return InventoryStatus.UNAVAILABLE
+        statuses = {result.status for result in self.provider_results}
+        if statuses == {InventoryStatus.UNAVAILABLE}:
+            return InventoryStatus.UNAVAILABLE
+        if InventoryStatus.DEGRADED in statuses or InventoryStatus.UNAVAILABLE in statuses:
+            return InventoryStatus.DEGRADED
+        return InventoryStatus.AVAILABLE
 
 
-Runner = Callable[..., subprocess.CompletedProcess[str]]
+class DeviceInventory(Protocol):
+    def list_devices(self) -> tuple[AcceleratorDevice, ...]: ...
 
 
-class NvidiaSMIInventoryProvider:
-    """Discover individual NVIDIA devices without requiring NVML bindings."""
+class AcceleratorInventoryProvider(DeviceInventory, Protocol):
+    name: str
 
+    def discover(self) -> InventoryProviderResult: ...
+
+    def list_devices(self) -> tuple[AcceleratorDevice, ...]: ...
+
+
+Runner = Callable[..., subprocess.CompletedProcess[Any]]
+
+
+@dataclass(frozen=True, slots=True)
+class _CommandResult:
+    output: str | None
+    error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ParseResult:
+    devices: tuple[AcceleratorDevice, ...]
+    rejected_rows: int = 0
+
+
+class _InventoryProviderBase:
+    name: str
+
+    def discover(self) -> InventoryProviderResult:
+        raise NotImplementedError
+
+    def list_devices(self) -> tuple[AcceleratorDevice, ...]:
+        return self.discover().devices
+
+
+def _run_text_command(
+    runner: Runner,
+    command: list[str],
+    *,
+    timeout: float,
+) -> _CommandResult:
+    try:
+        completed = runner(
+            command,
+            check=False,
+            capture_output=True,
+            text=False,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        return _CommandResult(None, "command_not_found")
+    except subprocess.TimeoutExpired:
+        return _CommandResult(None, "command_timeout")
+    except (OSError, subprocess.SubprocessError):
+        return _CommandResult(None, "command_failed")
+
+    if completed.returncode != 0:
+        return _CommandResult(None, "command_failed")
+    raw_output = completed.stdout
+    try:
+        output = (
+            raw_output.decode("utf-8", errors="strict")
+            if isinstance(raw_output, bytes)
+            else raw_output
+        )
+    except UnicodeDecodeError:
+        return _CommandResult(None, "invalid_utf8")
+    if not isinstance(output, str):
+        return _CommandResult(None, "invalid_output_type")
+    if len(output.encode("utf-8")) > MAX_COMMAND_OUTPUT_BYTES:
+        return _CommandResult(None, "output_too_large")
+    return _CommandResult(output, None)
+
+
+def parse_nvidia_smi_csv(output: str) -> _ParseResult:
+    devices: list[AcceleratorDevice] = []
+    rejected_rows = 0
+    seen_ids: set[str] = set()
+    for row_number, row in enumerate(
+        csv.reader(io.StringIO(output), skipinitialspace=True), start=1
+    ):
+        if row_number > MAX_INVENTORY_ROWS:
+            rejected_rows += 1
+            break
+        if not row:
+            continue
+        if len(row) != len(NvidiaSMIInventoryProvider.QUERY_FIELDS):
+            rejected_rows += 1
+            continue
+        raw_uuid, raw_index, raw_model, raw_total, raw_free, raw_arch = (
+            item.strip() for item in row
+        )
+        try:
+            index = int(raw_index)
+            memory_total_mb = int(raw_total)
+            memory_free_mb = int(raw_free)
+        except ValueError:
+            rejected_rows += 1
+            continue
+        if (
+            not raw_uuid
+            or raw_uuid in seen_ids
+            or not raw_model
+            or index < 0
+            or memory_total_mb <= 0
+        ):
+            rejected_rows += 1
+            continue
+        seen_ids.add(raw_uuid)
+        devices.append(
+            AcceleratorDevice(
+                device_id=raw_uuid,
+                device_index=index,
+                vendor=AcceleratorVendor.NVIDIA,
+                kind=AcceleratorKind.GPU,
+                model=raw_model,
+                memory_total_mb=memory_total_mb,
+                memory_free_mb=min(memory_total_mb, max(0, memory_free_mb)),
+                compute_arch=raw_arch if raw_arch and raw_arch != "N/A" else None,
+            )
+        )
+    return _ParseResult(
+        tuple(sorted(devices, key=lambda device: (device.device_index, device.device_id))),
+        rejected_rows,
+    )
+
+
+class NvidiaSMIInventoryProvider(_InventoryProviderBase):
+    """Discover NVIDIA devices without importing CUDA or NVML into the control plane."""
+
+    name = "nvidia-smi"
     QUERY_FIELDS = (
         "uuid",
         "index",
@@ -43,59 +194,428 @@ class NvidiaSMIInventoryProvider:
     def __init__(self, *, runner: Runner | None = None, timeout: float = 5.0) -> None:
         if timeout <= 0:
             raise ValueError("timeout must be greater than zero")
-        self._runner = runner
+        self._runner = runner or subprocess.run
         self.timeout = timeout
 
-    def list_devices(self) -> tuple[GPUDevice, ...]:
-        runner = self._runner or subprocess.run
+    def discover(self) -> InventoryProviderResult:
+        command = [
+            "nvidia-smi",
+            f"--query-gpu={','.join(self.QUERY_FIELDS)}",
+            "--format=csv,noheader,nounits",
+        ]
+        command_result = _run_text_command(self._runner, command, timeout=self.timeout)
+        if command_result.error is not None:
+            return InventoryProviderResult(
+                provider=self.name,
+                status=InventoryStatus.UNAVAILABLE,
+                message=command_result.error,
+            )
+        parsed = parse_nvidia_smi_csv(command_result.output or "")
+        status = InventoryStatus.DEGRADED if parsed.rejected_rows else InventoryStatus.AVAILABLE
+        return InventoryProviderResult(
+            provider=self.name,
+            status=status,
+            devices=parsed.devices,
+            message=(
+                f"rejected {parsed.rejected_rows} malformed inventory row(s)"
+                if parsed.rejected_rows
+                else None
+            ),
+            rejected_rows=parsed.rejected_rows,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AscendMappingEntry:
+    npu_id: int
+    chip_id: int
+    logic_id: int
+    model: str
+
+
+@dataclass(frozen=True, slots=True)
+class AscendMappingResult:
+    entries: tuple[AscendMappingEntry, ...]
+    rejected_rows: int = 0
+
+
+def _normalized_column(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.casefold())
+
+
+def _table_cells(line: str) -> list[str]:
+    stripped = line.strip().strip("|").strip()
+    if not stripped or set(stripped) <= {"+", "-", "="}:
+        return []
+    if "|" in line:
+        return [cell.strip() for cell in stripped.split("|")]
+    return [cell.strip() for cell in re.split(r"\s{2,}", stripped) if cell.strip()]
+
+
+def parse_ascend_mapping(output: str) -> AscendMappingResult:
+    required_columns = {"npuid", "chipid", "chiplogicid", "chipname"}
+    column_indexes: dict[str, int] | None = None
+    entries: list[AscendMappingEntry] = []
+    rejected_rows = 0
+    seen_ids: set[tuple[int, int]] = set()
+    for row_number, line in enumerate(output.splitlines(), start=1):
+        if row_number > MAX_INVENTORY_ROWS:
+            rejected_rows += 1
+            break
+        cells = _table_cells(line)
+        if not cells:
+            continue
+        normalized = [_normalized_column(cell) for cell in cells]
+        if required_columns <= set(normalized):
+            column_indexes = {name: normalized.index(name) for name in required_columns}
+            continue
+        if column_indexes is None:
+            continue
+        if max(column_indexes.values()) >= len(cells):
+            rejected_rows += 1
+            continue
+        model = cells[column_indexes["chipname"]].strip()
+        if model.casefold() == "mcu":
+            continue
         try:
-            result = runner(
-                [
-                    "nvidia-smi",
-                    f"--query-gpu={','.join(self.QUERY_FIELDS)}",
-                    "--format=csv,noheader,nounits",
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
+            npu_id = int(cells[column_indexes["npuid"]])
+            chip_id = int(cells[column_indexes["chipid"]])
+            logic_id = int(cells[column_indexes["chiplogicid"]])
+        except ValueError:
+            rejected_rows += 1
+            continue
+        identity = (npu_id, chip_id)
+        if npu_id < 0 or chip_id < 0 or logic_id < 0 or not model:
+            rejected_rows += 1
+            continue
+        if identity in seen_ids:
+            rejected_rows += 1
+            continue
+        seen_ids.add(identity)
+        entries.append(
+            AscendMappingEntry(
+                npu_id=npu_id,
+                chip_id=chip_id,
+                logic_id=logic_id,
+                model=model,
+            )
+        )
+    return AscendMappingResult(
+        tuple(sorted(entries, key=lambda entry: (entry.logic_id, entry.npu_id, entry.chip_id))),
+        rejected_rows,
+    )
+
+
+def parse_ascend_memory(output: str) -> dict[tuple[int, int], tuple[int, int]]:
+    current_npu_id: int | None = None
+    current_chip_id: int | None = None
+    values: dict[tuple[int, int], dict[str, int]] = {}
+    for line in output.splitlines()[:MAX_INVENTORY_ROWS]:
+        if ":" not in line:
+            continue
+        raw_key, raw_value = line.split(":", 1)
+        key = _normalized_column(raw_key)
+        value_match = re.search(r"-?\d+", raw_value)
+        if value_match is None:
+            continue
+        value = int(value_match.group())
+        if key == "npuid":
+            current_npu_id = value
+            current_chip_id = None
+            continue
+        if key == "chipid":
+            current_chip_id = value
+            if current_npu_id is not None:
+                values.setdefault((current_npu_id, current_chip_id), {})
+            continue
+        if current_npu_id is None or current_chip_id is None:
+            continue
+        record = values.setdefault((current_npu_id, current_chip_id), {})
+        if key in {"totalcapacitymb", "totalmemorymb", "hbmtotalmb"}:
+            record["total"] = value
+        elif key in {"capacitymb", "freememorymb", "hbmfreemb"}:
+            record["free"] = value
+
+    memory: dict[tuple[int, int], tuple[int, int]] = {}
+    for identity, record in values.items():
+        total = record.get("total")
+        free = record.get("free")
+        if total is not None and free is not None and total > 0 and 0 <= free <= total:
+            memory[identity] = (total, free)
+    return memory
+
+
+class AscendNpuSMIInventoryProvider(_InventoryProviderBase):
+    """Discover Ascend devices through bounded, version-tolerant npu-smi queries."""
+
+    name = "ascend-npu-smi"
+
+    def __init__(self, *, runner: Runner | None = None, timeout: float = 5.0) -> None:
+        if timeout <= 0:
+            raise ValueError("timeout must be greater than zero")
+        self._runner = runner or subprocess.run
+        self.timeout = timeout
+
+    def discover(self) -> InventoryProviderResult:
+        mapping_result = _run_text_command(
+            self._runner, ["npu-smi", "info", "-m"], timeout=self.timeout
+        )
+        if mapping_result.error is not None:
+            return InventoryProviderResult(
+                provider=self.name,
+                status=InventoryStatus.UNAVAILABLE,
+                message=mapping_result.error,
+            )
+        parsed_mapping = parse_ascend_mapping(mapping_result.output or "")
+        if not parsed_mapping.entries:
+            return InventoryProviderResult(
+                provider=self.name,
+                status=(
+                    InventoryStatus.DEGRADED
+                    if parsed_mapping.rejected_rows
+                    else InventoryStatus.AVAILABLE
+                ),
+                message=(
+                    "npu-smi mapping output contained no usable accelerator rows"
+                    if parsed_mapping.rejected_rows
+                    else None
+                ),
+                rejected_rows=parsed_mapping.rejected_rows,
+            )
+
+        memory_by_device: dict[tuple[int, int], tuple[int, int]] = {}
+        failed_queries = 0
+        for npu_id in sorted({entry.npu_id for entry in parsed_mapping.entries}):
+            memory_result = _run_text_command(
+                self._runner,
+                ["npu-smi", "info", "-t", "memory", "-i", str(npu_id)],
                 timeout=self.timeout,
             )
-        except (FileNotFoundError, subprocess.SubprocessError):
-            return ()
+            if memory_result.error is not None:
+                failed_queries += 1
+                continue
+            memory_by_device.update(parse_ascend_memory(memory_result.output or ""))
 
-        devices: list[GPUDevice] = []
-        for row in csv.reader(io.StringIO(result.stdout), skipinitialspace=True):
-            if len(row) != len(self.QUERY_FIELDS):
+        devices: list[AcceleratorDevice] = []
+        rejected_rows = parsed_mapping.rejected_rows
+        seen_indexes: set[int] = set()
+        for entry in parsed_mapping.entries:
+            memory = memory_by_device.get((entry.npu_id, entry.chip_id))
+            if memory is None or entry.logic_id in seen_indexes:
+                rejected_rows += 1
                 continue
-            raw_uuid, raw_index, raw_model, raw_total, raw_free, raw_capability = (
-                item.strip() for item in row
-            )
-            try:
-                index = int(raw_index)
-                memory_total_mb = int(raw_total)
-                memory_free_mb = int(raw_free)
-            except ValueError:
-                continue
-            if not raw_uuid or not raw_model or index < 0 or memory_total_mb <= 0:
-                continue
+            seen_indexes.add(entry.logic_id)
+            total_memory_mb, free_memory_mb = memory
             devices.append(
-                GPUDevice(
-                    uuid=raw_uuid,
-                    index=index,
-                    vendor="nvidia",
-                    model=raw_model,
-                    memory_total_mb=memory_total_mb,
-                    memory_free_mb=min(memory_total_mb, max(0, memory_free_mb)),
-                    compute_capability=(
-                        raw_capability if raw_capability and raw_capability != "N/A" else None
-                    ),
+                AcceleratorDevice(
+                    device_id=f"ASCEND-{entry.npu_id}-{entry.chip_id}",
+                    device_index=entry.logic_id,
+                    vendor=AcceleratorVendor.HUAWEI_ASCEND,
+                    kind=AcceleratorKind.NPU,
+                    model=entry.model,
+                    memory_total_mb=total_memory_mb,
+                    memory_free_mb=free_memory_mb,
+                    health="unknown",
+                    compute_arch=entry.model,
                 )
             )
-        return tuple(sorted(devices, key=lambda device: (device.index, device.uuid)))
+        status = (
+            InventoryStatus.DEGRADED
+            if rejected_rows or failed_queries
+            else InventoryStatus.AVAILABLE
+        )
+        details: list[str] = []
+        if rejected_rows:
+            details.append(f"rejected {rejected_rows} incomplete or malformed device row(s)")
+        if failed_queries:
+            details.append(f"{failed_queries} memory query or queries failed")
+        return InventoryProviderResult(
+            provider=self.name,
+            status=status,
+            devices=tuple(sorted(devices, key=lambda device: device.device_index)),
+            message="; ".join(details) or None,
+            rejected_rows=rejected_rows,
+        )
 
 
-class FakeGPUInventoryProvider:
+def _parse_memory_label(value: object) -> int | None:
+    match = re.fullmatch(r"\s*(\d+)\s*(Mi|M|Gi|G)?\s*", str(value), re.IGNORECASE)
+    if match is None:
+        return None
+    amount = int(match.group(1))
+    unit = (match.group(2) or "Mi").casefold()
+    if unit in {"gi", "g"}:
+        amount *= 1024
+    return amount if amount > 0 else None
+
+
+def _kubernetes_resource_contract(
+    resource_name: str,
+) -> tuple[AcceleratorVendor, AcceleratorKind] | None:
+    if resource_name == "nvidia.com/gpu":
+        return AcceleratorVendor.NVIDIA, AcceleratorKind.GPU
+    if not resource_name.startswith("huawei.com/"):
+        return None
+    suffix = resource_name.removeprefix("huawei.com/")
+    lowered = suffix.casefold()
+    excluded_markers = (
+        "memory",
+        "core",
+        "unhealthy",
+        "recover",
+        "fault",
+        "network",
+    )
+    if any(marker in lowered for marker in excluded_markers):
+        return None
+    if lowered == "npu" or lowered.startswith("ascend"):
+        return AcceleratorVendor.HUAWEI_ASCEND, AcceleratorKind.NPU
+    return None
+
+
+def parse_kubernetes_node(node: Mapping[str, object]) -> _ParseResult:
+    metadata = node.get("metadata")
+    status = node.get("status")
+    if not isinstance(metadata, Mapping) or not isinstance(status, Mapping):
+        return _ParseResult((), 1)
+    node_uid = str(metadata.get("uid") or "").strip()
+    labels = metadata.get("labels")
+    labels = labels if isinstance(labels, Mapping) else {}
+    allocatable = status.get("allocatable")
+    if not node_uid or not isinstance(allocatable, Mapping):
+        return _ParseResult((), 1)
+
+    devices: list[AcceleratorDevice] = []
+    rejected_rows = 0
+    next_index = 0
+    for resource_name in sorted(str(name) for name in allocatable):
+        contract = _kubernetes_resource_contract(resource_name)
+        if contract is None:
+            continue
+        raw_count = allocatable.get(resource_name)
+        try:
+            count = int(str(raw_count))
+        except ValueError:
+            rejected_rows += 1
+            continue
+        if count <= 0:
+            continue
+        remaining_slots = MAX_INVENTORY_ROWS - len(devices)
+        if count > remaining_slots:
+            rejected_rows += count - remaining_slots
+            count = remaining_slots
+        vendor, kind = contract
+        if vendor == AcceleratorVendor.NVIDIA:
+            model = str(labels.get("nvidia.com/gpu.product") or "NVIDIA GPU")
+            memory_mb = _parse_memory_label(labels.get("nvidia.com/gpu.memory"))
+            compute_arch = str(labels.get("nvidia.com/gpu.compute.major") or "").strip() or None
+        else:
+            model = str(
+                labels.get("node.kubernetes.io/npu.chip.name")
+                or labels.get("accelerator")
+                or resource_name.removeprefix("huawei.com/")
+            )
+            memory_mb = _parse_memory_label(labels.get("mind-cluster/npu-chip-memory"))
+            compute_arch = str(labels.get("node.kubernetes.io/npu.chip.name") or "").strip() or None
+        if memory_mb is None:
+            rejected_rows += count
+            continue
+        for slot in range(count):
+            devices.append(
+                AcceleratorDevice(
+                    device_id=f"k8s-capacity:{node_uid}:{resource_name}:{slot}",
+                    device_index=next_index,
+                    vendor=vendor,
+                    kind=kind,
+                    model=model,
+                    memory_total_mb=memory_mb,
+                    memory_free_mb=memory_mb,
+                    health="inventory-only",
+                    compute_arch=compute_arch,
+                    capabilities=("kubernetes-capacity-slot",),
+                    kubernetes_resource_name=resource_name,
+                )
+            )
+            next_index += 1
+    return _ParseResult(tuple(devices), rejected_rows)
+
+
+class KubernetesNodeAcceleratorProvider(_InventoryProviderBase):
+    """Read Device Plugin capacity from one Kubernetes Node object.
+
+    Generated IDs identify stable node capacity slots, not physical device IDs.
+    Runtime observations remain authoritative for the concrete allocation.
+    """
+
+    name = "kubernetes-node"
+
+    def __init__(
+        self,
+        *,
+        node_name: str | None,
+        runner: Runner | None = None,
+        timeout: float = 5.0,
+    ) -> None:
+        if timeout <= 0:
+            raise ValueError("timeout must be greater than zero")
+        self.node_name = node_name.strip() if node_name is not None else None
+        self._runner = runner or subprocess.run
+        self.timeout = timeout
+
+    def discover(self) -> InventoryProviderResult:
+        if not self.node_name:
+            return InventoryProviderResult(
+                provider=self.name,
+                status=InventoryStatus.UNAVAILABLE,
+                message="worker_node_name_required",
+            )
+        command_result = _run_text_command(
+            self._runner,
+            ["kubectl", "get", "node", self.node_name, "-o", "json"],
+            timeout=self.timeout,
+        )
+        if command_result.error is not None:
+            return InventoryProviderResult(
+                provider=self.name,
+                status=InventoryStatus.UNAVAILABLE,
+                message=command_result.error,
+            )
+        try:
+            node = json.loads(command_result.output or "")
+        except (TypeError, json.JSONDecodeError):
+            return InventoryProviderResult(
+                provider=self.name,
+                status=InventoryStatus.DEGRADED,
+                message="invalid_node_json",
+                rejected_rows=1,
+            )
+        if not isinstance(node, Mapping):
+            return InventoryProviderResult(
+                provider=self.name,
+                status=InventoryStatus.DEGRADED,
+                message="invalid_node_object",
+                rejected_rows=1,
+            )
+        parsed = parse_kubernetes_node(node)
+        return InventoryProviderResult(
+            provider=self.name,
+            status=(
+                InventoryStatus.DEGRADED if parsed.rejected_rows else InventoryStatus.AVAILABLE
+            ),
+            devices=parsed.devices,
+            message=(
+                f"rejected {parsed.rejected_rows} incomplete capacity slot(s)"
+                if parsed.rejected_rows
+                else None
+            ),
+            rejected_rows=parsed.rejected_rows,
+        )
+
+
+class FakeAcceleratorInventoryProvider(_InventoryProviderBase):
     """Deterministic development/test inventory that never probes the host."""
+
+    name = "fake"
 
     def __init__(
         self,
@@ -104,6 +624,7 @@ class FakeGPUInventoryProvider:
         model: str,
         memory_mb: int,
         worker_id: str,
+        vendor: AcceleratorVendor = AcceleratorVendor.NVIDIA,
         compute_capability: str = "0.0",
     ) -> None:
         if count < 0:
@@ -114,51 +635,151 @@ class FakeGPUInventoryProvider:
             raise ValueError("model must not be blank")
         if not worker_id.strip():
             raise ValueError("worker_id must not be blank")
+        if not isinstance(vendor, AcceleratorVendor):
+            raise TypeError("vendor must be an AcceleratorVendor")
         self.count = count
         self.model = model.strip()
         self.memory_mb = memory_mb
         self.worker_id = worker_id.strip()
-        self.compute_capability = compute_capability
+        self.vendor = vendor
+        self.kind = kind_for_vendor(vendor)
+        self.compute_arch = compute_capability
 
-    def list_devices(self) -> tuple[GPUDevice, ...]:
+    def discover(self) -> InventoryProviderResult:
         devices = []
         for index in range(self.count):
             device_uuid = uuid.uuid5(
                 uuid.NAMESPACE_URL,
-                f"mini-ai-cloud://fake-gpu/{self.worker_id}/{index}",
+                f"mini-ai-cloud://fake-accelerator/{self.vendor.value}/{self.worker_id}/{index}",
             )
             devices.append(
-                GPUDevice(
-                    uuid=f"FAKE-{device_uuid}",
-                    index=index,
-                    # A fake device simulates NVIDIA GPU inventory. ``fake`` is
-                    # evidence provenance, not a third hardware vendor.
-                    vendor="nvidia",
+                AcceleratorDevice(
+                    device_id=f"FAKE-{device_uuid}",
+                    device_index=index,
+                    vendor=self.vendor,
+                    kind=self.kind,
                     model=self.model,
                     memory_total_mb=self.memory_mb,
                     memory_free_mb=self.memory_mb,
-                    compute_capability=self.compute_capability,
+                    compute_arch=self.compute_arch,
                     fake=True,
                 )
             )
-        return tuple(devices)
-
-
-class NoGPUInventoryProvider:
-    def list_devices(self) -> tuple[GPUDevice, ...]:
-        return ()
-
-
-def build_gpu_inventory_provider(settings: Settings, *, worker_id: str) -> GPUInventoryProvider:
-    """Select an inventory provider and defensively reject production fake GPUs."""
-
-    if settings.fake_gpu_count:
-        if settings.app_env == "production":
-            raise ValueError("fake GPU inventory is forbidden in production")
-        return FakeGPUInventoryProvider(
-            count=settings.fake_gpu_count,
-            model=settings.fake_gpu_model,
-            memory_mb=settings.fake_gpu_memory_mb,
-            worker_id=worker_id,
+        return InventoryProviderResult(
+            provider=self.name,
+            status=InventoryStatus.AVAILABLE,
+            devices=tuple(devices),
         )
-    return NvidiaSMIInventoryProvider()
+
+
+class NoAcceleratorProvider(_InventoryProviderBase):
+    name = "none"
+
+    def discover(self) -> InventoryProviderResult:
+        return InventoryProviderResult(
+            provider=self.name,
+            status=InventoryStatus.AVAILABLE,
+            message="accelerator inventory explicitly disabled",
+        )
+
+
+class InventoryProviderRegistry(_InventoryProviderBase):
+    name = "registry"
+
+    def __init__(self, providers: Iterable[AcceleratorInventoryProvider]) -> None:
+        self.providers = tuple(providers)
+        if not self.providers:
+            raise ValueError("inventory registry requires at least one provider")
+        names = [provider.name for provider in self.providers]
+        if len(names) != len(set(names)):
+            raise ValueError("inventory provider names must be unique")
+
+    def snapshot(self) -> InventorySnapshot:
+        results = tuple(provider.discover() for provider in self.providers)
+        devices = tuple(
+            sorted(
+                (device for result in results for device in result.devices),
+                key=lambda device: (device.vendor.value, device.device_index, device.device_id),
+            )
+        )
+        identities = [device.device_id for device in devices]
+        if len(identities) != len(set(identities)):
+            raise ValueError("inventory providers returned duplicate device IDs")
+        slots = [(device.vendor, device.device_index) for device in devices]
+        if len(slots) != len(set(slots)):
+            raise ValueError("inventory providers returned duplicate vendor device indexes")
+        return InventorySnapshot(devices=devices, provider_results=results)
+
+    def discover(self) -> InventoryProviderResult:
+        snapshot = self.snapshot()
+        messages = tuple(
+            f"{result.provider}:{result.message}"
+            for result in snapshot.provider_results
+            if result.message
+        )
+        return InventoryProviderResult(
+            provider=self.name,
+            status=snapshot.status,
+            devices=snapshot.devices,
+            message="; ".join(messages) or None,
+            rejected_rows=sum(result.rejected_rows for result in snapshot.provider_results),
+        )
+
+
+def _provider_names(settings: Settings) -> tuple[str, ...]:
+    if settings.fake_gpu_count:
+        return ("fake",)
+    return tuple(
+        name.strip() for name in settings.accelerator_inventory_providers.split(",") if name.strip()
+    )
+
+
+def build_accelerator_inventory_registry(
+    settings: Settings,
+    *,
+    worker_id: str,
+) -> InventoryProviderRegistry:
+    """Build only known providers; vendor/kind always comes from provider code."""
+
+    providers: list[AcceleratorInventoryProvider] = []
+    for name in _provider_names(settings):
+        if name == "nvidia-smi":
+            providers.append(NvidiaSMIInventoryProvider())
+        elif name == "ascend-npu-smi":
+            providers.append(AscendNpuSMIInventoryProvider())
+        elif name == "kubernetes-node":
+            providers.append(KubernetesNodeAcceleratorProvider(node_name=settings.worker_node_name))
+        elif name == "fake":
+            if settings.app_env == "production":
+                raise ValueError("fake accelerator inventory is forbidden in production")
+            providers.append(
+                FakeAcceleratorInventoryProvider(
+                    count=settings.fake_gpu_count,
+                    model=settings.fake_gpu_model,
+                    memory_mb=settings.fake_gpu_memory_mb,
+                    worker_id=worker_id,
+                )
+            )
+        elif name == "none":
+            providers.append(NoAcceleratorProvider())
+        else:
+            raise ValueError(f"unknown accelerator inventory provider: {name}")
+    return InventoryProviderRegistry(providers)
+
+
+def build_gpu_inventory_provider(
+    settings: Settings,
+    *,
+    worker_id: str,
+) -> AcceleratorInventoryProvider:
+    """Compatibility factory for v0.4 internal callers."""
+
+    registry = build_accelerator_inventory_registry(settings, worker_id=worker_id)
+    return registry.providers[0] if len(registry.providers) == 1 else registry
+
+
+# v0.4 internal import aliases. Providers themselves return AcceleratorDevice.
+GPUDevice = AcceleratorDevice
+GPUInventoryProvider = DeviceInventory
+FakeGPUInventoryProvider = FakeAcceleratorInventoryProvider
+NoGPUInventoryProvider = NoAcceleratorProvider

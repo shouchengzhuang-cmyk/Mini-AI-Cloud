@@ -42,6 +42,8 @@ class AcceleratorDevice:
     runtime_profile_ids: tuple[str, ...] = ()
     capabilities: tuple[str, ...] = ()
     fake: bool = False
+    device_index: int = 0
+    kubernetes_resource_name: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.vendor, AcceleratorVendor):
@@ -70,3 +72,25 @@ class AcceleratorDevice:
             raise ValueError("capabilities must be unique")
         if any(not capability.strip() for capability in self.capabilities):
             raise ValueError("capabilities must not contain blank values")
+        if self.device_index < 0:
+            raise ValueError("device_index must not be negative")
+        if self.kubernetes_resource_name is not None and not self.kubernetes_resource_name.strip():
+            raise ValueError("kubernetes_resource_name must not be blank")
+
+    @property
+    def uuid(self) -> str:
+        """Legacy internal alias retained while v0.4 GPU consumers migrate."""
+
+        return self.device_id
+
+    @property
+    def index(self) -> int:
+        """Legacy internal alias retained for exact-device Docker bindings."""
+
+        return self.device_index
+
+    @property
+    def compute_capability(self) -> str | None:
+        """Legacy NVIDIA name for the vendor-neutral compute architecture."""
+
+        return self.compute_arch

@@ -27,10 +27,10 @@ def test_detect_gpus_parses_multiple_devices_and_sums_memory(
             "--query-gpu=uuid,index,name,memory.total,memory.free,compute_cap",
             "--format=csv,noheader,nounits",
         ],
-        check=True,
+        check=False,
         capture_output=True,
-        text=True,
-        timeout=5,
+        text=False,
+        timeout=5.0,
     )
 
 

@@ -111,8 +111,13 @@ def test_accelerator_device_enforces_vendor_kind_and_memory_invariants() -> None
         memory_total_mb=40_960,
         memory_free_mb=32_768,
         capabilities=("bf16",),
+        device_index=2,
+        kubernetes_resource_name="nvidia.com/gpu",
     )
     assert device.vendor == AcceleratorVendor.NVIDIA
+    assert device.uuid == "GPU-123"
+    assert device.index == 2
+    assert device.kubernetes_resource_name == "nvidia.com/gpu"
 
     with pytest.raises(ValueError, match="devices must use kind"):
         AcceleratorDevice(
@@ -140,6 +145,16 @@ def test_accelerator_device_enforces_vendor_kind_and_memory_invariants() -> None
             model="NVIDIA A100",
             memory_total_mb=40_960,
             memory_free_mb=32_768,
+        )
+    with pytest.raises(ValueError, match="device_index"):
+        AcceleratorDevice(
+            device_id="GPU-index",
+            vendor=AcceleratorVendor.NVIDIA,
+            kind=AcceleratorKind.GPU,
+            model="NVIDIA A100",
+            memory_total_mb=40_960,
+            memory_free_mb=32_768,
+            device_index=-1,
         )
 
 

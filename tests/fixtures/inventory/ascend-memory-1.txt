@@ -1,0 +1,5 @@
+NPU ID                         : 1
+Chip Count                     : 1
+Chip ID                        : 0
+Total Memory(MB)               : 65536
+Free Memory(MB)                : 63000
