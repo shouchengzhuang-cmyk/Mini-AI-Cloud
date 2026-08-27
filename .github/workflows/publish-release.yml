@@ -182,6 +182,54 @@ jobs:
           output-file: build/mini-ai-cloud-image.spdx.json
           upload-artifact: false
 
+      - name: Bind image SBOM to the release image and commit
+        shell: bash
+        env:
+          TARGET_SHA: ${{ steps.approval.outputs.target_sha }}
+        run: |
+          set -Eeuo pipefail
+          image_id="$(docker image inspect --format='{{.Id}}' mini-ai-cloud:release-gate)"
+          [[ "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          export IMAGE_SHA256="${image_id#sha256:}"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path("build/mini-ai-cloud-image.spdx.json")
+          payload = json.loads(path.read_text(encoding="utf-8"))
+          spdx_id = "SPDXRef-ReleaseImage"
+          assert all(package.get("SPDXID") != spdx_id for package in payload.get("packages", []))
+          payload.setdefault("packages", []).append(
+              {
+                  "name": "mini-ai-cloud:release-gate",
+                  "SPDXID": spdx_id,
+                  "versionInfo": os.environ["RELEASE_VERSION"],
+                  "downloadLocation": "NOASSERTION",
+                  "filesAnalyzed": False,
+                  "primaryPackagePurpose": "CONTAINER",
+                  "checksums": [
+                      {"algorithm": "SHA256", "checksumValue": os.environ["IMAGE_SHA256"]}
+                  ],
+                  "externalRefs": [
+                      {
+                          "referenceCategory": "OTHER",
+                          "referenceType": "git-sha",
+                          "referenceLocator": os.environ["TARGET_SHA"],
+                      }
+                  ],
+              }
+          )
+          describes = payload.setdefault("documentDescribes", [])
+          if spdx_id not in describes:
+              describes.append(spdx_id)
+          path.write_text(
+              json.dumps(payload, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+              newline="\n",
+          )
+          PY
+
       - name: Prepare deterministic release assets and final notes
         shell: bash
         env:
@@ -334,15 +382,17 @@ jobs:
           mkdir -p "${verification_dir}"
           gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
             --dir "${verification_dir}" --clobber
-          (cd "${verification_dir}" && sha256sum --check release-assets.sha256)
+          (cd "${verification_dir}" && sha256sum --check --strict release-assets.sha256)
           if [ "${release_is_draft}" = "true" ]; then
             cmp build/release-assets.sha256 "${verification_dir}/release-assets.sha256"
           fi
 
           export VERIFICATION_DIR="${verification_dir}"
           python - <<'PY'
+          import hashlib
           import json
           import os
+          import re
           import tarfile
           import zipfile
           from email.parser import Parser
@@ -360,21 +410,86 @@ jobs:
           assert metadata["Name"] == "mini-ai-cloud"
           assert metadata["Version"] == version
 
+          archive = root / f"mini-ai-cloud-v{version}-evidence.tar.gz"
+          expected_checksum_names = {
+              wheels[0].name,
+              archive.name,
+              "mini-ai-cloud-image.spdx.json",
+              "cyclonedx-sbom.json",
+              "release-preparation.json",
+              "SHA256SUMS",
+          }
+          checksum_entries = {}
+          for line in (root / "release-assets.sha256").read_text(encoding="utf-8").splitlines():
+              digest, separator, name = line.partition("  ")
+              assert separator and re.fullmatch(r"[0-9a-f]{64}", digest), line
+              assert name and "/" not in name and "\\" not in name, name
+              assert name not in checksum_entries, name
+              checksum_entries[name] = digest
+          assert set(checksum_entries) == expected_checksum_names, checksum_entries
+
           image_sbom = json.loads((root / "mini-ai-cloud-image.spdx.json").read_text(encoding="utf-8"))
           assert image_sbom.get("spdxVersion", "").startswith("SPDX-")
+          release_images = [
+              package
+              for package in image_sbom.get("packages", [])
+              if package.get("SPDXID") == "SPDXRef-ReleaseImage"
+          ]
+          assert len(release_images) == 1, release_images
+          release_image = release_images[0]
+          assert release_image["name"] == "mini-ai-cloud:release-gate"
+          assert release_image["versionInfo"] == version
+          assert "SPDXRef-ReleaseImage" in image_sbom.get("documentDescribes", [])
+          image_checksums = {
+              item["algorithm"]: item["checksumValue"]
+              for item in release_image.get("checksums", [])
+          }
+          assert re.fullmatch(r"[0-9a-f]{64}", image_checksums.get("SHA256", ""))
+          image_refs = {
+              (item["referenceCategory"], item["referenceType"]): item["referenceLocator"]
+              for item in release_image.get("externalRefs", [])
+          }
+          assert image_refs[("OTHER", "git-sha")] == sha
 
-          archive = root / f"mini-ai-cloud-v{version}-evidence.tar.gz"
           with tarfile.open(archive, "r:gz") as bundle:
               members = bundle.getmembers()
               for member in members:
                   path = PurePosixPath(member.name)
                   assert not path.is_absolute() and ".." not in path.parts
-              names = {member.name for member in members}
+              file_members = [member for member in members if member.isfile()]
+              names = {member.name for member in file_members}
+              assert len(names) == len(file_members), "duplicate regular-file member"
 
-              def read_json(name: str) -> dict:
+              def read_bytes(name: str) -> bytes:
                   fileobj = bundle.extractfile(name)
                   assert fileobj is not None, name
-                  return json.loads(fileobj.read().decode("utf-8"))
+                  return fileobj.read()
+
+              def read_json(name: str) -> dict:
+                  return json.loads(read_bytes(name).decode("utf-8"))
+
+              def parse_checksums(name: str) -> dict[str, str]:
+                  entries = {}
+                  for line in read_bytes(name).decode("utf-8").splitlines():
+                      digest, separator, relative = line.partition("  ")
+                      assert separator and re.fullmatch(r"[0-9a-f]{64}", digest), line
+                      path = PurePosixPath(relative)
+                      assert relative and not path.is_absolute() and ".." not in path.parts
+                      assert "\\" not in relative and relative not in entries, relative
+                      entries[relative] = digest
+                  return entries
+
+              def validate_checksums(prefix: str, manifest_name: str) -> dict[str, str]:
+                  entries = parse_checksums(manifest_name)
+                  expected = {
+                      name.removeprefix(prefix)
+                      for name in names
+                      if name.startswith(prefix) and name != manifest_name
+                  }
+                  assert set(entries) == expected, (manifest_name, entries, expected)
+                  for relative, digest in entries.items():
+                      assert hashlib.sha256(read_bytes(prefix + relative)).hexdigest() == digest
+                  return entries
 
               evidence = read_json(f"evidence/{sha}/manifest.json")
               preparation = read_json(f"release/{sha}/release-preparation.json")
@@ -389,10 +504,19 @@ jobs:
               assert len(dr_summaries) == 1, dr_summaries
               soak = read_json(soak_summaries[0])
               dr = read_json(dr_summaries[0])
-
-              checksum_member = bundle.extractfile(f"release/{sha}/SHA256SUMS")
-              assert checksum_member is not None
-              bundled_checksums = checksum_member.read()
+              evidence_prefix = f"evidence/{sha}/"
+              release_prefix = f"release/{sha}/"
+              evidence_checksums = validate_checksums(
+                  evidence_prefix, evidence_prefix + "hashes.sha256"
+              )
+              validate_checksums(release_prefix, release_prefix + "SHA256SUMS")
+              expected_artifact_hashes = {
+                  relative: digest
+                  for relative, digest in evidence_checksums.items()
+                  if relative != "manifest.json"
+              }
+              assert evidence["artifact_hashes"] == expected_artifact_hashes
+              bundled_checksums = read_bytes(release_prefix + "SHA256SUMS")
 
           assert evidence["git"]["sha"] == sha
           assert evidence["git"]["dirty"] is False
@@ -401,14 +525,33 @@ jobs:
           assert preparation["version"] == version
           assert preparation["real_gpu"] == "NOT_RUN"
           assert preparation["deployment_status"] == "NOT_DEPLOYED"
+          assert soak["git_sha"] == sha
+          assert soak["rounds_requested"] == 3 and soak["rounds_completed"] == 3
           assert soak["status"] == "PASS" and soak["cleanup"] == "PASS"
           assert dr["git_sha"] == sha
           assert dr["status"] == "PASS" and dr["cleanup"] == "PASS"
           assert cyclonedx.get("bomFormat") == "CycloneDX"
+          cyclonedx_metadata = cyclonedx["metadata"]
+          assert cyclonedx_metadata["component"]["name"] == "mini-ai-cloud"
+          assert cyclonedx_metadata["component"]["version"] == version
+          cyclonedx_properties = {
+              item["name"]: item["value"] for item in cyclonedx_metadata.get("properties", [])
+          }
+          assert cyclonedx_properties["mini-ai-cloud:git-sha"] == sha
           assert json.loads((root / "release-preparation.json").read_text(encoding="utf-8")) == preparation
           assert json.loads((root / "cyclonedx-sbom.json").read_text(encoding="utf-8")) == cyclonedx
           assert (root / "SHA256SUMS").read_bytes() == bundled_checksums
           PY
+          retained_wheel="$(find "${verification_dir}" -maxdepth 1 -type f \
+            -name 'mini_ai_cloud-*.whl' -print -quit)"
+          test -n "${retained_wheel}"
+          uv venv --python python "${verification_dir}/retained-wheel-venv"
+          uv pip install --python "${verification_dir}/retained-wheel-venv/bin/python" \
+            "${retained_wheel}"
+          "${verification_dir}/retained-wheel-venv/bin/mini-cloud" --help >/dev/null
+          test "$("${verification_dir}/retained-wheel-venv/bin/python" -c \
+            'import importlib.metadata; print(importlib.metadata.version("mini-ai-cloud"))')" = \
+            "${RELEASE_VERSION}"
 
           if [ "${release_is_draft}" = "true" ]; then
             gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \

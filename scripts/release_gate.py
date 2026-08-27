@@ -326,7 +326,7 @@ def prepare_release_bundle(root: Path, output_root: Path) -> Path:
 
 
 def _release_notes(root: Path, git_sha: str, validation: dict[str, int]) -> str:
-    latest_tag = _latest_tag(root)
+    latest_tag = _latest_tag(root, excluded_tag=f"v{RELEASE_VERSION}")
     revision_range = f"{latest_tag}..HEAD" if latest_tag else "HEAD"
     commits = _run(
         ("git", "log", "--format=- `%h` %s", "--no-merges", revision_range),
@@ -388,9 +388,12 @@ def wheel_smoke(root: Path, dist_dir: Path) -> None:
             raise ReleaseGateError("installed wheel version does not match release version")
 
 
-def _latest_tag(root: Path) -> str | None:
+def _latest_tag(root: Path, *, excluded_tag: str | None = None) -> str | None:
+    command = ["git", "describe", "--tags", "--abbrev=0"]
+    if excluded_tag is not None:
+        command.extend(("--exclude", excluded_tag))
     result = subprocess.run(
-        ["git", "describe", "--tags", "--abbrev=0"],
+        command,
         cwd=root,
         check=False,
         capture_output=True,

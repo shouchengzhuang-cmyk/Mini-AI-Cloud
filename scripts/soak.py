@@ -231,6 +231,7 @@ def run_soak(
     log_dir.mkdir(parents=True, exist_ok=False)
     commands: list[dict[str, object]] = []
     snapshots: list[dict[str, object]] = []
+    git_sha: str | None = None
     started = time.monotonic()
     cluster_owned = False
     failure: str | None = None
@@ -250,10 +251,18 @@ def run_soak(
 
     try:
         missing = [
-            name for name in ("docker", "kind", "kubectl", "make", "uv") if not tool_lookup(name)
+            name
+            for name in ("docker", "git", "kind", "kubectl", "make", "uv")
+            if not tool_lookup(name)
         ]
         if missing:
             raise SoakError(f"preflight missing commands: {', '.join(missing)}")
+        revision = record("git-revision", ("git", "rev-parse", "HEAD"))
+        _require_success(revision, "cannot resolve Git revision")
+        revision_value = revision.stdout.strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", revision_value):
+            raise SoakError("Git revision is not a full lowercase SHA")
+        git_sha = revision_value
         _require_success(record("docker-info", ("docker", "info")), "Docker Engine is unreachable")
         clusters = record("kind-clusters-before", ("kind", "get", "clusters"))
         _require_success(clusters, "cannot list Kind clusters")
@@ -410,6 +419,7 @@ def run_soak(
         summary = {
             "schema_version": "1.0.0",
             "run_id": run_id,
+            "git_sha": git_sha,
             "status": status,
             "rounds_requested": rounds,
             "rounds_completed": len(snapshots),

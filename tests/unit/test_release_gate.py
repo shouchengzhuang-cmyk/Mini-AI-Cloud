@@ -8,6 +8,7 @@ import pytest
 from scripts.release_gate import (
     RELEASE_VERSION,
     ReleaseGateError,
+    _latest_tag,
     cyclonedx_sbom,
     scan_secret_text,
     validate_action_pins,
@@ -18,6 +19,19 @@ from scripts.release_gate import (
 )
 
 ROOT = Path(__file__).parents[2]
+
+
+def test_latest_tag_excludes_the_release_being_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    recorded: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs: object) -> object:
+        recorded.append(command)
+        return type("Result", (), {"returncode": 0, "stdout": "v0.3.0\n"})()
+
+    monkeypatch.setattr("scripts.release_gate.subprocess.run", fake_run)
+
+    assert _latest_tag(ROOT, excluded_tag="v0.4.0") == "v0.3.0"
+    assert recorded == [["git", "describe", "--tags", "--abbrev=0", "--exclude", "v0.4.0"]]
 
 
 def test_release_identity_actions_dependencies_container_and_contracts_are_locked() -> None:
