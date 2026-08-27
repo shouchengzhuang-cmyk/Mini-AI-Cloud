@@ -51,19 +51,12 @@ archive_compose_volume() {
     return 1
   fi
   local volume_name=${matching_volumes[0]}
-  local destination_owner
-  destination_owner=$(stat --format '%u:%g' "$destination") ||
-    fail "cannot resolve the backup destination owner"
-  [[ $destination_owner =~ ^[0-9]+:[0-9]+$ ]] ||
-    fail "backup destination owner is invalid"
   docker run --rm --network none --read-only --cap-drop ALL --cap-add DAC_READ_SEARCH \
     --security-opt no-new-privileges \
-    --user "$destination_owner" \
     --tmpfs /tmp:size=16m \
     --mount "type=volume,source=$volume_name,target=/source,readonly" \
-    --mount "type=bind,source=$destination,target=/backup" \
     "$ARCHIVE_IMAGE" \
-    tar -C /source -czf "/backup/$archive_name" . ||
+    tar -C /source -czf - . >"$destination/$archive_name" ||
     fail "cannot archive the '$logical_name' volume"
   [[ -s $destination/$archive_name ]] || fail "volume archive is empty: $archive_name"
 }
@@ -123,7 +116,6 @@ validate_project_name "$project_name"
 require_command docker
 require_command realpath
 require_command sha256sum
-require_command stat
 
 docker compose version >/dev/null
 compose=(docker compose --file "$compose_file" --project-name "$project_name")
