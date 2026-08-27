@@ -37,6 +37,8 @@ spec:
             privileged: true
             readOnlyRootFilesystem: true
           volumeMounts:
+            - name: tmp
+              mountPath: /tmp
             - name: device-plugin
               mountPath: /var/lib/kubelet/device-plugins
             - name: plugins-registry
@@ -53,6 +55,10 @@ spec:
               cpu: 250m
               memory: 64Mi
       volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
         - name: device-plugin
           hostPath:
             path: /var/lib/kubelet/device-plugins

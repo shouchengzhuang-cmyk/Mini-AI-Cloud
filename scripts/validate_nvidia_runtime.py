@@ -63,6 +63,13 @@ def _validate_fake_device_plugin(
         raise ValueError("Kubernetes sample device plugin requires an explicit privileged boundary")
     if container.get("securityContext", {}).get("readOnlyRootFilesystem") is not True:
         raise ValueError("fake device plugin root filesystem must be read-only")
+    mounts = {item.get("name"): item.get("mountPath") for item in container.get("volumeMounts", [])}
+    if mounts.get("tmp") != "/tmp":
+        raise ValueError("fake device plugin requires an isolated writable /tmp")
+    volumes = {item.get("name"): item for item in pod_spec.get("volumes", [])}
+    tmp_volume = volumes.get("tmp", {}).get("emptyDir", {})
+    if tmp_volume != {"medium": "Memory", "sizeLimit": "16Mi"}:
+        raise ValueError("fake device plugin /tmp must be a bounded memory emptyDir")
     annotation = manifest["spec"]["template"]["metadata"].get("annotations", {})
     if annotation.get("mini-ai-cloud/test-scope") != "fake-device-plugin-only":
         raise ValueError("fake device plugin manifest must declare its evidence scope")
