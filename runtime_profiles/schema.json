@@ -1,0 +1,570 @@
+{
+  "$defs": {
+    "AcceleratorKind": {
+      "enum": [
+        "gpu",
+        "npu"
+      ],
+      "title": "AcceleratorKind",
+      "type": "string"
+    },
+    "AcceleratorVendor": {
+      "enum": [
+        "nvidia",
+        "huawei-ascend"
+      ],
+      "title": "AcceleratorVendor",
+      "type": "string"
+    },
+    "HttpProbe": {
+      "additionalProperties": false,
+      "properties": {
+        "failure_threshold": {
+          "maximum": 60,
+          "minimum": 1,
+          "title": "Failure Threshold",
+          "type": "integer"
+        },
+        "initial_delay_seconds": {
+          "maximum": 3600,
+          "minimum": 0,
+          "title": "Initial Delay Seconds",
+          "type": "integer"
+        },
+        "path": {
+          "maxLength": 256,
+          "pattern": "^/[A-Za-z0-9_./-]*$",
+          "title": "Path",
+          "type": "string"
+        },
+        "period_seconds": {
+          "maximum": 300,
+          "minimum": 1,
+          "title": "Period Seconds",
+          "type": "integer"
+        },
+        "port": {
+          "maximum": 65535,
+          "minimum": 1,
+          "title": "Port",
+          "type": "integer"
+        },
+        "timeout_seconds": {
+          "maximum": 60,
+          "minimum": 1,
+          "title": "Timeout Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "port",
+        "initial_delay_seconds",
+        "period_seconds",
+        "timeout_seconds",
+        "failure_threshold"
+      ],
+      "title": "HttpProbe",
+      "type": "object"
+    },
+    "KubernetesRuntime": {
+      "additionalProperties": false,
+      "properties": {
+        "node_selector": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "maxProperties": 32,
+          "minProperties": 1,
+          "title": "Node Selector",
+          "type": "object"
+        },
+        "requests_equal_limits": {
+          "const": true,
+          "default": true,
+          "title": "Requests Equal Limits",
+          "type": "boolean"
+        },
+        "resource_name": {
+          "maxLength": 253,
+          "minLength": 3,
+          "title": "Resource Name",
+          "type": "string"
+        },
+        "runtime_class_name": {
+          "maxLength": 253,
+          "minLength": 1,
+          "title": "Runtime Class Name",
+          "type": "string"
+        },
+        "security": {
+          "$ref": "#/$defs/RuntimeSecurityContext"
+        },
+        "tolerations": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/KubernetesToleration"
+          },
+          "maxItems": 32,
+          "title": "Tolerations",
+          "type": "array"
+        }
+      },
+      "required": [
+        "runtime_class_name",
+        "resource_name",
+        "node_selector",
+        "security"
+      ],
+      "title": "KubernetesRuntime",
+      "type": "object"
+    },
+    "KubernetesToleration": {
+      "additionalProperties": false,
+      "properties": {
+        "effect": {
+          "enum": [
+            "NoSchedule",
+            "PreferNoSchedule",
+            "NoExecute"
+          ],
+          "title": "Effect",
+          "type": "string"
+        },
+        "key": {
+          "maxLength": 253,
+          "minLength": 1,
+          "title": "Key",
+          "type": "string"
+        },
+        "operator": {
+          "default": "Equal",
+          "enum": [
+            "Equal",
+            "Exists"
+          ],
+          "title": "Operator",
+          "type": "string"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "maxLength": 63,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "required": [
+        "key",
+        "effect"
+      ],
+      "title": "KubernetesToleration",
+      "type": "object"
+    },
+    "RuntimeCapabilities": {
+      "additionalProperties": false,
+      "properties": {
+        "dtypes": {
+          "items": {
+            "maxLength": 512,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Dtypes",
+          "type": "array"
+        },
+        "features": {
+          "default": [],
+          "items": {
+            "maxLength": 512,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 64,
+          "title": "Features",
+          "type": "array"
+        },
+        "model_architectures": {
+          "default": [],
+          "items": {
+            "maxLength": 512,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 128,
+          "title": "Model Architectures",
+          "type": "array"
+        },
+        "tensor_parallel": {
+          "$ref": "#/$defs/TensorParallelCapability"
+        }
+      },
+      "required": [
+        "dtypes",
+        "tensor_parallel"
+      ],
+      "title": "RuntimeCapabilities",
+      "type": "object"
+    },
+    "RuntimeCompatibility": {
+      "additionalProperties": false,
+      "properties": {
+        "driver_version": {
+          "const": "recorded-at-runtime",
+          "title": "Driver Version",
+          "type": "string"
+        },
+        "hardware_families": {
+          "default": [],
+          "items": {
+            "maxLength": 512,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 64,
+          "title": "Hardware Families",
+          "type": "array"
+        },
+        "python": {
+          "const": "profile-owned",
+          "title": "Python",
+          "type": "string"
+        },
+        "toolkit_version": {
+          "const": "recorded-at-runtime",
+          "title": "Toolkit Version",
+          "type": "string"
+        },
+        "vendor_plugin_version": {
+          "const": "pinned",
+          "title": "Vendor Plugin Version",
+          "type": "string"
+        },
+        "vllm_version": {
+          "const": "pinned",
+          "title": "Vllm Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "python",
+        "vllm_version",
+        "vendor_plugin_version",
+        "driver_version",
+        "toolkit_version"
+      ],
+      "title": "RuntimeCompatibility",
+      "type": "object"
+    },
+    "RuntimeImage": {
+      "additionalProperties": false,
+      "properties": {
+        "digest_required": {
+          "const": true,
+          "default": true,
+          "title": "Digest Required",
+          "type": "boolean"
+        },
+        "reference": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Reference",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reference"
+      ],
+      "title": "RuntimeImage",
+      "type": "object"
+    },
+    "RuntimeProbes": {
+      "additionalProperties": false,
+      "properties": {
+        "health": {
+          "$ref": "#/$defs/HttpProbe"
+        },
+        "readiness": {
+          "$ref": "#/$defs/HttpProbe"
+        }
+      },
+      "required": [
+        "health",
+        "readiness"
+      ],
+      "title": "RuntimeProbes",
+      "type": "object"
+    },
+    "RuntimeProcess": {
+      "additionalProperties": false,
+      "properties": {
+        "api_protocol": {
+          "const": "openai",
+          "default": "openai",
+          "title": "Api Protocol",
+          "type": "string"
+        },
+        "command": {
+          "items": {
+            "maxLength": 512,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Command",
+          "type": "array"
+        },
+        "command_allowlist": {
+          "items": {
+            "items": {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "title": "Command Allowlist",
+          "type": "array"
+        },
+        "env_allowlist": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "title": "Env Allowlist",
+          "type": "array"
+        },
+        "visible_devices_source": {
+          "const": "device-plugin",
+          "default": "device-plugin",
+          "title": "Visible Devices Source",
+          "type": "string"
+        }
+      },
+      "required": [
+        "command",
+        "command_allowlist"
+      ],
+      "title": "RuntimeProcess",
+      "type": "object"
+    },
+    "RuntimeProfileEvidenceStatus": {
+      "enum": [
+        "SCHEMA_READY",
+        "MANIFEST_VALIDATED",
+        "SIMULATED",
+        "REAL_ENGINE_PASS",
+        "REAL_CONTROL_PLANE_PASS",
+        "REAL_DUAL_BACKEND_PASS",
+        "REAL_HW_NOT_RUN",
+        "BLOCKED"
+      ],
+      "title": "RuntimeProfileEvidenceStatus",
+      "type": "string"
+    },
+    "RuntimeSecurityContext": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_privilege_escalation": {
+          "const": false,
+          "default": false,
+          "title": "Allow Privilege Escalation",
+          "type": "boolean"
+        },
+        "hostNetwork": {
+          "const": false,
+          "default": false,
+          "title": "Hostnetwork",
+          "type": "boolean"
+        },
+        "hostPID": {
+          "const": false,
+          "default": false,
+          "title": "Hostpid",
+          "type": "boolean"
+        },
+        "hostPath": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 0,
+          "title": "Hostpath",
+          "type": "array"
+        },
+        "privileged": {
+          "const": false,
+          "default": false,
+          "title": "Privileged",
+          "type": "boolean"
+        }
+      },
+      "title": "RuntimeSecurityContext",
+      "type": "object"
+    },
+    "TensorParallelCapability": {
+      "additionalProperties": false,
+      "properties": {
+        "maximum_size": {
+          "anyOf": [
+            {
+              "maximum": 1024,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Maximum Size"
+        },
+        "maximum_size_source": {
+          "enum": [
+            "profile",
+            "runtime-observation"
+          ],
+          "title": "Maximum Size Source",
+          "type": "string"
+        },
+        "minimum_size": {
+          "maximum": 1024,
+          "minimum": 1,
+          "title": "Minimum Size",
+          "type": "integer"
+        },
+        "scope": {
+          "const": "single-node",
+          "default": "single-node",
+          "title": "Scope",
+          "type": "string"
+        },
+        "supported": {
+          "title": "Supported",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "supported",
+        "minimum_size",
+        "maximum_size_source"
+      ],
+      "title": "TensorParallelCapability",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "allocation_authority": {
+      "const": "kubernetes_device_plugin",
+      "title": "Allocation Authority",
+      "type": "string"
+    },
+    "capabilities": {
+      "$ref": "#/$defs/RuntimeCapabilities"
+    },
+    "compatibility": {
+      "$ref": "#/$defs/RuntimeCompatibility"
+    },
+    "engine": {
+      "pattern": "^[a-z][a-z0-9-]{1,63}$",
+      "title": "Engine",
+      "type": "string"
+    },
+    "evidence_references": {
+      "default": [],
+      "items": {
+        "maxLength": 512,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 64,
+      "title": "Evidence References",
+      "type": "array"
+    },
+    "evidence_status": {
+      "$ref": "#/$defs/RuntimeProfileEvidenceStatus"
+    },
+    "execution_mode": {
+      "const": "kubernetes",
+      "title": "Execution Mode",
+      "type": "string"
+    },
+    "id": {
+      "pattern": "^[a-z][a-z0-9-]{2,63}$",
+      "title": "Id",
+      "type": "string"
+    },
+    "image": {
+      "$ref": "#/$defs/RuntimeImage"
+    },
+    "kind": {
+      "$ref": "#/$defs/AcceleratorKind"
+    },
+    "kubernetes": {
+      "$ref": "#/$defs/KubernetesRuntime"
+    },
+    "limitations": {
+      "items": {
+        "maxLength": 512,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 64,
+      "minItems": 1,
+      "title": "Limitations",
+      "type": "array"
+    },
+    "probes": {
+      "$ref": "#/$defs/RuntimeProbes"
+    },
+    "process": {
+      "$ref": "#/$defs/RuntimeProcess"
+    },
+    "schema_version": {
+      "const": "1.0.0",
+      "default": "1.0.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "vendor": {
+      "$ref": "#/$defs/AcceleratorVendor"
+    },
+    "version": {
+      "pattern": "^[1-9][0-9]*\\.[0-9]+\\.[0-9]+$",
+      "title": "Version",
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "version",
+    "vendor",
+    "kind",
+    "execution_mode",
+    "engine",
+    "image",
+    "kubernetes",
+    "process",
+    "probes",
+    "compatibility",
+    "capabilities",
+    "allocation_authority",
+    "evidence_status",
+    "limitations"
+  ],
+  "title": "RuntimeProfile",
+  "type": "object"
+}
