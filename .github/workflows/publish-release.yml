@@ -343,6 +343,10 @@ jobs:
               gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
                 --json isPrerelease --jq '.isPrerelease'
             )"
+            release_is_immutable="$(
+              gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+                --jq '.immutable // false'
+            )"
             while IFS= read -r remote_asset; do
               printf '%s\n' "${expected_assets[@]}" | grep -Fxq "${remote_asset}" || {
                 echo "Unexpected existing release asset: ${remote_asset}" >&2
@@ -352,7 +356,8 @@ jobs:
               gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
                 --json assets --jq '.assets[].name'
             )
-            if [ "${release_is_draft}" = "true" ]; then
+            if [ "${release_is_draft}" = "true" ] || \
+              [ "${release_is_immutable}" = "false" ]; then
               gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
                 --title "Mini AI Cloud ${RELEASE_TAG}" \
                 --notes-file build/final-release-notes.md \
@@ -360,6 +365,7 @@ jobs:
                 --prerelease=false
               gh release upload "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --clobber \
                 "${release_assets[@]}"
+              release_is_draft=true
             else
               test "${release_is_prerelease}" = "false"
             fi
@@ -572,6 +578,7 @@ jobs:
               }
               assert evidence["artifact_hashes"] == expected_artifact_hashes
               bundled_checksums = read_bytes(release_prefix + "SHA256SUMS")
+              bundled_release_notes = read_bytes(release_prefix + "release-notes.md")
 
           assert evidence["git"]["sha"] == sha
           assert evidence["git"]["dirty"] is False
@@ -596,6 +603,7 @@ jobs:
           assert json.loads((root / "release-preparation.json").read_text(encoding="utf-8")) == preparation
           assert json.loads((root / "cyclonedx-sbom.json").read_text(encoding="utf-8")) == cyclonedx
           assert (root / "SHA256SUMS").read_bytes() == bundled_checksums
+          assert (root / "release-notes.md").read_bytes() == bundled_release_notes
           PY
           retained_wheel="$(find "${verification_dir}" -maxdepth 1 -type f \
             -name 'mini_ai_cloud-*.whl' -print -quit)"
