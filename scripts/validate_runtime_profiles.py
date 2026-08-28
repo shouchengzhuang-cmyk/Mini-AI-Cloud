@@ -7,28 +7,17 @@ from pathlib import Path
 from typing import cast
 
 import yaml  # type: ignore[import-untyped]
-from pydantic import BaseModel, ConfigDict, Field
 
-from core.runtime_profiles import RuntimeProfile, generated_runtime_profile_schema
+from core.runtime_profiles import (
+    RuntimeProfile,
+    RuntimeProfileManifest,
+    RuntimeProfileManifestEntry,
+    generated_runtime_profile_schema,
+)
 
 
 class RuntimeProfileContractError(ValueError):
     pass
-
-
-class ManifestEntry(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    identity: str = Field(min_length=1)
-    path: str = Field(pattern=r"^runtime_profiles/[a-z0-9-]+(?:\.example)?\.yaml$")
-    semantic_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
-
-
-class RuntimeProfileManifest(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    schema_version: str = Field(pattern=r"^1\.\d+\.\d+$")
-    profiles: tuple[ManifestEntry, ...] = Field(min_length=1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,10 +57,20 @@ def generated_manifest(
     profiles: tuple[LoadedRuntimeProfile, ...], repository_root: Path
 ) -> RuntimeProfileManifest:
     entries = tuple(
-        ManifestEntry(
+        RuntimeProfileManifestEntry(
             identity=loaded.profile.identity,
+            profile_id=loaded.profile.id,
+            profile_version=loaded.profile.version,
             path=loaded.path.relative_to(repository_root).as_posix(),
             semantic_digest=loaded.profile.semantic_digest(),
+            vendor=loaded.profile.vendor,
+            kind=loaded.profile.kind,
+            engine=loaded.profile.engine,
+            evidence_status=loaded.profile.evidence_status,
+            hardware_families=loaded.profile.compatibility.hardware_families,
+            model_architectures=loaded.profile.capabilities.model_architectures,
+            dtypes=loaded.profile.capabilities.dtypes,
+            features=loaded.profile.capabilities.features,
         )
         for loaded in sorted(profiles, key=lambda item: item.profile.identity)
     )

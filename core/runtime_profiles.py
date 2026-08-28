@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 from enum import StrEnum
+from pathlib import Path
 from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -388,6 +389,111 @@ class RuntimeProfile(FrozenContractModel):
             sort_keys=True,
         ).encode("utf-8")
         return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+
+class RuntimeProfileManifestEntry(FrozenContractModel):
+    identity: str = Field(min_length=1, max_length=160)
+    profile_id: str = Field(pattern=PROFILE_ID_PATTERN.pattern)
+    profile_version: str = Field(pattern=PROFILE_VERSION_PATTERN.pattern)
+    path: str = Field(pattern=r"^runtime_profiles/[a-z0-9-]+(?:\.example)?\.yaml$")
+    semantic_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    vendor: AcceleratorVendor
+    kind: AcceleratorKind
+    engine: str = Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")
+    evidence_status: RuntimeProfileEvidenceStatus
+    hardware_families: tuple[NonEmptyText, ...] = Field(default=(), max_length=64)
+    model_architectures: tuple[NonEmptyText, ...] = Field(default=(), max_length=128)
+    dtypes: tuple[NonEmptyText, ...] = Field(min_length=1, max_length=32)
+    features: tuple[NonEmptyText, ...] = Field(default=(), max_length=64)
+
+    @model_validator(mode="after")
+    def validate_manifest_identity(self) -> Self:
+        if self.identity != f"{self.profile_id}@{self.profile_version}":
+            raise ValueError("manifest identity must match profile_id@profile_version")
+        if not vendor_kind_is_compatible(self.vendor, self.kind):
+            raise ValueError("manifest vendor and kind are incompatible")
+        return self
+
+
+class RuntimeProfileManifest(FrozenContractModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    profiles: tuple[RuntimeProfileManifestEntry, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_unique_profiles(self) -> Self:
+        identities = [profile.identity for profile in self.profiles]
+        duplicates = sorted({identity for identity in identities if identities.count(identity) > 1})
+        if duplicates:
+            raise ValueError(f"duplicate runtime profile identities: {', '.join(duplicates)}")
+        return self
+
+
+class RuntimeProfileCompatibilityError(ValueError):
+    pass
+
+
+class RuntimeProfileCatalog:
+    def __init__(self, manifest: RuntimeProfileManifest) -> None:
+        self._manifest = manifest
+        self._profiles = {
+            (profile.profile_id, profile.profile_version): profile for profile in manifest.profiles
+        }
+
+    @classmethod
+    def from_path(cls, path: Path | str) -> RuntimeProfileCatalog:
+        manifest_path = Path(path)
+        if not manifest_path.is_file():
+            raise RuntimeProfileCompatibilityError(
+                f"runtime profile manifest does not exist: {manifest_path}"
+            )
+        if manifest_path.stat().st_size > 1_048_576:
+            raise RuntimeProfileCompatibilityError("runtime profile manifest exceeds 1 MiB")
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest = RuntimeProfileManifest.model_validate(payload)
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+            raise RuntimeProfileCompatibilityError(
+                f"invalid runtime profile manifest: {manifest_path}"
+            ) from error
+        return cls(manifest)
+
+    @property
+    def manifest(self) -> RuntimeProfileManifest:
+        return self._manifest
+
+    def resolve_compatible(
+        self,
+        *,
+        profile_id: str,
+        profile_version: str,
+        semantic_digest: str,
+        vendor: AcceleratorVendor,
+        kind: AcceleratorKind,
+        architecture: str,
+        dtype: str,
+    ) -> RuntimeProfileManifestEntry:
+        profile = self._profiles.get((profile_id, profile_version))
+        if profile is None:
+            raise RuntimeProfileCompatibilityError(
+                f"unknown runtime profile: {profile_id}@{profile_version}"
+            )
+        if profile.semantic_digest != semantic_digest:
+            raise RuntimeProfileCompatibilityError(
+                "runtime profile digest does not match the immutable manifest"
+            )
+        if profile.vendor is not vendor or profile.kind is not kind:
+            raise RuntimeProfileCompatibilityError(
+                "model variant vendor/kind does not match the runtime profile"
+            )
+        if dtype not in profile.dtypes:
+            raise RuntimeProfileCompatibilityError(
+                f"dtype={dtype} is not declared by runtime profile {profile.identity}"
+            )
+        if profile.model_architectures and architecture not in profile.model_architectures:
+            raise RuntimeProfileCompatibilityError(
+                f"architecture={architecture} is not declared by runtime profile {profile.identity}"
+            )
+        return profile
 
 
 def generated_runtime_profile_schema() -> dict[str, object]:

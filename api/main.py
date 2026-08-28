@@ -2,6 +2,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 import structlog.contextvars
@@ -21,6 +22,7 @@ from api.routes import (
     gateway,
     identity,
     job_groups,
+    model_variants,
     registry,
     services,
     system,
@@ -47,6 +49,7 @@ from core.logging import configure_logging, get_logger
 from core.metrics import API_REQUEST_DURATION, API_REQUESTS
 from core.project_identity import PROJECT_VERSION
 from core.redis import RedisQueue
+from core.runtime_profiles import RuntimeProfileCatalog
 from scheduler.global_scheduler import GlobalScheduler
 from worker.kubernetes_serving_runtime import KubernetesServingRuntimeAdapter
 from worker.vllm_runtime import DockerVLLMRuntimeAdapter
@@ -69,6 +72,9 @@ def create_app(
         log_stream_ttl_seconds=resolved_settings.log_stream_ttl_seconds,
         ready_stream_maxlen=resolved_settings.ready_stream_maxlen,
         socket_timeout=resolved_settings.redis_socket_timeout,
+    )
+    runtime_profile_catalog = RuntimeProfileCatalog.from_path(
+        Path(resolved_settings.runtime_profile_manifest_path)
     )
     should_start_control = (
         resolved_settings.control_plane_enabled
@@ -296,6 +302,7 @@ def create_app(
     app.state.fake_replica_runtime = fake_replica_runtime
     app.state.vllm_replica_runtime = vllm_replica_runtime
     app.state.kubernetes_replica_runtime = kubernetes_replica_runtime
+    app.state.runtime_profile_catalog = runtime_profile_catalog
     app.add_middleware(
         RequestBodyLimitMiddleware,
         max_bytes=resolved_settings.api_request_max_bytes,
@@ -336,6 +343,7 @@ def create_app(
     app.include_router(workers.router)
     app.include_router(services.router)
     app.include_router(registry.router)
+    app.include_router(model_variants.router)
     app.include_router(usage.router)
     app.include_router(artifacts.router)
     app.include_router(gateway.router)

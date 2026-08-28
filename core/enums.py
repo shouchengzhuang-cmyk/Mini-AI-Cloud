@@ -24,6 +24,12 @@ class AllocationAuthority(StrEnum):
     KUBERNETES_DEVICE_PLUGIN = "kubernetes_device_plugin"
 
 
+class ModelAvailabilityStatus(StrEnum):
+    READY = "ready"
+    DEGRADED = "degraded"
+    DISABLED = "disabled"
+
+
 class TaskStatus(StrEnum):
     PENDING = "pending"
     QUEUED = "queued"

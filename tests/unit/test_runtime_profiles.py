@@ -36,10 +36,11 @@ def test_committed_runtime_profiles_and_generated_files_are_valid() -> None:
         "SCHEMA_READY",
         "REAL_HW_NOT_RUN",
     }
-    assert {loaded.profile.identity for loaded in profiles} >= {
+    assert {loaded.profile.identity for loaded in profiles} == {
+        "ascend-vllm-k8s-a2@1.0.0",
+        "ascend-vllm-k8s-a2@2.0.0",
         "nvidia-vllm-k8s@1.0.0",
         "nvidia-vllm-k8s@2.0.0",
-        "ascend-vllm-k8s-a2@1.0.0",
     }
 
 

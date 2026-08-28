@@ -13,6 +13,7 @@ from core.config import Settings
 from core.database import Database
 from core.rbac import Permission, Principal, PrincipalKind, require_permission
 from core.redis import RedisQueue
+from core.runtime_profiles import RuntimeProfileCatalog
 from repositories.identity import ApiKeyRepository
 
 
@@ -26,6 +27,10 @@ def get_queue(request: Request) -> RedisQueue:
 
 def get_app_settings(request: Request) -> Settings:
     return request.app.state.settings
+
+
+def get_runtime_profile_catalog(request: Request) -> RuntimeProfileCatalog:
+    return request.app.state.runtime_profile_catalog
 
 
 async def get_session(request: Request) -> AsyncIterator[AsyncSession]:

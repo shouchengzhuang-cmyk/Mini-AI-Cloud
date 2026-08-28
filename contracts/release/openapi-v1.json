@@ -2118,6 +2118,258 @@
           "title": "LogStream",
           "type": "string"
         },
+        "LogicalModelCreate": {
+          "additionalProperties": false,
+          "properties": {
+            "description": {
+              "anyOf": [
+                {
+                  "maxLength": 2000,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Description"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "title": "Metadata",
+              "type": "object"
+            },
+            "name": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Name",
+              "type": "string"
+            },
+            "public_name": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Public Name",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "public_name"
+          ],
+          "title": "LogicalModelCreate",
+          "type": "object"
+        },
+        "LogicalModelListResponse": {
+          "additionalProperties": false,
+          "properties": {
+            "items": {
+              "items": {
+                "$ref": "#/components/schemas/LogicalModelResponse"
+              },
+              "title": "Items",
+              "type": "array"
+            },
+            "pagination": {
+              "$ref": "#/components/schemas/PaginationMeta"
+            }
+          },
+          "required": [
+            "items",
+            "pagination"
+          ],
+          "title": "LogicalModelListResponse",
+          "type": "object"
+        },
+        "LogicalModelResponse": {
+          "additionalProperties": false,
+          "properties": {
+            "created_at": {
+              "format": "date-time",
+              "title": "Created At",
+              "type": "string"
+            },
+            "created_by_user_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Created By User Id"
+            },
+            "description": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Description"
+            },
+            "id": {
+              "format": "uuid",
+              "title": "Id",
+              "type": "string"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "title": "Metadata",
+              "type": "object"
+            },
+            "name": {
+              "title": "Name",
+              "type": "string"
+            },
+            "project_id": {
+              "format": "uuid",
+              "title": "Project Id",
+              "type": "string"
+            },
+            "public_name": {
+              "title": "Public Name",
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/components/schemas/ModelAvailabilityStatus"
+            },
+            "updated_at": {
+              "format": "date-time",
+              "title": "Updated At",
+              "type": "string"
+            },
+            "version": {
+              "minimum": 1.0,
+              "title": "Version",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "id",
+            "project_id",
+            "name",
+            "public_name",
+            "description",
+            "status",
+            "metadata",
+            "created_by_user_id",
+            "created_at",
+            "updated_at",
+            "version"
+          ],
+          "title": "LogicalModelResponse",
+          "type": "object"
+        },
+        "LogicalModelStatusEventResponse": {
+          "additionalProperties": false,
+          "properties": {
+            "created_at": {
+              "format": "date-time",
+              "title": "Created At",
+              "type": "string"
+            },
+            "created_by_user_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Created By User Id"
+            },
+            "from_status": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/ModelAvailabilityStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "id": {
+              "format": "uuid",
+              "title": "Id",
+              "type": "string"
+            },
+            "logical_model_id": {
+              "format": "uuid",
+              "title": "Logical Model Id",
+              "type": "string"
+            },
+            "model_version": {
+              "minimum": 1.0,
+              "title": "Model Version",
+              "type": "integer"
+            },
+            "reason": {
+              "title": "Reason",
+              "type": "string"
+            },
+            "to_status": {
+              "$ref": "#/components/schemas/ModelAvailabilityStatus"
+            }
+          },
+          "required": [
+            "id",
+            "logical_model_id",
+            "from_status",
+            "to_status",
+            "reason",
+            "model_version",
+            "created_by_user_id",
+            "created_at"
+          ],
+          "title": "LogicalModelStatusEventResponse",
+          "type": "object"
+        },
+        "LogicalModelStatusHistoryResponse": {
+          "additionalProperties": false,
+          "properties": {
+            "items": {
+              "items": {
+                "$ref": "#/components/schemas/LogicalModelStatusEventResponse"
+              },
+              "title": "Items",
+              "type": "array"
+            },
+            "pagination": {
+              "$ref": "#/components/schemas/PaginationMeta"
+            }
+          },
+          "required": [
+            "items",
+            "pagination"
+          ],
+          "title": "LogicalModelStatusHistoryResponse",
+          "type": "object"
+        },
+        "LogicalModelStatusUpdate": {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "maxLength": 2000,
+              "minLength": 1,
+              "title": "Reason",
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/components/schemas/ModelAvailabilityStatus"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ],
+          "title": "LogicalModelStatusUpdate",
+          "type": "object"
+        },
         "MembershipCreate": {
           "additionalProperties": false,
           "properties": {
@@ -2245,6 +2497,309 @@
             "message"
           ],
           "title": "MessageResponse",
+          "type": "object"
+        },
+        "ModelAvailabilityStatus": {
+          "enum": [
+            "ready",
+            "degraded",
+            "disabled"
+          ],
+          "title": "ModelAvailabilityStatus",
+          "type": "string"
+        },
+        "ModelVariantCreate": {
+          "additionalProperties": false,
+          "properties": {
+            "architecture": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Architecture",
+              "type": "string"
+            },
+            "artifact_digest": {
+              "maxLength": 71,
+              "minLength": 71,
+              "title": "Artifact Digest",
+              "type": "string"
+            },
+            "artifact_revision": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Artifact Revision",
+              "type": "string"
+            },
+            "artifact_source": {
+              "maxLength": 1024,
+              "minLength": 1,
+              "title": "Artifact Source",
+              "type": "string"
+            },
+            "dtype": {
+              "maxLength": 64,
+              "minLength": 1,
+              "title": "Dtype",
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/components/schemas/AcceleratorKind"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "title": "Metadata",
+              "type": "object"
+            },
+            "name": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Name",
+              "type": "string"
+            },
+            "quantization": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Quantization"
+            },
+            "runtime_profile_digest": {
+              "maxLength": 71,
+              "minLength": 71,
+              "title": "Runtime Profile Digest",
+              "type": "string"
+            },
+            "runtime_profile_id": {
+              "maxLength": 64,
+              "minLength": 3,
+              "title": "Runtime Profile Id",
+              "type": "string"
+            },
+            "runtime_profile_version": {
+              "maxLength": 32,
+              "minLength": 5,
+              "title": "Runtime Profile Version",
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/components/schemas/ModelAvailabilityStatus",
+              "default": "disabled"
+            },
+            "status_reason": {
+              "anyOf": [
+                {
+                  "maxLength": 2000,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status Reason"
+            },
+            "vendor": {
+              "$ref": "#/components/schemas/AcceleratorVendor"
+            }
+          },
+          "required": [
+            "name",
+            "vendor",
+            "kind",
+            "runtime_profile_id",
+            "runtime_profile_version",
+            "runtime_profile_digest",
+            "artifact_source",
+            "artifact_revision",
+            "artifact_digest",
+            "architecture",
+            "dtype"
+          ],
+          "title": "ModelVariantCreate",
+          "type": "object"
+        },
+        "ModelVariantListResponse": {
+          "additionalProperties": false,
+          "properties": {
+            "items": {
+              "items": {
+                "$ref": "#/components/schemas/ModelVariantResponse"
+              },
+              "title": "Items",
+              "type": "array"
+            },
+            "pagination": {
+              "$ref": "#/components/schemas/PaginationMeta"
+            }
+          },
+          "required": [
+            "items",
+            "pagination"
+          ],
+          "title": "ModelVariantListResponse",
+          "type": "object"
+        },
+        "ModelVariantResponse": {
+          "additionalProperties": false,
+          "properties": {
+            "architecture": {
+              "title": "Architecture",
+              "type": "string"
+            },
+            "artifact_digest": {
+              "title": "Artifact Digest",
+              "type": "string"
+            },
+            "artifact_revision": {
+              "title": "Artifact Revision",
+              "type": "string"
+            },
+            "artifact_source": {
+              "title": "Artifact Source",
+              "type": "string"
+            },
+            "created_at": {
+              "format": "date-time",
+              "title": "Created At",
+              "type": "string"
+            },
+            "created_by_user_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Created By User Id"
+            },
+            "dtype": {
+              "title": "Dtype",
+              "type": "string"
+            },
+            "id": {
+              "format": "uuid",
+              "title": "Id",
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/components/schemas/AcceleratorKind"
+            },
+            "logical_model_id": {
+              "format": "uuid",
+              "title": "Logical Model Id",
+              "type": "string"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "title": "Metadata",
+              "type": "object"
+            },
+            "name": {
+              "title": "Name",
+              "type": "string"
+            },
+            "quantization": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Quantization"
+            },
+            "runtime_profile_digest": {
+              "title": "Runtime Profile Digest",
+              "type": "string"
+            },
+            "runtime_profile_id": {
+              "title": "Runtime Profile Id",
+              "type": "string"
+            },
+            "runtime_profile_version": {
+              "title": "Runtime Profile Version",
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/components/schemas/ModelAvailabilityStatus"
+            },
+            "status_reason": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status Reason"
+            },
+            "updated_at": {
+              "format": "date-time",
+              "title": "Updated At",
+              "type": "string"
+            },
+            "vendor": {
+              "$ref": "#/components/schemas/AcceleratorVendor"
+            },
+            "version": {
+              "minimum": 1.0,
+              "title": "Version",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "id",
+            "logical_model_id",
+            "name",
+            "vendor",
+            "kind",
+            "runtime_profile_id",
+            "runtime_profile_version",
+            "runtime_profile_digest",
+            "artifact_source",
+            "artifact_revision",
+            "artifact_digest",
+            "architecture",
+            "dtype",
+            "quantization",
+            "status",
+            "status_reason",
+            "metadata",
+            "created_by_user_id",
+            "created_at",
+            "updated_at",
+            "version"
+          ],
+          "title": "ModelVariantResponse",
+          "type": "object"
+        },
+        "ModelVariantStatusUpdate": {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "maxLength": 2000,
+              "minLength": 1,
+              "title": "Reason",
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/components/schemas/ModelAvailabilityStatus"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ],
+          "title": "ModelVariantStatusUpdate",
           "type": "object"
         },
         "OfflineWorkerResponse": {
@@ -14425,6 +14980,2482 @@
           "summary": "Get Dependency State",
           "tags": [
             "job-groups"
+          ]
+        }
+      },
+      "/api/v1/projects/{project_id}/logical-models": {
+        "get": {
+          "description": "List Logical Models",
+          "operationId": "list_logical_models_api_v1_projects__project_id__logical_models_get",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "project_id",
+              "required": true,
+              "schema": {
+                "format": "uuid",
+                "title": "Project Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "query",
+              "name": "limit",
+              "required": false,
+              "schema": {
+                "default": 100,
+                "maximum": 1000,
+                "minimum": 1,
+                "title": "Limit",
+                "type": "integer"
+              }
+            },
+            {
+              "in": "query",
+              "name": "offset",
+              "required": false,
+              "schema": {
+                "default": 0,
+                "minimum": 0,
+                "title": "Offset",
+                "type": "integer"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/LogicalModelListResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "400": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Malformed or unsupported request"
+            },
+            "401": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Authentication required"
+            },
+            "403": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Insufficient permission"
+            },
+            "404": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Resource not found in the authenticated scope"
+            },
+            "409": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "State or idempotency conflict"
+            },
+            "413": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Request body exceeds the configured limit"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            },
+            "429": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Rate limit exceeded"
+            },
+            "500": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Unexpected server error"
+            },
+            "503": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Required backend is unavailable"
+            }
+          },
+          "security": [
+            {
+              "BearerApiKey": []
+            },
+            {
+              "ApiKeyHeader": []
+            }
+          ],
+          "summary": "List Logical Models",
+          "tags": [
+            "model-variants"
+          ]
+        },
+        "post": {
+          "description": "Create Logical Model",
+          "operationId": "create_logical_model_api_v1_projects__project_id__logical_models_post",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "project_id",
+              "required": true,
+              "schema": {
+                "format": "uuid",
+                "title": "Project Id",
+                "type": "string"
+              }
+            }
+          ],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogicalModelCreate"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "201": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/LogicalModelResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "400": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Malformed or unsupported request"
+            },
+            "401": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Authentication required"
+            },
+            "403": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Insufficient permission"
+            },
+            "404": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Resource not found in the authenticated scope"
+            },
+            "409": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "State or idempotency conflict"
+            },
+            "413": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Request body exceeds the configured limit"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            },
+            "429": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Rate limit exceeded"
+            },
+            "500": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Unexpected server error"
+            },
+            "503": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Required backend is unavailable"
+            }
+          },
+          "security": [
+            {
+              "BearerApiKey": []
+            },
+            {
+              "ApiKeyHeader": []
+            }
+          ],
+          "summary": "Create Logical Model",
+          "tags": [
+            "model-variants"
+          ]
+        }
+      },
+      "/api/v1/projects/{project_id}/logical-models/{logical_model_id}": {
+        "delete": {
+          "description": "Delete Logical Model",
+          "operationId": "delete_logical_model_api_v1_projects__project_id__logical_models__logical_model_id__delete",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "project_id",
+              "required": true,
+              "schema": {
+                "format": "uuid",
+                "title": "Project Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "logical_model_id",
+              "required": true,
+              "schema": {
+                "format": "uuid",
+                "title": "Logical Model Id",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/MessageResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "400": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Malformed or unsupported request"
+            },
+            "401": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Authentication required"
+            },
+            "403": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Insufficient permission"
+            },
+            "404": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Resource not found in the authenticated scope"
+            },
+            "409": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "State or idempotency conflict"
+            },
+            "413": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Request body exceeds the configured limit"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            },
+            "429": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Rate limit exceeded"
+            },
+            "500": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Unexpected server error"
+            },
+            "503": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Required backend is unavailable"
+            }
+          },
+          "security": [
+            {
+              "BearerApiKey": []
+            },
+            {
+              "ApiKeyHeader": []
+            }
+          ],
+          "summary": "Delete Logical Model",
+          "tags": [
+            "model-variants"
+          ]
+        },
+        "get": {
+          "description": "Get Logical Model",
+          "operationId": "get_logical_model_api_v1_projects__project_id__logical_models__logical_model_id__get",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "project_id",
+              "required": true,
+              "schema": {
+                "format": "uuid",
+                "title": "Project Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "logical_model_id",
+              "required": true,
+              "schema": {
+                "format": "uuid",
+                "title": "Logical Model Id",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/LogicalModelResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "400": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Malformed or unsupported request"
+            },
+            "401": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Authentication required"
+            },
+            "403": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Insufficient permission"
+            },
+            "404": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Resource not found in the authenticated scope"
+            },
+            "409": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "State or idempotency conflict"
+            },
+            "413": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Request body exceeds the configured limit"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            },
+            "429": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Rate limit exceeded"
+            },
+            "500": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Unexpected server error"
+            },
+            "503": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Required backend is unavailable"
+            }
+          },
+          "security": [
+            {
+              "BearerApiKey": []
+            },
+            {
+              "ApiKeyHeader": []
+            }
+          ],
+          "summary": "Get Logical Model",
+          "tags": [
+            "model-variants"
+          ]
+        }
+      },
+      "/api/v1/projects/{project_id}/logical-models/{logical_model_id}/status": {
+        "put": {
+          "description": "Set Logical Model Status",
+          "operationId": "set_logical_model_status_api_v1_projects__project_id__logical_models__logical_model_id__status_put",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "project_id",
+              "required": true,
+              "schema": {
+                "format": "uuid",
+                "title": "Project Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "logical_model_id",
+              "required": true,
+              "schema": {
+                "format": "uuid",
+                "title": "Logical Model Id",
+                "type": "string"
+              }
+            }
+          ],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogicalModelStatusUpdate"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/LogicalModelResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "400": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Malformed or unsupported request"
+            },
+            "401": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Authentication required"
+            },
+            "403": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Insufficient permission"
+            },
+            "404": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Resource not found in the authenticated scope"
+            },
+            "409": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "State or idempotency conflict"
+            },
+            "413": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Request body exceeds the configured limit"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            },
+            "429": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Rate limit exceeded"
+            },
+            "500": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Unexpected server error"
+            },
+            "503": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Required backend is unavailable"
+            }
+          },
+          "security": [
+            {
+              "BearerApiKey": []
+            },
+            {
+              "ApiKeyHeader": []
+            }
+          ],
+          "summary": "Set Logical Model Status",
+          "tags": [
+            "model-variants"
+          ]
+        }
+      },
+      "/api/v1/projects/{project_id}/logical-models/{logical_model_id}/status-history": {
+        "get": {
+          "description": "Get Logical Model Status History",
+          "operationId": "get_logical_model_status_history_api_v1_projects__project_id__logical_models__logical_model_id__status_history_get",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "project_id",
+              "required": true,
+              "schema": {
+                "format": "uuid",
+                "title": "Project Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "logical_model_id",
+              "required": true,
+              "schema": {
+                "format": "uuid",
+                "title": "Logical Model Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "query",
+              "name": "limit",
+              "required": false,
+              "schema": {
+                "default": 100,
+                "maximum": 1000,
+                "minimum": 1,
+                "title": "Limit",
+                "type": "integer"
+              }
+            },
+            {
+              "in": "query",
+              "name": "offset",
+              "required": false,
+              "schema": {
+                "default": 0,
+                "minimum": 0,
+                "title": "Offset",
+                "type": "integer"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/LogicalModelStatusHistoryResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "400": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Malformed or unsupported request"
+            },
+            "401": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Authentication required"
+            },
+            "403": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Insufficient permission"
+            },
+            "404": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Resource not found in the authenticated scope"
+            },
+            "409": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "State or idempotency conflict"
+            },
+            "413": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Request body exceeds the configured limit"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            },
+            "429": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Rate limit exceeded"
+            },
+            "500": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Unexpected server error"
+            },
+            "503": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Required backend is unavailable"
+            }
+          },
+          "security": [
+            {
+              "BearerApiKey": []
+            },
+            {
+              "ApiKeyHeader": []
+            }
+          ],
+          "summary": "Get Logical Model Status History",
+          "tags": [
+            "model-variants"
+          ]
+        }
+      },
+      "/api/v1/projects/{project_id}/logical-models/{logical_model_id}/variants": {
+        "get": {
+          "description": "List Model Variants",
+          "operationId": "list_model_variants_api_v1_projects__project_id__logical_models__logical_model_id__variants_get",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "project_id",
+              "required": true,
+              "schema": {
+                "format": "uuid",
+                "title": "Project Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "logical_model_id",
+              "required": true,
+              "schema": {
+                "format": "uuid",
+                "title": "Logical Model Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "query",
+              "name": "limit",
+              "required": false,
+              "schema": {
+                "default": 100,
+                "maximum": 1000,
+                "minimum": 1,
+                "title": "Limit",
+                "type": "integer"
+              }
+            },
+            {
+              "in": "query",
+              "name": "offset",
+              "required": false,
+              "schema": {
+                "default": 0,
+                "minimum": 0,
+                "title": "Offset",
+                "type": "integer"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ModelVariantListResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "400": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Malformed or unsupported request"
+            },
+            "401": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Authentication required"
+            },
+            "403": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Insufficient permission"
+            },
+            "404": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Resource not found in the authenticated scope"
+            },
+            "409": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "State or idempotency conflict"
+            },
+            "413": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Request body exceeds the configured limit"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            },
+            "429": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Rate limit exceeded"
+            },
+            "500": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Unexpected server error"
+            },
+            "503": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Required backend is unavailable"
+            }
+          },
+          "security": [
+            {
+              "BearerApiKey": []
+            },
+            {
+              "ApiKeyHeader": []
+            }
+          ],
+          "summary": "List Model Variants",
+          "tags": [
+            "model-variants"
+          ]
+        },
+        "post": {
+          "description": "Create Model Variant",
+          "operationId": "create_model_variant_api_v1_projects__project_id__logical_models__logical_model_id__variants_post",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "project_id",
+              "required": true,
+              "schema": {
+                "format": "uuid",
+                "title": "Project Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "logical_model_id",
+              "required": true,
+              "schema": {
+                "format": "uuid",
+                "title": "Logical Model Id",
+                "type": "string"
+              }
+            }
+          ],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelVariantCreate"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "201": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ModelVariantResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "400": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Malformed or unsupported request"
+            },
+            "401": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Authentication required"
+            },
+            "403": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Insufficient permission"
+            },
+            "404": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Resource not found in the authenticated scope"
+            },
+            "409": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "State or idempotency conflict"
+            },
+            "413": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Request body exceeds the configured limit"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            },
+            "429": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Rate limit exceeded"
+            },
+            "500": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Unexpected server error"
+            },
+            "503": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Required backend is unavailable"
+            }
+          },
+          "security": [
+            {
+              "BearerApiKey": []
+            },
+            {
+              "ApiKeyHeader": []
+            }
+          ],
+          "summary": "Create Model Variant",
+          "tags": [
+            "model-variants"
+          ]
+        }
+      },
+      "/api/v1/projects/{project_id}/logical-models/{logical_model_id}/variants/{variant_id}": {
+        "delete": {
+          "description": "Delete Model Variant",
+          "operationId": "delete_model_variant_api_v1_projects__project_id__logical_models__logical_model_id__variants__variant_id__delete",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "project_id",
+              "required": true,
+              "schema": {
+                "format": "uuid",
+                "title": "Project Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "logical_model_id",
+              "required": true,
+              "schema": {
+                "format": "uuid",
+                "title": "Logical Model Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "variant_id",
+              "required": true,
+              "schema": {
+                "format": "uuid",
+                "title": "Variant Id",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/MessageResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "400": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Malformed or unsupported request"
+            },
+            "401": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Authentication required"
+            },
+            "403": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Insufficient permission"
+            },
+            "404": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Resource not found in the authenticated scope"
+            },
+            "409": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "State or idempotency conflict"
+            },
+            "413": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Request body exceeds the configured limit"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            },
+            "429": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Rate limit exceeded"
+            },
+            "500": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Unexpected server error"
+            },
+            "503": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Required backend is unavailable"
+            }
+          },
+          "security": [
+            {
+              "BearerApiKey": []
+            },
+            {
+              "ApiKeyHeader": []
+            }
+          ],
+          "summary": "Delete Model Variant",
+          "tags": [
+            "model-variants"
+          ]
+        },
+        "get": {
+          "description": "Get Model Variant",
+          "operationId": "get_model_variant_api_v1_projects__project_id__logical_models__logical_model_id__variants__variant_id__get",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "project_id",
+              "required": true,
+              "schema": {
+                "format": "uuid",
+                "title": "Project Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "logical_model_id",
+              "required": true,
+              "schema": {
+                "format": "uuid",
+                "title": "Logical Model Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "variant_id",
+              "required": true,
+              "schema": {
+                "format": "uuid",
+                "title": "Variant Id",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ModelVariantResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "400": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Malformed or unsupported request"
+            },
+            "401": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Authentication required"
+            },
+            "403": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Insufficient permission"
+            },
+            "404": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Resource not found in the authenticated scope"
+            },
+            "409": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "State or idempotency conflict"
+            },
+            "413": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Request body exceeds the configured limit"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            },
+            "429": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Rate limit exceeded"
+            },
+            "500": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Unexpected server error"
+            },
+            "503": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Required backend is unavailable"
+            }
+          },
+          "security": [
+            {
+              "BearerApiKey": []
+            },
+            {
+              "ApiKeyHeader": []
+            }
+          ],
+          "summary": "Get Model Variant",
+          "tags": [
+            "model-variants"
+          ]
+        }
+      },
+      "/api/v1/projects/{project_id}/logical-models/{logical_model_id}/variants/{variant_id}/status": {
+        "put": {
+          "description": "Set Model Variant Status",
+          "operationId": "set_model_variant_status_api_v1_projects__project_id__logical_models__logical_model_id__variants__variant_id__status_put",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "project_id",
+              "required": true,
+              "schema": {
+                "format": "uuid",
+                "title": "Project Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "logical_model_id",
+              "required": true,
+              "schema": {
+                "format": "uuid",
+                "title": "Logical Model Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "variant_id",
+              "required": true,
+              "schema": {
+                "format": "uuid",
+                "title": "Variant Id",
+                "type": "string"
+              }
+            }
+          ],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelVariantStatusUpdate"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ModelVariantResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "400": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Malformed or unsupported request"
+            },
+            "401": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Authentication required"
+            },
+            "403": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Insufficient permission"
+            },
+            "404": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Resource not found in the authenticated scope"
+            },
+            "409": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "State or idempotency conflict"
+            },
+            "413": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Request body exceeds the configured limit"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            },
+            "429": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Rate limit exceeded"
+            },
+            "500": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Unexpected server error"
+            },
+            "503": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Required backend is unavailable"
+            }
+          },
+          "security": [
+            {
+              "BearerApiKey": []
+            },
+            {
+              "ApiKeyHeader": []
+            }
+          ],
+          "summary": "Set Model Variant Status",
+          "tags": [
+            "model-variants"
           ]
         }
       },
