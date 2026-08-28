@@ -12,13 +12,14 @@ SIMULATION_OUTPUT_DIR ?= build/scheduler-simulation
 BACKUP_OUTPUT_DIR ?= build/backups
 RELEASE_IMAGE ?= mini-ai-cloud:release-gate
 RELEASE_WHEEL_DIR ?= build/release-wheel
+DUAL_BACKEND_OUTPUT ?= build/dual-backend-report.json
 
 .PHONY: help install format lint typecheck validate-evidence evidence test test-unit test-integration test-docker \
 	test-e2e test-serving check config build up down ps logs migrate migrate-local run-api run-worker \
 	load-test dev observability test-chaos test-k8s kind-up kind-down kind-serving-up \
 	test-kind-serving kind-serving-down demo-fencing demo-adoption demo-sse-drain demo-all \
 	test-nvidia-fake-device-plugin validate-ascend-runtime \
-	test-dr test-soak test-release release-validate benchmark backup restore
+	test-dr test-soak test-release release-validate benchmark benchmark-dual-backend backup restore
 
 help: ## Show available targets.
 	@awk 'BEGIN {FS = ":.*## "; printf "Usage: make <target>\n\n"} \
@@ -159,6 +160,11 @@ benchmark: ## Compare binpack/spread on 100 workers, 4 GPUs each, and 10000 jobs
 	$(UV) run python -m scripts.scheduler_simulation \
 		--workers 100 --gpus-per-worker 4 --jobs 10000 \
 		--output-dir $(SIMULATION_OUTPUT_DIR)
+
+benchmark-dual-backend: ## Run the configured NVIDIA + Ascend serving benchmark.
+	@test -n "$(DUAL_BACKEND_CONFIG)" || { echo "DUAL_BACKEND_CONFIG=/path/to/config.json is required" >&2; exit 2; }
+	$(UV) run python -m benchmarks.dual_backend \
+		--config "$(DUAL_BACKEND_CONFIG)" --output "$(DUAL_BACKEND_OUTPUT)"
 
 backup: ## Back up local PostgreSQL plus local/MinIO artifact volumes.
 	bash scripts/backup.sh --local-stack --project-name $(LOCAL_STACK_PROJECT) \
