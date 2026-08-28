@@ -23,13 +23,20 @@ from api.services.gateway import GatewayMetrics, GatewayService, ServiceLoad
 from api.services.service_health import ServiceHealthController
 from api.services.service_reconciler import ServiceReconciler
 from core.database import Database
-from core.enums import ProjectRole, RuntimeType
+from core.enums import (
+    AcceleratorKind,
+    AcceleratorVendor,
+    ModelAvailabilityStatus,
+    ProjectRole,
+    RuntimeType,
+)
 from core.rbac import Principal, PrincipalKind
 from models.base import Base
-from models.identity import Project, User
+from models.identity import ApiKey, Project, User
 from models.model_variant import LogicalModel, ModelVariant
 from models.outbox import OutboxEvent
 from models.registry import RegisteredModel
+from models.routing import VendorCircuitState
 from models.service import (
     ModelService,
     ReplicaHealth,
@@ -38,7 +45,7 @@ from models.service import (
     ServiceStatus,
     ServingRuntime,
 )
-from models.usage import ProjectQuota, ProjectQuotaState, ServingRequestUsage
+from models.usage import AuditEvent, ProjectQuota, ProjectQuotaState, ServingRequestUsage
 from models.worker import Worker
 from repositories.quotas import QuotaRepository
 from repositories.services import ServiceRepository
@@ -93,6 +100,19 @@ class DisconnectChunkStream(httpx.AsyncByteStream):
         self.closed = True
 
 
+class FaultAfterFirstChunkStream(httpx.AsyncByteStream):
+    def __init__(self, request: httpx.Request) -> None:
+        self.request = request
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield b'data: {"choices":[{"delta":{"content":"pinned"}}]}\n\n'
+        raise httpx.ReadError("fault after stream start", request=self.request)
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
 @pytest_asyncio.fixture
 async def gateway_database(tmp_path: Any) -> AsyncIterator[Database]:
     path = (tmp_path / "gateway.sqlite3").as_posix()
@@ -109,6 +129,7 @@ async def gateway_database(tmp_path: Any) -> AsyncIterator[Database]:
             Base.metadata.create_all,
             tables=[
                 cast(Table, User.__table__),
+                cast(Table, ApiKey.__table__),
                 cast(Table, Project.__table__),
                 cast(Table, ProjectQuota.__table__),
                 cast(Table, ProjectQuotaState.__table__),
@@ -119,6 +140,8 @@ async def gateway_database(tmp_path: Any) -> AsyncIterator[Database]:
                 cast(Table, ModelService.__table__),
                 cast(Table, ServiceReplica.__table__),
                 cast(Table, ServingRequestUsage.__table__),
+                cast(Table, VendorCircuitState.__table__),
+                cast(Table, AuditEvent.__table__),
                 cast(Table, OutboxEvent.__table__),
             ],
         )
@@ -188,6 +211,158 @@ async def _ready_service(database: Database) -> tuple[uuid.UUID, list[ServiceRep
                 health=ReplicaHealth.HEALTHY,
             )
         return service.id, replicas
+
+
+async def _ready_dual_vendor_services(
+    database: Database,
+) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
+    nvidia_service_id, _ = await _ready_service(database)
+    logical_model_id = uuid.uuid4()
+    nvidia_variant_id = uuid.uuid4()
+    ascend_variant_id = uuid.uuid4()
+    profile_digest = "sha256:" + "1" * 64
+    artifact_digest = "sha256:" + "2" * 64
+    async with database.session() as session, session.begin():
+        session.add(
+            LogicalModel(
+                id=logical_model_id,
+                project_id=PROJECT_ID,
+                name="logical-chat",
+                public_name="logical-chat",
+                status=ModelAvailabilityStatus.READY,
+            )
+        )
+        session.add_all(
+            [
+                ModelVariant(
+                    id=nvidia_variant_id,
+                    logical_model_id=logical_model_id,
+                    name="nvidia-variant",
+                    vendor=AcceleratorVendor.NVIDIA,
+                    kind=AcceleratorKind.GPU,
+                    runtime_profile_id="nvidia-vllm",
+                    runtime_profile_version="1.0.0",
+                    runtime_profile_digest=profile_digest,
+                    artifact_source="physical/nvidia",
+                    artifact_revision="revision-1",
+                    artifact_digest=artifact_digest,
+                    architecture="test",
+                    dtype="bfloat16",
+                    status=ModelAvailabilityStatus.READY,
+                ),
+                ModelVariant(
+                    id=ascend_variant_id,
+                    logical_model_id=logical_model_id,
+                    name="ascend-variant",
+                    vendor=AcceleratorVendor.HUAWEI_ASCEND,
+                    kind=AcceleratorKind.NPU,
+                    runtime_profile_id="ascend-vllm",
+                    runtime_profile_version="1.0.0",
+                    runtime_profile_digest=profile_digest,
+                    artifact_source="physical/ascend",
+                    artifact_revision="revision-1",
+                    artifact_digest=artifact_digest,
+                    architecture="test",
+                    dtype="bfloat16",
+                    status=ModelAvailabilityStatus.READY,
+                ),
+            ]
+        )
+        await session.flush()
+        nvidia_service = await session.get(ModelService, nvidia_service_id)
+        assert nvidia_service is not None
+        nvidia_replicas = await ServiceRepository.list_replicas(
+            session, nvidia_service_id, for_update=True
+        )
+        nvidia_service.name = "logical-chat"
+        nvidia_service.model = "physical/nvidia"
+        nvidia_service.logical_model_id = logical_model_id
+        nvidia_service.model_variant_id = nvidia_variant_id
+        nvidia_service.selected_vendor = "nvidia"
+        nvidia_service.selected_kind = "gpu"
+        nvidia_service.selected_model = "test-gpu"
+        nvidia_service.runtime_profile_id = "nvidia-vllm"
+        nvidia_service.runtime_profile_version = "1.0.0"
+        nvidia_service.runtime_profile_digest = profile_digest
+        nvidia_service.allocation_authority = "control_plane_exact_device"
+        nvidia_service.selection_policy = "prefer-nvidia"
+        for replica in nvidia_replicas:
+            replica.logical_model_id = logical_model_id
+            replica.model_variant_id = nvidia_variant_id
+            replica.selected_vendor = "nvidia"
+            replica.selected_kind = "gpu"
+            replica.selected_model = "test-gpu"
+            replica.runtime_profile_id = "nvidia-vllm"
+            replica.runtime_profile_version = "1.0.0"
+            replica.runtime_profile_digest = profile_digest
+            replica.allocation_authority = "control_plane_exact_device"
+            replica.selection_policy = "prefer-nvidia"
+
+        await QuotaRepository.replace(
+            session,
+            project_id=PROJECT_ID,
+            max_queued_tasks=None,
+            max_running_tasks=None,
+            max_cpu_millicores=None,
+            max_memory_mb=None,
+            max_gpus=None,
+            max_nvidia_gpus=None,
+            max_ascend_npus=None,
+            max_services=None,
+            max_service_replicas=None,
+            max_artifact_bytes=None,
+            daily_cost_limit=None,
+        )
+        ascend_service = await ServiceRepository.create(
+            session,
+            project_id=PROJECT_ID,
+            name="logical-chat-ascend",
+            model="physical/ascend",
+            runtime=ServingRuntime.VLLM,
+            runtime_type=RuntimeType.DOCKER,
+            image="example/vllm:test",
+            cpu_millicores=1000,
+            memory_mb=1024,
+            gpu_count=1,
+            gpu_memory_mb=0,
+            desired_replicas=1,
+            logical_model_id=logical_model_id,
+            model_variant_id=ascend_variant_id,
+            selected_vendor="huawei-ascend",
+            selected_kind="npu",
+            selected_model="Atlas A2",
+            runtime_profile_id="ascend-vllm",
+            runtime_profile_version="1.0.0",
+            runtime_profile_digest=profile_digest,
+            allocation_authority="control_plane_exact_device",
+            selection_policy="prefer-nvidia",
+        )
+        await ServiceRepository.reconcile_locked(session, ascend_service)
+        ascend_replica = (await ServiceRepository.list_replicas(session, ascend_service.id))[0]
+        execution_id = uuid.uuid4()
+        assert await ServiceRepository.bind_replica_execution(
+            session,
+            replica_id=ascend_replica.id,
+            generation=1,
+            worker_id="worker-a",
+            execution_id=execution_id,
+            lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+        )
+        assert await ServiceRepository.mark_replica_running(
+            session,
+            replica_id=ascend_replica.id,
+            generation=1,
+            execution_id=execution_id,
+            endpoint_url="http://ascend.test:8000",
+        )
+        assert await ServiceRepository.record_replica_health(
+            session,
+            replica_id=ascend_replica.id,
+            generation=1,
+            execution_id=execution_id,
+            health=ReplicaHealth.HEALTHY,
+        )
+    return logical_model_id, nvidia_variant_id, ascend_variant_id
 
 
 def _api_key_principal() -> Principal:
@@ -1286,3 +1461,158 @@ async def test_autoscaler_holds_when_scale_up_would_exceed_project_quota(
     assert persisted is not None and persisted.desired_replicas == 1
     assert state is not None and state.service_replicas == 1
     assert state.service_reserved_cpu_millicores == 500
+
+
+async def test_logical_model_fallback_records_circuit_audit_and_physical_usage(
+    gateway_database: Database,
+) -> None:
+    logical_model_id, nvidia_variant_id, ascend_variant_id = await _ready_dual_vendor_services(
+        gateway_database
+    )
+    hosts: list[str] = []
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        assert request.url.host is not None
+        hosts.append(request.url.host)
+        if request.url.host.startswith("worker-"):
+            raise httpx.ConnectError("injected nvidia connect fault", request=request)
+        payload = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "model": payload["model"],
+                "choices": [],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        gateway = GatewayService(
+            gateway_database,
+            client,
+            GatewayMetrics(),
+            request_timeout=2,
+            endpoint_host_allowlist="*.test",
+            fallback_attempts=1,
+            circuit_failure_threshold=1,
+        )
+        result = await gateway.forward(
+            project_id=PROJECT_ID,
+            public_model="logical-chat",
+            path="/v1/chat/completions",
+            payload={"model": "logical-chat", "messages": []},
+            request_headers={},
+            stream_requested=False,
+            client_disconnected=lambda: _false(),
+        )
+
+    assert result.status_code == 200
+    assert result.headers["x-mini-ai-accelerator-vendor"] == "huawei-ascend"
+    assert result.headers["x-mini-ai-model-variant-id"] == str(ascend_variant_id)
+    assert json.loads(result.body or b"{}")["model"] == "physical/ascend"
+    assert len(hosts) == 2
+    assert hosts[0].startswith("worker-")
+    assert hosts[1] == "ascend.test"
+
+    async with gateway_database.session() as session:
+        circuits = list(
+            await session.scalars(
+                select(VendorCircuitState).where(
+                    VendorCircuitState.logical_model_id == logical_model_id
+                )
+            )
+        )
+        audit = await session.scalar(
+            select(AuditEvent).where(AuditEvent.action == "gateway.vendor_fallback")
+        )
+        usage = list(await session.scalars(select(ServingRequestUsage)))
+    by_vendor = {item.vendor: item for item in circuits}
+    assert by_vendor["nvidia"].state == "open"
+    assert by_vendor["huawei-ascend"].state == "closed"
+    assert audit is not None
+    assert audit.details["from_variant_id"] == str(nvidia_variant_id)
+    assert audit.details["to_variant_id"] == str(ascend_variant_id)
+    assert {(item.selected_vendor, item.model_variant_id) for item in usage} == {
+        ("nvidia", nvidia_variant_id),
+        ("huawei-ascend", ascend_variant_id),
+    }
+
+
+async def test_vendor_fallback_is_bounded_to_one_alternate(
+    gateway_database: Database,
+) -> None:
+    await _ready_dual_vendor_services(gateway_database)
+    calls = 0
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ConnectError("injected backend fault", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        gateway = GatewayService(
+            gateway_database,
+            client,
+            GatewayMetrics(),
+            request_timeout=2,
+            endpoint_host_allowlist="*.test",
+            fallback_attempts=1,
+        )
+        with pytest.raises(APIError) as error:
+            await gateway.forward(
+                project_id=PROJECT_ID,
+                public_model="logical-chat",
+                path="/v1/completions",
+                payload={"model": "logical-chat", "prompt": "fault"},
+                request_headers={},
+                stream_requested=False,
+                client_disconnected=lambda: _false(),
+            )
+    assert error.value.code == "UPSTREAM_DISCONNECTED"
+    assert calls == 2
+
+
+async def test_sse_stream_start_pins_vendor_and_does_not_fallback(
+    gateway_database: Database,
+) -> None:
+    _logical_model_id, nvidia_variant_id, _ascend_variant_id = await _ready_dual_vendor_services(
+        gateway_database
+    )
+    hosts: list[str] = []
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        assert request.url.host is not None
+        hosts.append(request.url.host)
+        if request.url.host == "ascend.test":
+            return httpx.Response(200, json={"choices": []})
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=FaultAfterFirstChunkStream(request),
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        gateway = GatewayService(
+            gateway_database,
+            client,
+            GatewayMetrics(),
+            request_timeout=2,
+            endpoint_host_allowlist="*.test",
+            fallback_attempts=1,
+        )
+        result = await gateway.forward(
+            project_id=PROJECT_ID,
+            public_model="logical-chat",
+            path="/v1/chat/completions",
+            payload={"model": "logical-chat", "messages": [], "stream": True},
+            request_headers={},
+            stream_requested=True,
+            client_disconnected=lambda: _false(),
+        )
+        assert result.stream is not None
+        chunks = [chunk async for chunk in result.stream]
+
+    assert chunks == [b'data: {"choices":[{"delta":{"content":"pinned"}}]}\n\n']
+    assert len(hosts) == 1
+    assert hosts[0].startswith("worker-")
+    assert result.headers["x-mini-ai-model-variant-id"] == str(nvidia_variant_id)

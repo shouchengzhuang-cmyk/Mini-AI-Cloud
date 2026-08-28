@@ -135,6 +135,9 @@ class UsageRepository:
         project_id: uuid.UUID,
         service_id: uuid.UUID,
         replica_id: uuid.UUID | None,
+        logical_model_id: uuid.UUID | None = None,
+        model_variant_id: uuid.UUID | None = None,
+        selected_vendor: str | None = None,
         path: str,
         outcome: str,
         error_code: str | None,
@@ -183,6 +186,9 @@ class UsageRepository:
                 project_id=project_id,
                 service_id=service_id,
                 replica_id=replica_id,
+                logical_model_id=logical_model_id,
+                model_variant_id=model_variant_id,
+                selected_vendor=selected_vendor,
                 path=path,
                 outcome=normalized_outcome,
                 error_code=normalized_error,
@@ -220,6 +226,9 @@ class UsageRepository:
             project_id=project_id,
             service_id=service_id,
             replica_id=replica_id,
+            logical_model_id=logical_model_id,
+            model_variant_id=model_variant_id,
+            selected_vendor=selected_vendor,
             path=path,
             outcome=normalized_outcome,
             error_code=normalized_error,
@@ -447,6 +456,9 @@ def _same_serving_usage(
     project_id: uuid.UUID,
     service_id: uuid.UUID,
     replica_id: uuid.UUID | None,
+    logical_model_id: uuid.UUID | None = None,
+    model_variant_id: uuid.UUID | None = None,
+    selected_vendor: str | None = None,
     path: str,
     outcome: str,
     error_code: str | None,
@@ -464,6 +476,9 @@ def _same_serving_usage(
         usage.project_id == project_id
         and usage.service_id == service_id
         and usage.replica_id == replica_id
+        and usage.logical_model_id == logical_model_id
+        and usage.model_variant_id == model_variant_id
+        and usage.selected_vendor == selected_vendor
         and usage.path == path
         and usage.outcome == outcome
         and usage.error_code == error_code

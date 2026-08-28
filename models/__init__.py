@@ -19,6 +19,7 @@ from models.registry import (
     SecretVersion,
     TaskSecretBinding,
 )
+from models.routing import VendorCircuitState
 from models.scheduling import (
     GPUDevice,
     PlacementAttempt,
@@ -79,5 +80,6 @@ __all__ = [
     "TaskSecretBinding",
     "UsageLedger",
     "User",
+    "VendorCircuitState",
     "Worker",
 ]

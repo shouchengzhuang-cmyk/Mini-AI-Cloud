@@ -31,6 +31,7 @@ from core.metrics import (
     SERVICE_REQUEST_DURATION,
     SERVICE_REQUESTS,
 )
+from repositories.gateway_routing import GatewayRoute, GatewayRoutingRepository
 from repositories.services import EndpointSelection, ServiceRepository
 from repositories.usage import UsageRepository
 
@@ -177,6 +178,9 @@ class _RequestAccounting:
     path: str
     streamed: bool
     gpu_count: int
+    logical_model_id: uuid.UUID | None
+    model_variant_id: uuid.UUID | None
+    selected_vendor: str | None
     started_at: datetime
     started_monotonic: float
     tracked_in_memory: bool = False
@@ -207,6 +211,9 @@ class GatewayService:
         first_token_timeout: float | None = None,
         max_response_bytes: int = 16 * 1024 * 1024,
         endpoint_host_allowlist: str | Iterable[str] = (),
+        fallback_attempts: int = 1,
+        circuit_failure_threshold: int = 2,
+        circuit_cooldown_seconds: int = 30,
     ) -> None:
         if request_timeout <= 0:
             raise ValueError("request_timeout must be positive")
@@ -216,6 +223,12 @@ class GatewayService:
             raise ValueError("first_token_timeout must be positive")
         if max_response_bytes <= 0:
             raise ValueError("max_response_bytes must be positive")
+        if fallback_attempts not in {0, 1}:
+            raise ValueError("fallback_attempts must be zero or one")
+        if circuit_failure_threshold < 1:
+            raise ValueError("circuit_failure_threshold must be positive")
+        if circuit_cooldown_seconds < 1:
+            raise ValueError("circuit_cooldown_seconds must be positive")
         self.database = database
         self.http_client = http_client
         self.metrics = metrics
@@ -230,6 +243,9 @@ class GatewayService:
         )
         self.max_response_bytes = max_response_bytes
         self.endpoint_host_allowlist = _normalize_endpoint_allowlist(endpoint_host_allowlist)
+        self.fallback_attempts = fallback_attempts
+        self.circuit_failure_threshold = circuit_failure_threshold
+        self.circuit_cooldown_seconds = circuit_cooldown_seconds
         self.logger = get_logger("gateway")
 
     async def list_models(self, *, project_id: uuid.UUID) -> OpenAIModelList:
@@ -267,6 +283,144 @@ class GatewayService:
         stream_requested: bool,
         client_disconnected: Callable[[], Awaitable[bool]],
     ) -> GatewayForwardResult:
+        request_id = uuid.uuid4()
+        excluded_vendors: set[str] = set()
+        failed_route: GatewayRoute | None = None
+        fallback_reason: str | None = None
+        last_error: APIError | None = None
+        for attempt in range(self.fallback_attempts + 1):
+            async with self.database.session() as session, session.begin():
+                anchor, route = await GatewayRoutingRepository.choose_route(
+                    session,
+                    project_id=project_id,
+                    public_model=public_model,
+                    excluded_vendors=frozenset(excluded_vendors),
+                )
+            if anchor is None:
+                _observe_gateway_error("MODEL_NOT_FOUND")
+                raise APIError(404, "MODEL_NOT_FOUND", "The requested model service was not found")
+            if route is None:
+                if last_error is not None:
+                    raise last_error
+                unavailable_accounting = _RequestAccounting(
+                    request_id=uuid.uuid4(),
+                    project_id=project_id,
+                    service_id=anchor.id,
+                    selection=None,
+                    path=path,
+                    streamed=stream_requested,
+                    gpu_count=anchor.gpu_count,
+                    logical_model_id=anchor.logical_model_id,
+                    model_variant_id=anchor.model_variant_id,
+                    selected_vendor=anchor.selected_vendor,
+                    started_at=datetime.now(UTC),
+                    started_monotonic=time.monotonic(),
+                )
+                await self._finalize_request(
+                    unavailable_accounting,
+                    outcome="no_healthy_replica",
+                    error_code=ErrorCode.NO_HEALTHY_REPLICA.value,
+                    completed=False,
+                )
+                raise APIError(
+                    503,
+                    ErrorCode.NO_HEALTHY_REPLICA.value,
+                    "The requested model service has no healthy vendor backend",
+                    headers={"Retry-After": "1"},
+                )
+
+            try:
+                result = await self._forward_route(
+                    route=route,
+                    request_id=uuid.uuid4(),
+                    project_id=project_id,
+                    path=path,
+                    payload=payload,
+                    request_headers=request_headers,
+                    stream_requested=stream_requested,
+                    client_disconnected=client_disconnected,
+                )
+            except APIError as exc:
+                await self._record_route_outcome(
+                    route=route,
+                    project_id=project_id,
+                    success=False,
+                    error_code=exc.code,
+                )
+                if attempt >= self.fallback_attempts or not _is_fallback_error(exc.code):
+                    raise
+                if route.selected_vendor is None:
+                    raise
+                excluded_vendors.add(route.selected_vendor)
+                failed_route = route
+                fallback_reason = exc.code
+                last_error = exc
+                continue
+
+            if result.status_code >= 500 and attempt < self.fallback_attempts:
+                await self._record_route_outcome(
+                    route=route,
+                    project_id=project_id,
+                    success=False,
+                    error_code="UPSTREAM_HTTP_5XX",
+                )
+                if route.selected_vendor is not None:
+                    excluded_vendors.add(route.selected_vendor)
+                    failed_route = route
+                    fallback_reason = "UPSTREAM_HTTP_5XX"
+                    continue
+
+            await self._record_route_outcome(
+                route=route,
+                project_id=project_id,
+                success=result.status_code < 500,
+                error_code=None if result.status_code < 500 else "UPSTREAM_HTTP_5XX",
+            )
+            if failed_route is not None and fallback_reason is not None:
+                async with self.database.session() as session, session.begin():
+                    await GatewayRoutingRepository.record_fallback(
+                        session,
+                        project_id=project_id,
+                        request_id=request_id,
+                        from_route=failed_route,
+                        to_route=route,
+                        reason=fallback_reason,
+                    )
+            return result
+        assert last_error is not None
+        raise last_error
+
+    async def _record_route_outcome(
+        self,
+        *,
+        route: GatewayRoute,
+        project_id: uuid.UUID,
+        success: bool,
+        error_code: str | None,
+    ) -> None:
+        async with self.database.session() as session, session.begin():
+            await GatewayRoutingRepository.record_outcome(
+                session,
+                route=route,
+                project_id=project_id,
+                success=success,
+                error_code=error_code,
+                failure_threshold=self.circuit_failure_threshold,
+                cooldown_seconds=self.circuit_cooldown_seconds,
+            )
+
+    async def _forward_route(
+        self,
+        *,
+        route: GatewayRoute,
+        request_id: uuid.UUID,
+        project_id: uuid.UUID,
+        path: str,
+        payload: Mapping[str, Any],
+        request_headers: Mapping[str, str],
+        stream_requested: bool,
+        client_disconnected: Callable[[], Awaitable[bool]],
+    ) -> GatewayForwardResult:
         if path not in {"/v1/chat/completions", "/v1/completions"}:
             raise ValueError("unsupported gateway upstream path")
         started_monotonic = time.monotonic()
@@ -276,51 +430,25 @@ class GatewayService:
             overall_deadline,
             started_monotonic + self.first_token_timeout,
         )
-        async with self.database.session() as session, session.begin():
-            service = await ServiceRepository.get_by_name(
-                session,
-                project_id=project_id,
-                name=public_model,
-                for_update=True,
-            )
-            if service is None:
-                _observe_gateway_error("MODEL_NOT_FOUND")
-                _observe_gateway("model_not_found", started_monotonic)
-                raise APIError(404, "MODEL_NOT_FOUND", "The requested model service was not found")
-            selection = await ServiceRepository.choose_healthy_endpoint(
-                session,
-                service_id=service.id,
-                project_id=project_id,
-            )
-            service_id = service.id
-            upstream_model = service.model
-            gpu_count = service.gpu_count
+        selection = route.selection
+        service_id = route.service_id
+        upstream_model = route.upstream_model
+        gpu_count = route.gpu_count
 
         accounting = _RequestAccounting(
-            request_id=uuid.uuid4(),
+            request_id=request_id,
             project_id=project_id,
             service_id=service_id,
             selection=selection,
             path=path,
             streamed=stream_requested,
             gpu_count=gpu_count,
+            logical_model_id=route.logical_model_id,
+            model_variant_id=route.model_variant_id,
+            selected_vendor=route.selected_vendor,
             started_at=started_at,
             started_monotonic=started_monotonic,
         )
-        if selection is None:
-            await self._finalize_request(
-                accounting,
-                outcome="no_healthy_replica",
-                error_code=ErrorCode.NO_HEALTHY_REPLICA.value,
-                completed=False,
-            )
-            raise APIError(
-                503,
-                ErrorCode.NO_HEALTHY_REPLICA.value,
-                "The requested model service has no healthy replicas",
-                headers={"Retry-After": "1"},
-            )
-
         try:
             await self.metrics.request_started(service_id, selection.replica_id)
             accounting.tracked_in_memory = True
@@ -462,6 +590,10 @@ class GatewayService:
 
         response_headers = _forward_response_headers(upstream.headers)
         response_headers["x-mini-ai-replica-id"] = str(selection.replica_id)
+        if route.model_variant_id is not None:
+            response_headers["x-mini-ai-model-variant-id"] = str(route.model_variant_id)
+        if route.selected_vendor is not None:
+            response_headers["x-mini-ai-accelerator-vendor"] = route.selected_vendor
         is_sse = upstream.headers.get("content-type", "").lower().startswith("text/event-stream")
         if stream_requested and upstream.is_success and is_sse:
             iterator = upstream.aiter_bytes().__aiter__()
@@ -890,6 +1022,9 @@ class GatewayService:
                         if accounting.selection is not None
                         else None
                     ),
+                    logical_model_id=accounting.logical_model_id,
+                    model_variant_id=accounting.model_variant_id,
+                    selected_vendor=accounting.selected_vendor,
                     path=accounting.path,
                     outcome=outcome,
                     error_code=error_code,
@@ -1169,6 +1304,14 @@ def _observe_gateway(outcome: str, started_at: float) -> None:
     GATEWAY_DURATION.observe(duration)
     SERVICE_REQUESTS.labels(outcome).inc()
     SERVICE_REQUEST_DURATION.observe(duration)
+
+
+def _is_fallback_error(code: str) -> bool:
+    return code in {
+        ErrorCode.UPSTREAM_CONNECT_TIMEOUT.value,
+        ErrorCode.INFERENCE_REQUEST_TIMEOUT.value,
+        ErrorCode.UPSTREAM_DISCONNECTED.value,
+    }
 
 
 def _observe_gateway_error(code: str) -> None:
