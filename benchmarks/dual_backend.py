@@ -11,17 +11,19 @@ import uuid
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
 SUPPORTED_VENDORS = frozenset({"nvidia", "huawei-ascend"})
+PromptMatchMode = Literal["contains", "exact"]
 
 
 @dataclass(frozen=True, slots=True)
 class PromptCase:
     id: str
     messages: list[dict[str, str]]
+    match: PromptMatchMode
     expected_any: list[str]
     max_tokens: int
 
@@ -171,15 +173,16 @@ async def run_benchmark(
                             )
             if phase == "warmup":
                 await asyncio.sleep(0)
-        fallback = await _run_fallback_drill(client, config)
+        fallback = {
+            "status": "NOT_RUN",
+            "reason": "fallback drill requires a separate fallback-only phase",
+        }
     finally:
         if owns_client:
             await client.aclose()
 
     measured = [item for item in observations if item.phase == "measured"]
     complete = bool(measured) and all(item.ok for item in measured)
-    if config.fallback_drill.enabled:
-        complete = complete and fallback["status"] == "PASS"
     return {
         "schema_version": "1.0.0",
         "run_status": "RUN_COMPLETED_UNVERIFIED" if complete else "RUN_FAILED",
@@ -203,6 +206,48 @@ async def run_benchmark(
         "limitations": [
             "HTTP success does not prove the declared physical hardware identity.",
             "Results cover only this bounded prompt set and sample count.",
+            "evidence_status remains REAL_HW_NOT_RUN pending diagnostics and review.",
+        ],
+    }
+
+
+async def run_fallback_drill(
+    config: BenchmarkConfig,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    started_at = datetime.now(UTC)
+    run_id = str(uuid.uuid4())
+    owns_client = client is None
+    if client is None:
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(config.timeout_seconds),
+            follow_redirects=False,
+            trust_env=False,
+        )
+    try:
+        if config.fallback_drill.enabled:
+            fallback = await _run_fallback_drill(client, config)
+        else:
+            fallback = {"status": "NOT_RUN", "reason": "disabled in benchmark config"}
+    finally:
+        if owns_client:
+            await client.aclose()
+
+    return {
+        "schema_version": "1.0.0",
+        "run_status": "RUN_COMPLETED_UNVERIFIED" if fallback["status"] == "PASS" else "RUN_FAILED",
+        "evidence_status": "REAL_HW_NOT_RUN",
+        "run_id": run_id,
+        "started_at": started_at.isoformat(),
+        "finished_at": datetime.now(UTC).isoformat(),
+        "observations": [],
+        "measured_summary": [],
+        "fallback_drill": fallback,
+        "limitations": [
+            "Fallback drill only validates routing when synthetic primary fault "
+            "is injected externally.",
+            "It never changes cluster/state of any backend.",
             "evidence_status remains REAL_HW_NOT_RUN pending diagnostics and review.",
         ],
     }
@@ -251,9 +296,9 @@ async def _observe(
                 if "application/json" not in content_type:
                     errors.append("protocol:expected_json")
                 body = await response.aread()
-                if body and ttft is None:
-                    ttft = max(0.0, time.monotonic() - started)
                 content, usage, body_errors = _read_buffered(body)
+                if ttft is None and content.strip():
+                    ttft = max(0.0, time.monotonic() - started)
                 errors.extend(body_errors)
     except (httpx.HTTPError, TimeoutError) as exc:
         errors.append(f"transport:{type(exc).__name__}")
@@ -293,8 +338,6 @@ async def _read_sse(
         if data == "[DONE]":
             done = True
             break
-        if ttft is None:
-            ttft = max(0.0, time.monotonic() - started)
         try:
             event = json.loads(data)
         except json.JSONDecodeError:
@@ -307,6 +350,8 @@ async def _read_sse(
             if isinstance(choice, dict):
                 delta = choice.get("delta")
                 if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+                    if ttft is None and delta["content"].strip():
+                        ttft = max(0.0, time.monotonic() - started)
                     content_parts.append(delta["content"])
         if isinstance(event.get("usage"), dict):
             usage = event["usage"]
@@ -334,12 +379,20 @@ def _read_buffered(body: bytes) -> tuple[str, dict[str, int] | None, list[str]]:
 
 
 def _semantic_errors(content: str, prompt: PromptCase) -> list[str]:
-    normalized = " ".join(content.lower().split())
+    normalized = _normalize_response(content)
     if not normalized:
         return ["semantic:empty_content"]
-    if not any(expected.lower() in normalized for expected in prompt.expected_any):
+    expected_values = {_normalize_response(item) for item in prompt.expected_any}
+    if prompt.match == "exact":
+        if normalized not in expected_values:
+            return ["semantic:exact_match_failed"]
+    elif not any(expected in normalized for expected in expected_values):
         return ["semantic:expected_sentinel_missing"]
     return []
+
+
+def _normalize_response(value: str) -> str:
+    return " ".join(value.lower().split())
 
 
 def _usage_errors(usage: dict[str, Any] | None) -> list[str]:
@@ -472,6 +525,7 @@ def _prompt(value: object) -> PromptCase:
         raise ValueError("expected_any must be a non-empty string list")
     return PromptCase(
         id=_required_string(value, "id"),
+        match=_prompt_match(value),
         messages=normalized_messages,
         expected_any=list(expected),
         max_tokens=_positive_int(value, "max_tokens"),
@@ -499,6 +553,18 @@ def _vendor(value: dict[str, Any], key: str) -> str:
     return vendor
 
 
+def _prompt_match(value: dict[str, Any]) -> PromptMatchMode:
+    mode = value.get("match", "contains")
+    if not isinstance(mode, str):
+        raise ValueError("match must be contains or exact")
+    mode = mode.strip().lower()
+    if mode == "contains":
+        return "contains"
+    if mode == "exact":
+        return "exact"
+    raise ValueError("match must be contains or exact")
+
+
 def _positive_int(value: dict[str, Any], key: str) -> int:
     item = value.get(key)
     if isinstance(item, bool) or not isinstance(item, int) or item < 1:
@@ -524,8 +590,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Benchmark NVIDIA and Huawei Ascend backends")
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--fallback-only",
+        action="store_true",
+        help="Run only fallback drill phase for an already-completed baseline run.",
+    )
     args = parser.parse_args(argv)
-    report = asyncio.run(run_benchmark(load_config(args.config.resolve())))
+    config = load_config(args.config.resolve())
+    if args.fallback_only:
+        report = asyncio.run(run_fallback_drill(config))
+    else:
+        report = asyncio.run(run_benchmark(config))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"Wrote {report['run_status']} report to {args.output}")

@@ -3,18 +3,21 @@
   "prompts": [
     {
       "id": "exact-capital",
+      "match": "exact",
       "messages": [{"role": "user", "content": "Reply with exactly: Paris"}],
       "expected_any": ["paris"],
       "max_tokens": 8
     },
     {
       "id": "exact-arithmetic",
+      "match": "exact",
       "messages": [{"role": "user", "content": "Reply with exactly the integer result of 17 + 25."}],
       "expected_any": ["42"],
       "max_tokens": 8
     },
     {
       "id": "stream-sentinel",
+      "match": "exact",
       "messages": [{"role": "user", "content": "Reply with exactly: dual-stack-ok"}],
       "expected_any": ["dual-stack-ok"],
       "max_tokens": 12
