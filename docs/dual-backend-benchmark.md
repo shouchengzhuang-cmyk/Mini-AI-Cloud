@@ -26,16 +26,43 @@ iteration, protocol and semantic validation pass, streaming reaches `[DONE]`, an
 is non-negative and internally consistent. Warmup failures remain visible but never enter measured
 latency statistics.
 
+For checkpoint safety, use fallback drill as a separate phase:
+
+```bash
+# Phase 1: baseline benchmark (no fallback drill)
+uv run python -m benchmarks.dual_backend \
+  --config /path/to/dual-backend.json \
+  --output /path/to/baseline-report.json
+
+# Operator injects fault between phases (external, manual process)
+
+# Phase 2: fallback drill only
+uv run python -m benchmarks.dual_backend \
+  --fallback-only \
+  --config /path/to/dual-backend.json \
+  --output /path/to/fallback-report.json
+```
+
 ## Stability and fallback drills
 
 Measured repetitions form the bounded stability drill. The report includes success counts and
 p50/p95 latency per backend and mode; it does not extrapolate beyond that sample.
 
-Fallback drilling is opt-in. Before starting the harness, the operator must use an independently
-approved test mechanism to make the configured primary vendor unavailable. The harness only sends
-logical-model requests and checks the immutable routing headers. It never disables a backend,
-changes cluster state, deploys, or allocates paid resources. Restore the primary independently,
-then retain both the fault-injection record and harness output.
+Fallback drilling is opt-in and manual. The harness never disables a backend, changes cluster state,
+deploys, or allocates paid resources.
+
+`--fallback-only` sends only logical-model requests to verify fallback routing against a
+pre-injected fault state. Restore the primary independently, and retain both fault-injection
+record and harness output.
+
+## Prompt matching semantics
+
+Prompt matching supports:
+
+- `match: exact` — normalized full-content equality is required.
+- `match: contains` (default) — any configured expected token can appear anywhere.
+
+Normalization is lower-case and whitespace-normalized for both modes.
 
 ## Evidence boundary
 
