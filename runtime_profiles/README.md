@@ -58,9 +58,9 @@ digest exceeds the label value limit. Ready accelerator Pods may emit an observe
 allocation callback. The callback reports the device-plugin-owned resource and count but
 does not invent physical device IDs that the standard Pod API did not expose.
 
-The example profiles remain non-deployable after rendering support. The current Fake
-Kubernetes controller does not select them automatically; A7/A8 must provide independently
-validated runtime profiles and execution wiring.
+The example profiles remain non-deployable. The formal `2.0.0` profiles are independently
+validated vendor contracts, but the current Fake Kubernetes controller does not select them
+automatically; vendor-aware admission and selection remain an A9 responsibility.
 
 ## Ascend A2 profile
 
@@ -94,13 +94,21 @@ uv run python scripts/ascend_runtime_acceptance.py accept \
   --base-url http://runtime.example.invalid:8000 --model /models/example
 ```
 
+## NVIDIA profile
+
+The production-candidate NVIDIA contract is `nvidia-vllm-k8s@2.0.0`. Its pinned image,
+GFD constraints, fake Device Plugin scope, diagnostics, and real engine acceptance entry
+are documented in [`docs/nvidia-runtime.md`](../docs/nvidia-runtime.md). Its status remains
+`REAL_HW_NOT_RUN` until the real-hardware command completes and immutable evidence is
+reviewed.
+
 ## Compatibility metadata
 
 `python: profile-owned` keeps runtime Python independent of the control-plane interpreter.
 The runtime image must pin vLLM and its vendor plugin. Driver and toolkit versions are
 host/runtime observations and must be recorded with evidence instead of guessed in an
-example. A7 and A8 are responsible for replacing the placeholder images and binding exact
-version matrices to real NVIDIA and Ascend evidence.
+example. Each formal vendor profile binds its exact compatibility matrix and keeps real
+NVIDIA and Ascend execution evidence separate from static validation.
 
 The Kubernetes resource name, RuntimeClass, node selector, tolerations, and accelerator
 families remain profile data. They are examples here, not hard-coded platform facts.

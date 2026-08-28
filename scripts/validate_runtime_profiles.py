@@ -20,7 +20,7 @@ class ManifestEntry(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     identity: str = Field(min_length=1)
-    path: str = Field(pattern=r"^runtime_profiles/[a-z0-9-]+\.example\.yaml$")
+    path: str = Field(pattern=r"^runtime_profiles/[a-z0-9-]+(?:\.example)?\.yaml$")
     semantic_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
 
 
@@ -50,9 +50,9 @@ def load_profile(path: Path) -> RuntimeProfile:
 
 def load_profiles(repository_root: Path) -> tuple[LoadedRuntimeProfile, ...]:
     profile_root = _runtime_profile_root(repository_root)
-    paths = sorted(profile_root.glob("*.example.yaml"))
+    paths = sorted(profile_root.glob("*.yaml"))
     if not paths:
-        raise RuntimeProfileContractError("no runtime profile examples found")
+        raise RuntimeProfileContractError("no runtime profiles found")
 
     profiles = tuple(LoadedRuntimeProfile(path=path, profile=load_profile(path)) for path in paths)
     identities = [loaded.profile.identity for loaded in profiles]
@@ -125,7 +125,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.write_generated:
         write_generated_files(profiles, repository_root)
     validate_generated_files(profiles, repository_root)
-    print(f"Validated {len(profiles)} immutable runtime profile examples.")
+    print(f"Validated {len(profiles)} immutable runtime profiles.")
 
 
 if __name__ == "__main__":

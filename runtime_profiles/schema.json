@@ -101,6 +101,44 @@
       "title": "KubernetesDeviceVisibility",
       "type": "object"
     },
+    "KubernetesNodeSelectorRequirement": {
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "maxLength": 253,
+          "minLength": 1,
+          "title": "Key",
+          "type": "string"
+        },
+        "operator": {
+          "enum": [
+            "In",
+            "NotIn",
+            "Exists",
+            "DoesNotExist",
+            "Gt",
+            "Lt"
+          ],
+          "title": "Operator",
+          "type": "string"
+        },
+        "values": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "title": "Values",
+          "type": "array"
+        }
+      },
+      "required": [
+        "key",
+        "operator"
+      ],
+      "title": "KubernetesNodeSelectorRequirement",
+      "type": "object"
+    },
     "KubernetesRuntime": {
       "additionalProperties": false,
       "properties": {
@@ -114,6 +152,15 @@
             }
           ],
           "default": null
+        },
+        "node_affinity": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/KubernetesNodeSelectorRequirement"
+          },
+          "maxItems": 32,
+          "title": "Node Affinity",
+          "type": "array"
         },
         "node_selector": {
           "additionalProperties": {
