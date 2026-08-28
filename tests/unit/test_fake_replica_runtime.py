@@ -108,6 +108,7 @@ async def _wait_for_process_exit(process: asyncio.subprocess.Process) -> int:
     def poll() -> int:
         deadline = time.monotonic() + 3
         stat_path = Path(f"/proc/{process.pid}/stat")
+        cmdline_path = Path(f"/proc/{process.pid}/cmdline")
         while time.monotonic() < deadline:
             if process.returncode is not None:
                 return process.returncode
@@ -116,6 +117,15 @@ async def _wait_for_process_exit(process: asyncio.subprocess.Process) -> int:
             except (FileNotFoundError, ProcessLookupError):
                 return 0
             if state == "Z":
+                return 0
+            try:
+                command = cmdline_path.read_bytes().replace(b"\0", b" ")
+            except (FileNotFoundError, ProcessLookupError):
+                return 0
+            if b"fake_inference.py" not in command:
+                # psutil may reap the child before asyncio's watcher resolves;
+                # under a busy full suite the kernel can immediately reuse the
+                # PID. A different command at this PID is the same exit signal.
                 return 0
             time.sleep(0.01)
         raise TimeoutError("fake inference process did not exit")

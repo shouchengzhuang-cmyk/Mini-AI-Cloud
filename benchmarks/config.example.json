@@ -1,0 +1,32 @@
+{
+  "schema_version": "1.0.0",
+  "warmup_iterations": 2,
+  "measured_iterations": 5,
+  "timeout_seconds": 120,
+  "prompt_set": "prompts.json",
+  "endpoints": [
+    {
+      "name": "nvidia",
+      "vendor": "nvidia",
+      "base_url": "http://nvidia-vllm.example:8000",
+      "model": "physical-nvidia-model",
+      "api_key_env": "NVIDIA_BENCHMARK_API_KEY"
+    },
+    {
+      "name": "ascend",
+      "vendor": "huawei-ascend",
+      "base_url": "http://ascend-vllm.example:8000",
+      "model": "physical-ascend-model",
+      "api_key_env": "ASCEND_BENCHMARK_API_KEY"
+    }
+  ],
+  "fallback_drill": {
+    "enabled": false,
+    "base_url": "http://mini-ai-cloud.example:8000",
+    "model": "logical-model-name",
+    "api_key_env": "MINI_CLOUD_BENCHMARK_API_KEY",
+    "expected_primary_vendor": "nvidia",
+    "expected_fallback_vendor": "huawei-ascend",
+    "requests": 3
+  }
+}
