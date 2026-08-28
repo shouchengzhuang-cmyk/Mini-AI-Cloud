@@ -8,7 +8,12 @@ from typing import Any
 from kubernetes_asyncio import client, config
 from kubernetes_asyncio.client.exceptions import ApiException
 
-from core.enums import ErrorCategory, ErrorCode
+from core.enums import AllocationAuthority, ErrorCategory, ErrorCode
+from core.runtime_profiles import (
+    RuntimeProfile,
+    RuntimeProfileCatalog,
+    RuntimeProfileCompatibilityError,
+)
 from worker.runtime import ExecutionSpec, RuntimeFailure, RuntimeHandle, RuntimeLog
 
 TASK_ID_LABEL = "mini-ai-cloud/task-id"
@@ -17,6 +22,14 @@ EXECUTION_ID_LABEL = "mini-ai-cloud/execution-id"
 WORKER_ID_LABEL = "mini-ai-cloud/worker-id"
 MANAGED_LABEL = "mini-ai-cloud/managed"
 RESOURCE_KIND_LABEL = "mini-ai-cloud/resource-kind"
+ACCELERATOR_VENDOR_LABEL = "mini-ai-cloud/accelerator-vendor"
+ACCELERATOR_KIND_LABEL = "mini-ai-cloud/accelerator-kind"
+RUNTIME_PROFILE_ID_LABEL = "mini-ai-cloud/runtime-profile-id"
+RUNTIME_PROFILE_VERSION_LABEL = "mini-ai-cloud/runtime-profile-version"
+RUNTIME_PROFILE_DIGEST_ANNOTATION = "mini-ai-cloud/runtime-profile-digest"
+ACCELERATOR_RESOURCE_ANNOTATION = "mini-ai-cloud/accelerator-resource"
+ACCELERATOR_COUNT_ANNOTATION = "mini-ai-cloud/accelerator-count"
+ALLOCATION_AUTHORITY_ANNOTATION = "mini-ai-cloud/allocation-authority"
 NETWORK_POLICY_RESOURCE_KIND = "task-deny-all"
 _LEGACY_PROJECT_ID = uuid.UUID(int=0)
 
@@ -78,6 +91,7 @@ class KubernetesRuntime:
         poll_interval: float = 0.25,
         api: Any | None = None,
         networking_api: Any | None = None,
+        runtime_profile_catalog: RuntimeProfileCatalog | None = None,
     ) -> None:
         if not namespace.strip():
             raise ValueError("namespace must not be blank")
@@ -96,6 +110,7 @@ class KubernetesRuntime:
         self._api = api
         self._networking_api = networking_api
         self._owns_api = api is None
+        self.runtime_profile_catalog = runtime_profile_catalog
         self._client_lock = asyncio.Lock()
         self._network_policy_labels: dict[str, dict[str, str]] = {}
 
@@ -422,13 +437,17 @@ class KubernetesRuntime:
             )
 
     def _build_pod(self, spec: ExecutionSpec) -> client.V1Pod:
+        profile = self._resolve_runtime_profile(spec)
         resources: dict[str, str] = {
             "cpu": f"{max(1, round(spec.cpu_limit * 1000))}m",
             "memory": f"{spec.memory_limit_mb}Mi",
         }
-        if spec.gpu_count > 0:
+        if profile is not None:
+            resources[profile.kubernetes.resource_name] = str(spec.gpu_count)
+        elif spec.gpu_count > 0:
             resources["nvidia.com/gpu"] = str(spec.gpu_count)
         labels = self._execution_labels(spec)
+        annotations = self._profile_annotations(spec, profile)
         volumes: list[client.V1Volume] = []
         volume_mounts: list[client.V1VolumeMount] = []
         container_paths: set[str] = set()
@@ -467,14 +486,65 @@ class KubernetesRuntime:
                     read_only=mount.read_only,
                 )
             )
+        environment = [
+            client.V1EnvVar(name=name, value=value)
+            for name, value in sorted(spec.environment.items())
+        ]
+        if profile is not None and profile.kubernetes.device_visibility is not None:
+            visibility = profile.kubernetes.device_visibility
+            environment.append(
+                client.V1EnvVar(
+                    name=visibility.environment_name,
+                    value_from=client.V1EnvVarSource(
+                        field_ref=client.V1ObjectFieldSelector(
+                            api_version="v1",
+                            field_path=(
+                                f"metadata.annotations['{visibility.annotation_key}']"
+                            ),
+                        )
+                    ),
+                )
+            )
+        affinity: client.V1Affinity | None = None
+        tolerations: list[client.V1Toleration] | None = None
+        if profile is not None:
+            if profile.kubernetes.node_affinity:
+                affinity = client.V1Affinity(
+                    node_affinity=client.V1NodeAffinity(
+                        required_during_scheduling_ignored_during_execution=client.V1NodeSelector(
+                            node_selector_terms=[
+                                client.V1NodeSelectorTerm(
+                                    match_expressions=[
+                                        client.V1NodeSelectorRequirement(
+                                            key=requirement.key,
+                                            operator=requirement.operator,
+                                            values=(
+                                                list(requirement.values)
+                                                if requirement.values
+                                                else None
+                                            ),
+                                        )
+                                        for requirement in profile.kubernetes.node_affinity
+                                    ]
+                                )
+                            ]
+                        )
+                    )
+                )
+            tolerations = [
+                client.V1Toleration(
+                    key=item.key,
+                    operator=item.operator,
+                    value=item.value,
+                    effect=item.effect,
+                )
+                for item in profile.kubernetes.tolerations
+            ]
         container = client.V1Container(
             name="task",
             image=spec.image,
             command=list(spec.command),
-            env=[
-                client.V1EnvVar(name=name, value=value)
-                for name, value in sorted(spec.environment.items())
-            ],
+            env=environment,
             resources=client.V1ResourceRequirements(
                 requests=dict(resources),
                 limits=dict(resources),
@@ -491,13 +561,24 @@ class KubernetesRuntime:
             metadata=client.V1ObjectMeta(
                 name=self.pod_name(spec.task_id, spec.execution_id),
                 labels=labels,
+                annotations=annotations or None,
             ),
             spec=client.V1PodSpec(
+                affinity=affinity,
                 automount_service_account_token=False,
                 active_deadline_seconds=max(1, spec.timeout_seconds),
                 containers=[container],
                 node_name=self.node_name,
+                node_selector=(
+                    dict(profile.kubernetes.node_selector) if profile is not None else None
+                ),
                 restart_policy="Never",
+                runtime_class_name=(
+                    profile.kubernetes.runtime_class_name if profile is not None else None
+                ),
+                scheduler_name=(
+                    profile.kubernetes.scheduler_name if profile is not None else None
+                ),
                 security_context=client.V1PodSecurityContext(
                     run_as_non_root=True,
                     # Official Python and Alpine images do not declare USER. An
@@ -507,6 +588,7 @@ class KubernetesRuntime:
                     run_as_group=65532,
                     seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
                 ),
+                tolerations=tolerations,
                 volumes=volumes or None,
             ),
         )
@@ -525,15 +607,86 @@ class KubernetesRuntime:
                 "refusing to adopt Pod with mismatched execution labels: "
                 f"{self.pod_name(spec.task_id, spec.execution_id)}"
             )
+        profile = self._resolve_runtime_profile(spec)
+        expected_annotations = self._profile_annotations(spec, profile)
+        annotations = getattr(metadata, "annotations", None) or {}
+        if any(annotations.get(key) != value for key, value in expected_annotations.items()):
+            raise KubernetesRuntimeError(
+                "refusing to adopt Pod with mismatched accelerator profile annotations: "
+                f"{self.pod_name(spec.task_id, spec.execution_id)}"
+            )
 
     @staticmethod
     def _execution_labels(spec: ExecutionSpec) -> dict[str, str]:
-        return {
+        labels = {
             TASK_ID_LABEL: str(spec.task_id),
             PROJECT_ID_LABEL: str(spec.project_id or _LEGACY_PROJECT_ID),
             EXECUTION_ID_LABEL: str(spec.execution_id),
             WORKER_ID_LABEL: spec.worker_id,
             MANAGED_LABEL: "true",
+        }
+        if spec.selected_vendor is not None:
+            labels[ACCELERATOR_VENDOR_LABEL] = spec.selected_vendor
+        if spec.selected_kind is not None:
+            labels[ACCELERATOR_KIND_LABEL] = spec.selected_kind
+        if spec.runtime_profile_id is not None:
+            labels[RUNTIME_PROFILE_ID_LABEL] = spec.runtime_profile_id
+        if spec.runtime_profile_version is not None:
+            labels[RUNTIME_PROFILE_VERSION_LABEL] = spec.runtime_profile_version
+        return labels
+
+    def _resolve_runtime_profile(self, spec: ExecutionSpec) -> RuntimeProfile | None:
+        snapshot = (
+            spec.selected_vendor,
+            spec.selected_kind,
+            spec.runtime_profile_id,
+            spec.runtime_profile_version,
+            spec.runtime_profile_digest,
+            spec.allocation_authority,
+        )
+        if not any(value is not None for value in snapshot):
+            return None
+        if spec.gpu_count <= 0 or not all(value is not None for value in snapshot):
+            raise KubernetesGpuUnavailable("incomplete Kubernetes accelerator snapshot")
+        if spec.allocation_authority != AllocationAuthority.KUBERNETES_DEVICE_PLUGIN.value:
+            raise KubernetesGpuUnavailable(
+                "vendor-aware Kubernetes tasks require kubernetes_device_plugin authority"
+            )
+        if self.runtime_profile_catalog is None:
+            raise KubernetesGpuUnavailable("runtime profile catalog is unavailable")
+        assert spec.runtime_profile_id is not None
+        assert spec.runtime_profile_version is not None
+        assert spec.runtime_profile_digest is not None
+        try:
+            profile = self.runtime_profile_catalog.load_exact(
+                profile_id=spec.runtime_profile_id,
+                profile_version=spec.runtime_profile_version,
+                semantic_digest=spec.runtime_profile_digest,
+            )
+        except RuntimeProfileCompatibilityError as exc:
+            raise KubernetesGpuUnavailable(f"runtime profile is unavailable: {exc}") from exc
+        if (
+            profile.vendor.value != spec.selected_vendor
+            or profile.kind.value != spec.selected_kind
+            or profile.allocation_authority.value != spec.allocation_authority
+        ):
+            raise KubernetesGpuUnavailable(
+                "runtime profile does not match the immutable accelerator snapshot"
+            )
+        return profile
+
+    @staticmethod
+    def _profile_annotations(
+        spec: ExecutionSpec,
+        profile: RuntimeProfile | None,
+    ) -> dict[str, str]:
+        if profile is None:
+            return {}
+        return {
+            RUNTIME_PROFILE_DIGEST_ANNOTATION: profile.semantic_digest(),
+            ACCELERATOR_RESOURCE_ANNOTATION: profile.kubernetes.resource_name,
+            ACCELERATOR_COUNT_ANNOTATION: str(spec.gpu_count),
+            ALLOCATION_AUTHORITY_ANNOTATION: profile.allocation_authority.value,
         }
 
     def _validate_handle(self, handle: RuntimeHandle) -> None:

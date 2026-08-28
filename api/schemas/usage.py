@@ -15,10 +15,18 @@ class ProjectQuotaUpdate(RequestModel):
     max_cpu_millicores: StrictInt | None = Field(default=None, ge=0, le=2_147_483_647)
     max_memory_mb: StrictInt | None = Field(default=None, ge=0, le=2_147_483_647)
     max_gpus: StrictInt | None = Field(default=None, ge=0, le=1_000_000)
+    max_nvidia_gpus: StrictInt | None = Field(default=None, ge=0, le=1_000_000)
+    max_ascend_npus: StrictInt | None = Field(default=0, ge=0, le=1_000_000)
     max_services: StrictInt | None = Field(default=None, ge=0, le=1_000_000)
     max_service_replicas: StrictInt | None = Field(default=None, ge=0, le=1_000_000)
     max_artifact_bytes: StrictInt | None = Field(default=None, ge=0, le=9_223_372_036_854_775_807)
     daily_cost_limit: Decimal | None = Field(default=None, ge=0, le=_MAX_COST)
+
+    @model_validator(mode="after")
+    def preserve_legacy_gpu_quota_semantics(self) -> "ProjectQuotaUpdate":
+        if "max_nvidia_gpus" not in self.model_fields_set:
+            self.max_nvidia_gpus = self.max_gpus
+        return self
 
 
 class ProjectQuotaLimitsResponse(ResponseModel):
@@ -27,6 +35,8 @@ class ProjectQuotaLimitsResponse(ResponseModel):
     max_cpu_millicores: int | None = Field(ge=0)
     max_memory_mb: int | None = Field(ge=0)
     max_gpus: int | None = Field(ge=0)
+    max_nvidia_gpus: int | None = Field(ge=0)
+    max_ascend_npus: int | None = Field(ge=0)
     max_services: int | None = Field(ge=0)
     max_service_replicas: int | None = Field(ge=0)
     max_artifact_bytes: int | None = Field(ge=0)
@@ -41,11 +51,15 @@ class ProjectQuotaStateResponse(ResponseModel):
     reserved_cpu_millicores: int = Field(ge=0)
     reserved_memory_mb: int = Field(ge=0)
     reserved_gpus: int = Field(ge=0)
+    reserved_nvidia_gpus: int = Field(ge=0)
+    reserved_ascend_npus: int = Field(ge=0)
     service_count: int = Field(ge=0)
     service_replicas: int = Field(ge=0)
     service_reserved_cpu_millicores: int = Field(ge=0)
     service_reserved_memory_mb: int = Field(ge=0)
     service_reserved_gpus: int = Field(ge=0)
+    service_reserved_nvidia_gpus: int = Field(ge=0)
+    service_reserved_ascend_npus: int = Field(ge=0)
     artifact_bytes: int = Field(ge=0)
     accounting_date: date
     daily_reserved_cost: Decimal = Field(ge=0)

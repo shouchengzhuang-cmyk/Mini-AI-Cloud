@@ -71,6 +71,9 @@ async def _variant(
     kind: AcceleratorKind,
     profile_id: str,
     artifact_digest: str,
+    profile_version: str = "1.0.0",
+    profile_digest: str = "sha256:" + "c" * 64,
+    status: ModelAvailabilityStatus = ModelAvailabilityStatus.READY,
 ) -> uuid.UUID:
     async with database.session() as session, session.begin():
         variant = await ModelVariantRepository.create(
@@ -81,15 +84,15 @@ async def _variant(
             vendor=vendor,
             kind=kind,
             runtime_profile_id=profile_id,
-            runtime_profile_version="1.0.0",
-            runtime_profile_digest="sha256:" + "c" * 64,
+            runtime_profile_version=profile_version,
+            runtime_profile_digest=profile_digest,
             artifact_source=f"modelscope/{name}",
             artifact_revision=f"{name}-revision",
             artifact_digest=artifact_digest,
             architecture="qwen2",
             dtype="bfloat16",
             quantization=None,
-            status=ModelAvailabilityStatus.READY,
+            status=status,
             status_reason=None,
             metadata={},
             created_by_user_id=None,
@@ -228,3 +231,274 @@ async def test_profile_deletion_guard_counts_all_variant_references(
             profile_id="nvidia-vllm-k8s",
             profile_version="2.0.0",
         )
+
+
+async def test_ready_candidates_filter_and_sort_deterministically(
+    variant_database: Database,
+) -> None:
+    project_id = await _project(variant_database)
+    async with variant_database.session() as session, session.begin():
+        model = await LogicalModelRepository.create(
+            session,
+            project_id=project_id,
+            name="admission-model",
+            public_name="Admission Model",
+            description=None,
+            metadata={},
+            created_by_user_id=None,
+        )
+        model_id = model.id
+
+    await _variant(
+        variant_database,
+        project_id=project_id,
+        logical_model_id=model_id,
+        name="z-ascend",
+        vendor=AcceleratorVendor.HUAWEI_ASCEND,
+        kind=AcceleratorKind.NPU,
+        profile_id="ascend-vllm-k8s-a2",
+        artifact_digest="sha256:" + "1" * 64,
+    )
+    await _variant(
+        variant_database,
+        project_id=project_id,
+        logical_model_id=model_id,
+        name="z-nvidia",
+        vendor=AcceleratorVendor.NVIDIA,
+        kind=AcceleratorKind.GPU,
+        profile_id="nvidia-vllm-k8s",
+        artifact_digest="sha256:" + "2" * 64,
+    )
+    await _variant(
+        variant_database,
+        project_id=project_id,
+        logical_model_id=model_id,
+        name="a-nvidia",
+        vendor=AcceleratorVendor.NVIDIA,
+        kind=AcceleratorKind.GPU,
+        profile_id="nvidia-vllm-k8s",
+        artifact_digest="sha256:" + "3" * 64,
+    )
+    await _variant(
+        variant_database,
+        project_id=project_id,
+        logical_model_id=model_id,
+        name="ignored-nvidia",
+        vendor=AcceleratorVendor.NVIDIA,
+        kind=AcceleratorKind.GPU,
+        profile_id="nvidia-vllm-k8s",
+        artifact_digest="sha256:" + "4" * 64,
+        status=ModelAvailabilityStatus.DEGRADED,
+    )
+
+    async with variant_database.session() as session:
+        assert (
+            await ModelVariantRepository.list_ready_candidates(
+                session,
+                project_id=project_id,
+                logical_model_id=model_id,
+                allowed_vendors=(
+                    AcceleratorVendor.NVIDIA,
+                    AcceleratorVendor.HUAWEI_ASCEND,
+                ),
+                allowed_kinds=(AcceleratorKind.GPU, AcceleratorKind.NPU),
+            )
+            == []
+        )
+
+    async with variant_database.session() as session, session.begin():
+        await LogicalModelRepository.set_status(
+            session,
+            project_id=project_id,
+            logical_model_id=model_id,
+            status=ModelAvailabilityStatus.READY,
+            reason="admission enabled",
+            created_by_user_id=None,
+        )
+        candidates = await ModelVariantRepository.list_ready_candidates(
+            session,
+            project_id=project_id,
+            logical_model_id=model_id,
+            allowed_vendors=(
+                AcceleratorVendor.NVIDIA,
+                AcceleratorVendor.HUAWEI_ASCEND,
+            ),
+            allowed_kinds=(AcceleratorKind.GPU, AcceleratorKind.NPU),
+            for_update=True,
+        )
+        assert [candidate.name for candidate in candidates] == [
+            "z-ascend",
+            "a-nvidia",
+            "z-nvidia",
+        ]
+
+        nvidia_candidates = await ModelVariantRepository.list_ready_candidates(
+            session,
+            project_id=project_id,
+            logical_model_id=model_id,
+            allowed_vendors=(AcceleratorVendor.NVIDIA,),
+            allowed_kinds=(AcceleratorKind.GPU,),
+            runtime_profile_id="nvidia-vllm-k8s",
+        )
+        assert [candidate.name for candidate in nvidia_candidates] == [
+            "a-nvidia",
+            "z-nvidia",
+        ]
+        assert (
+            await ModelVariantRepository.list_ready_candidates(
+                session,
+                project_id=project_id,
+                logical_model_id=model_id,
+                allowed_vendors=(AcceleratorVendor.NVIDIA,),
+                allowed_kinds=(AcceleratorKind.GPU,),
+                runtime_profile_id="nvidia-missing-k8s",
+            )
+            == []
+        )
+        assert (
+            await ModelVariantRepository.list_ready_candidates(
+                session,
+                project_id=project_id,
+                logical_model_id=model_id,
+                allowed_vendors=(AcceleratorVendor.NVIDIA,),
+                allowed_kinds=(AcceleratorKind.NPU,),
+            )
+            == []
+        )
+        assert (
+            await ModelVariantRepository.list_ready_candidates(
+                session,
+                project_id=project_id,
+                logical_model_id=model_id,
+                allowed_vendors=(),
+                allowed_kinds=(AcceleratorKind.GPU,),
+            )
+            == []
+        )
+
+
+async def test_reservation_revalidation_requires_exact_ready_snapshot(
+    variant_database: Database,
+) -> None:
+    project_id = await _project(variant_database)
+    artifact_digest = "sha256:" + "a" * 64
+    profile_digest = "sha256:" + "b" * 64
+    async with variant_database.session() as session, session.begin():
+        model = await LogicalModelRepository.create(
+            session,
+            project_id=project_id,
+            name="reservation-model",
+            public_name="Reservation Model",
+            description=None,
+            metadata={},
+            created_by_user_id=None,
+        )
+        model_id = model.id
+
+    variant_id = await _variant(
+        variant_database,
+        project_id=project_id,
+        logical_model_id=model_id,
+        name="reservation-nvidia",
+        vendor=AcceleratorVendor.NVIDIA,
+        kind=AcceleratorKind.GPU,
+        profile_id="nvidia-vllm-k8s",
+        profile_version="2.0.0",
+        profile_digest=profile_digest,
+        artifact_digest=artifact_digest,
+    )
+    await _variant(
+        variant_database,
+        project_id=project_id,
+        logical_model_id=model_id,
+        name="reservation-ascend",
+        vendor=AcceleratorVendor.HUAWEI_ASCEND,
+        kind=AcceleratorKind.NPU,
+        profile_id="ascend-vllm-k8s-a2",
+        artifact_digest="sha256:" + "c" * 64,
+    )
+
+    async with variant_database.session() as session, session.begin():
+        await LogicalModelRepository.set_status(
+            session,
+            project_id=project_id,
+            logical_model_id=model_id,
+            status=ModelAvailabilityStatus.READY,
+            reason="reservation enabled",
+            created_by_user_id=None,
+        )
+
+        async def revalidate(
+            *,
+            expected_project_id: uuid.UUID = project_id,
+            expected_logical_model_id: uuid.UUID = model_id,
+            expected_variant_id: uuid.UUID = variant_id,
+            expected_vendor: AcceleratorVendor = AcceleratorVendor.NVIDIA,
+            expected_kind: AcceleratorKind = AcceleratorKind.GPU,
+            expected_runtime_profile_id: str = "nvidia-vllm-k8s",
+            expected_runtime_profile_version: str = "2.0.0",
+            expected_artifact_digest: str = artifact_digest,
+            expected_runtime_profile_digest: str = profile_digest,
+            for_update: bool = True,
+        ) -> ModelVariant | None:
+            return await ModelVariantRepository.revalidate_ready_for_reservation(
+                session,
+                project_id=expected_project_id,
+                logical_model_id=expected_logical_model_id,
+                expected_variant_id=expected_variant_id,
+                expected_vendor=expected_vendor,
+                expected_kind=expected_kind,
+                expected_runtime_profile_id=expected_runtime_profile_id,
+                expected_runtime_profile_version=expected_runtime_profile_version,
+                expected_artifact_digest=expected_artifact_digest,
+                expected_runtime_profile_digest=expected_runtime_profile_digest,
+                for_update=for_update,
+            )
+
+        exact = await revalidate()
+        assert exact is not None
+        assert exact.id == variant_id
+
+        assert (
+            await revalidate(
+                expected_artifact_digest="sha256:" + "d" * 64,
+                for_update=False,
+            )
+            is None
+        )
+        assert await revalidate(expected_runtime_profile_digest="sha256:" + "e" * 64) is None
+        assert await revalidate(expected_vendor=AcceleratorVendor.HUAWEI_ASCEND) is None
+        assert await revalidate(expected_kind=AcceleratorKind.NPU) is None
+        assert await revalidate(expected_runtime_profile_id="ascend-vllm-k8s-a2") is None
+        assert await revalidate(expected_runtime_profile_version="1.0.0") is None
+        assert await revalidate(expected_variant_id=uuid.uuid4()) is None
+        assert await revalidate(expected_project_id=uuid.uuid4()) is None
+        assert await revalidate(expected_logical_model_id=uuid.uuid4()) is None
+
+        await LogicalModelRepository.set_status(
+            session,
+            project_id=project_id,
+            logical_model_id=model_id,
+            status=ModelAvailabilityStatus.DEGRADED,
+            reason="logical model paused",
+            created_by_user_id=None,
+        )
+        assert await revalidate() is None
+
+        await LogicalModelRepository.set_status(
+            session,
+            project_id=project_id,
+            logical_model_id=model_id,
+            status=ModelAvailabilityStatus.READY,
+            reason="logical model resumed",
+            created_by_user_id=None,
+        )
+        await ModelVariantRepository.set_status(
+            session,
+            project_id=project_id,
+            logical_model_id=model_id,
+            variant_id=variant_id,
+            status=ModelAvailabilityStatus.DEGRADED,
+            reason="variant paused",
+        )
+        assert await revalidate() is None

@@ -3,6 +3,7 @@ import signal
 import time
 import uuid
 from dataclasses import replace
+from pathlib import Path
 
 from redis.exceptions import RedisError
 
@@ -12,6 +13,7 @@ from core.database import Database
 from core.enums import ACTIVE_TASK_STATUSES, WorkerStatus
 from core.logging import configure_logging, get_logger
 from core.redis import RedisQueue
+from core.runtime_profiles import RuntimeProfileCatalog
 from repositories.tasks import TaskRepository
 from repositories.workers import WorkerRepository
 from scheduler import Scheduler, TaskAssignment
@@ -75,6 +77,9 @@ class WorkerService:
                 cleanup_grace_seconds=settings.kubernetes_cleanup_grace_seconds,
                 kubeconfig=settings.kubernetes_kubeconfig,
                 in_cluster=settings.kubernetes_in_cluster,
+                runtime_profile_catalog=RuntimeProfileCatalog.from_path(
+                    Path(settings.runtime_profile_manifest_path)
+                ),
             )
         if "fake" in runtime_types:
             runtimes["fake"] = FakeComputeRuntime()

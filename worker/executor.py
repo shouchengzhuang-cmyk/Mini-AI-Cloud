@@ -667,6 +667,14 @@ class TaskExecutor:
             project_id=getattr(task, "project_id", None),
             gpu_device_ids=tuple(getattr(task, "gpu_device_ids", None) or ()),
             runtime_type=task.runtime_type.value,
+            selected_vendor=task.selected_vendor,
+            selected_kind=task.selected_kind,
+            selected_model=task.selected_model,
+            runtime_profile_id=task.runtime_profile_id,
+            runtime_profile_version=task.runtime_profile_version,
+            runtime_profile_digest=task.runtime_profile_digest,
+            model_variant_id=task.model_variant_id,
+            allocation_authority=task.allocation_authority,
             mounts=mounts,
         )
 

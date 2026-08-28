@@ -7,7 +7,11 @@ import pytest
 import yaml  # type: ignore[import-untyped]
 from pydantic import ValidationError
 
-from core.runtime_profiles import RuntimeProfile
+from core.runtime_profiles import (
+    RuntimeProfile,
+    RuntimeProfileCatalog,
+    RuntimeProfileCompatibilityError,
+)
 from scripts.validate_runtime_profiles import (
     RuntimeProfileContractError,
     load_profiles,
@@ -132,6 +136,51 @@ def test_semantic_digest_changes_with_profile_semantics_not_yaml_formatting() ->
 
     assert profile.semantic_digest() == reformatted.semantic_digest()
     assert profile.semantic_digest() != changed.semantic_digest()
+
+
+def test_catalog_loads_an_exact_manifest_backed_runtime_profile() -> None:
+    catalog = RuntimeProfileCatalog.from_path(REPOSITORY_ROOT / "runtime_profiles/manifest.json")
+    entry = next(
+        item for item in catalog.manifest.profiles if item.identity == "nvidia-vllm-k8s@2.0.0"
+    )
+
+    profile = catalog.load_exact(
+        profile_id=entry.profile_id,
+        profile_version=entry.profile_version,
+        semantic_digest=entry.semantic_digest,
+    )
+
+    assert profile.identity == entry.identity
+    assert profile.semantic_digest() == entry.semantic_digest
+    with pytest.raises(RuntimeProfileCompatibilityError, match="immutable manifest"):
+        catalog.load_exact(
+            profile_id=entry.profile_id,
+            profile_version=entry.profile_version,
+            semantic_digest="sha256:" + "0" * 64,
+        )
+
+
+def test_catalog_rejects_yaml_that_drifted_from_the_manifest(tmp_path: Path) -> None:
+    profile_root = tmp_path / "runtime_profiles"
+    profile_root.mkdir()
+    for name in (
+        "manifest.json",
+        "ascend-vllm-k8s.example.yaml",
+        "ascend-vllm-k8s.yaml",
+        "nvidia-vllm-k8s.example.yaml",
+        "nvidia-vllm-k8s.yaml",
+    ):
+        (profile_root / name).write_bytes(
+            (REPOSITORY_ROOT / "runtime_profiles" / name).read_bytes()
+        )
+    profile_path = profile_root / "nvidia-vllm-k8s.yaml"
+    payload = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    assert isinstance(payload, dict)
+    payload["limitations"].append("Manifest drift injected by the test.")
+    profile_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(RuntimeProfileCompatibilityError, match="digest"):
+        RuntimeProfileCatalog.from_path(profile_root / "manifest.json")
 
 
 def test_positive_evidence_status_requires_a_reference() -> None:

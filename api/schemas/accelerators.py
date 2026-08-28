@@ -25,9 +25,8 @@ LEGACY_GPU_FIELDS = frozenset({"gpu_count", "gpu_memory_mb", "gpu_model"})
 class AcceleratorRequest(RequestModel):
     """Vendor-neutral accelerator request contract.
 
-    A1 validates the complete NVIDIA/Ascend vocabulary. Until the later M6
-    persistence and scheduling PRs land, only requests that can be represented
-    exactly by the v0.4 NVIDIA GPU fields may enter the existing execution path.
+    The normalized request remains authoritative even when legacy ``gpu_*``
+    columns are populated for aggregate resource accounting compatibility.
     """
 
     model_config = ConfigDict(
@@ -217,12 +216,18 @@ def reconcile_legacy_gpu_fields(
         return legacy_values
     if accelerator.is_legacy_gpu_compatible():
         return accelerator.legacy_gpu_values()
-    return legacy_values
+    return (
+        accelerator.count,
+        accelerator.memory_mb_per_device,
+        accelerator.allowed_models[0] if len(accelerator.allowed_models) == 1 else None,
+    )
 
 
 def require_current_execution_support(accelerator: AcceleratorRequest | None) -> None:
-    if accelerator is not None and not accelerator.is_legacy_gpu_compatible():
-        raise ValueError(
-            "the accelerator contract is schema-ready, but this request requires later M6 "
-            "scheduling and runtime PRs"
-        )
+    """Compatibility hook retained for callers introduced before A9.
+
+    A9 admits the complete validated contract. Runtime, profile, model-variant,
+    quota and capacity constraints are enforced by vendor-aware admission.
+    """
+
+    del accelerator

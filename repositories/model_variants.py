@@ -342,6 +342,83 @@ class ModelVariantRepository:
         return await session.scalar(query)
 
     @staticmethod
+    async def list_ready_candidates(
+        session: AsyncSession,
+        *,
+        project_id: uuid.UUID,
+        logical_model_id: uuid.UUID,
+        allowed_vendors: Sequence[AcceleratorVendor],
+        allowed_kinds: Sequence[AcceleratorKind],
+        runtime_profile_id: str | None = None,
+        for_update: bool = False,
+    ) -> list[ModelVariant]:
+        query = (
+            select(ModelVariant)
+            .join(LogicalModel, LogicalModel.id == ModelVariant.logical_model_id)
+            .where(
+                LogicalModel.id == logical_model_id,
+                LogicalModel.project_id == project_id,
+                LogicalModel.status == ModelAvailabilityStatus.READY,
+                ModelVariant.logical_model_id == logical_model_id,
+                ModelVariant.vendor.in_(tuple(allowed_vendors)),
+                ModelVariant.kind.in_(tuple(allowed_kinds)),
+                ModelVariant.status == ModelAvailabilityStatus.READY,
+            )
+            .order_by(
+                ModelVariant.vendor.asc(),
+                ModelVariant.kind.asc(),
+                ModelVariant.runtime_profile_id.asc(),
+                ModelVariant.runtime_profile_version.asc(),
+                ModelVariant.name.asc(),
+                ModelVariant.id.asc(),
+            )
+        )
+        if runtime_profile_id is not None:
+            query = query.where(
+                ModelVariant.runtime_profile_id == _normalize_profile_id(runtime_profile_id)
+            )
+        if for_update:
+            query = query.with_for_update()
+        return list(await session.scalars(query))
+
+    @staticmethod
+    async def revalidate_ready_for_reservation(
+        session: AsyncSession,
+        *,
+        project_id: uuid.UUID,
+        logical_model_id: uuid.UUID,
+        expected_variant_id: uuid.UUID,
+        expected_vendor: AcceleratorVendor,
+        expected_kind: AcceleratorKind,
+        expected_runtime_profile_id: str,
+        expected_runtime_profile_version: str,
+        expected_artifact_digest: str,
+        expected_runtime_profile_digest: str,
+        for_update: bool = True,
+    ) -> ModelVariant | None:
+        query = (
+            select(ModelVariant)
+            .join(LogicalModel, LogicalModel.id == ModelVariant.logical_model_id)
+            .where(
+                LogicalModel.id == logical_model_id,
+                LogicalModel.project_id == project_id,
+                LogicalModel.status == ModelAvailabilityStatus.READY,
+                ModelVariant.id == expected_variant_id,
+                ModelVariant.logical_model_id == logical_model_id,
+                ModelVariant.vendor == expected_vendor,
+                ModelVariant.kind == expected_kind,
+                ModelVariant.runtime_profile_id == expected_runtime_profile_id,
+                ModelVariant.runtime_profile_version == expected_runtime_profile_version,
+                ModelVariant.artifact_digest == expected_artifact_digest,
+                ModelVariant.runtime_profile_digest == expected_runtime_profile_digest,
+                ModelVariant.status == ModelAvailabilityStatus.READY,
+            )
+        )
+        if for_update:
+            query = query.with_for_update()
+        return await session.scalar(query)
+
+    @staticmethod
     async def list(
         session: AsyncSession,
         *,

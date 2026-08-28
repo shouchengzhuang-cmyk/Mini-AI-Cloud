@@ -33,6 +33,49 @@ class Task(Base):
         CheckConstraint("priority BETWEEN 0 AND 100", name="priority"),
         CheckConstraint("cpu_millicores > 0", name="cpu_millicores"),
         CheckConstraint("gpu_memory_mb >= 0", name="gpu_memory"),
+        CheckConstraint(
+            "(selected_vendor IS NULL AND selected_kind IS NULL "
+            "AND selected_model IS NULL AND runtime_profile_id IS NULL "
+            "AND runtime_profile_version IS NULL AND runtime_profile_digest IS NULL "
+            "AND model_variant_id IS NULL AND allocation_authority IS NULL) OR "
+            "(selected_vendor IS NOT NULL AND selected_kind IS NOT NULL "
+            "AND selected_model IS NOT NULL AND allocation_authority IS NOT NULL)",
+            name="selected_accelerator_snapshot",
+        ),
+        CheckConstraint(
+            "(runtime_profile_id IS NULL AND runtime_profile_version IS NULL "
+            "AND runtime_profile_digest IS NULL) OR "
+            "(runtime_profile_id IS NOT NULL AND runtime_profile_version IS NOT NULL "
+            "AND runtime_profile_digest IS NOT NULL)",
+            name="selected_profile_snapshot",
+        ),
+        CheckConstraint(
+            "model_variant_id IS NULL OR runtime_profile_id IS NOT NULL",
+            name="selected_variant_profile",
+        ),
+        CheckConstraint(
+            "allocation_authority IS NULL "
+            "OR allocation_authority != 'kubernetes_device_plugin' "
+            "OR runtime_profile_id IS NOT NULL",
+            name="selected_profile_authority",
+        ),
+        CheckConstraint(
+            "selected_vendor IS NULL OR "
+            "(selected_vendor = 'nvidia' AND selected_kind = 'gpu') OR "
+            "(selected_vendor = 'huawei-ascend' AND selected_kind = 'npu')",
+            name="selected_vendor_kind",
+        ),
+        CheckConstraint(
+            "runtime_profile_digest IS NULL OR "
+            "(length(runtime_profile_digest) = 71 "
+            "AND runtime_profile_digest LIKE 'sha256:%')",
+            name="selected_profile_digest",
+        ),
+        CheckConstraint(
+            "allocation_authority IS NULL OR allocation_authority IN "
+            "('control_plane_exact_device','kubernetes_device_plugin')",
+            name="selected_allocation_authority",
+        ),
         CheckConstraint("retry_base_seconds > 0", name="retry_base_seconds"),
         CheckConstraint("retry_max_seconds >= retry_base_seconds", name="retry_max_seconds"),
         Index("ix_tasks_status_created_at", "status", "created_at"),
@@ -40,6 +83,7 @@ class Task(Base):
         Index("ix_tasks_lease_expires_at", "lease_expires_at"),
         Index("ix_tasks_next_attempt_at", "next_attempt_at"),
         Index("ix_tasks_project_created", "project_id", "created_at", "id"),
+        Index("ix_tasks_project_variant_status", "project_id", "model_variant_id", "status"),
         Index("ix_tasks_schedule", "status", "priority", "queue_order"),
         UniqueConstraint("project_id", "idempotency_key", name="uq_tasks_project_idempotency"),
     )
@@ -114,6 +158,19 @@ class Task(Base):
     gpu_memory_mb: Mapped[int] = mapped_column(Integer, default=0)
     gpu_model: Mapped[str | None] = mapped_column(String(255))
     gpu_device_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    accelerator_request_json: Mapped[dict[str, object] | None] = mapped_column(
+        JSON(none_as_null=True)
+    )
+    selected_vendor: Mapped[str | None] = mapped_column(String(64))
+    selected_kind: Mapped[str | None] = mapped_column(String(32))
+    selected_model: Mapped[str | None] = mapped_column(String(255))
+    runtime_profile_id: Mapped[str | None] = mapped_column(String(128))
+    runtime_profile_version: Mapped[str | None] = mapped_column(String(32))
+    runtime_profile_digest: Mapped[str | None] = mapped_column(String(71))
+    model_variant_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("model_variants.id", ondelete="RESTRICT")
+    )
+    allocation_authority: Mapped[str | None] = mapped_column(String(64))
     network_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     network_mode: Mapped[str] = mapped_column(String(32), default="none")
     labels: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
