@@ -3,12 +3,12 @@
     {
       "identity": "ascend-vllm-k8s-a2@1.0.0",
       "path": "runtime_profiles/ascend-vllm-k8s.example.yaml",
-      "semantic_digest": "sha256:a59a59dcb05548eb95594136ec9cb8b49aae63d1cf1c6d56bafb74b7afbc970d"
+      "semantic_digest": "sha256:6328aca59560500168fb2c84a6d507204295ce3466e7d9e9b337915211bcb0d1"
     },
     {
       "identity": "nvidia-vllm-k8s@1.0.0",
       "path": "runtime_profiles/nvidia-vllm-k8s.example.yaml",
-      "semantic_digest": "sha256:af029737b4bcda648b00ed700237f14febea4d8dddbaae678aa4b7e2cd2cd16b"
+      "semantic_digest": "sha256:6ccc95bf511922d4b0833d6c587561d74a645935fc090a6a15f912268f1ccc21"
     }
   ],
   "schema_version": "1.0.0"

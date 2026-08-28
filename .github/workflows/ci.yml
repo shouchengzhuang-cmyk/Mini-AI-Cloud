@@ -37,6 +37,8 @@ jobs:
         run: uv run python scripts/validate_evidence.py
       - name: Validate runtime profile contracts
         run: uv run python scripts/validate_runtime_profiles.py
+      - name: Validate Ascend runtime contract
+        run: uv run python scripts/validate_ascend_runtime.py
       - name: Validate Compose configuration
         run: docker compose config --quiet
       - name: Ruff format

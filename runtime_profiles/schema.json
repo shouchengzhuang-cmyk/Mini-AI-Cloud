@@ -67,9 +67,54 @@
       "title": "HttpProbe",
       "type": "object"
     },
+    "KubernetesDeviceVisibility": {
+      "additionalProperties": false,
+      "properties": {
+        "annotation_key": {
+          "maxLength": 253,
+          "minLength": 3,
+          "title": "Annotation Key",
+          "type": "string"
+        },
+        "environment_name": {
+          "const": "ASCEND_VISIBLE_DEVICES",
+          "title": "Environment Name",
+          "type": "string"
+        },
+        "scheduling_mode": {
+          "const": "mindcluster-volcano-full-card",
+          "title": "Scheduling Mode",
+          "type": "string"
+        },
+        "source": {
+          "const": "pod-annotation",
+          "title": "Source",
+          "type": "string"
+        }
+      },
+      "required": [
+        "environment_name",
+        "source",
+        "annotation_key",
+        "scheduling_mode"
+      ],
+      "title": "KubernetesDeviceVisibility",
+      "type": "object"
+    },
     "KubernetesRuntime": {
       "additionalProperties": false,
       "properties": {
+        "device_visibility": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KubernetesDeviceVisibility"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "node_selector": {
           "additionalProperties": {
             "type": "string"
@@ -96,6 +141,20 @@
           "minLength": 1,
           "title": "Runtime Class Name",
           "type": "string"
+        },
+        "scheduler_name": {
+          "anyOf": [
+            {
+              "maxLength": 253,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Scheduler Name"
         },
         "security": {
           "$ref": "#/$defs/RuntimeSecurityContext"

@@ -128,11 +128,27 @@ class KubernetesToleration(FrozenContractModel):
         return self
 
 
+class KubernetesDeviceVisibility(FrozenContractModel):
+    environment_name: Literal["ASCEND_VISIBLE_DEVICES"]
+    source: Literal["pod-annotation"]
+    annotation_key: str = Field(min_length=3, max_length=253)
+    scheduling_mode: Literal["mindcluster-volcano-full-card"]
+
+    @field_validator("annotation_key")
+    @classmethod
+    def validate_annotation_key(cls, value: str) -> str:
+        if not KUBERNETES_RESOURCE_PATTERN.fullmatch(value):
+            raise ValueError("annotation_key must be a qualified Kubernetes annotation")
+        return value
+
+
 class KubernetesRuntime(FrozenContractModel):
     runtime_class_name: str = Field(min_length=1, max_length=253)
+    scheduler_name: str | None = Field(default=None, min_length=1, max_length=253)
     resource_name: str = Field(min_length=3, max_length=253)
     node_selector: dict[str, str] = Field(min_length=1, max_length=32)
     tolerations: tuple[KubernetesToleration, ...] = Field(default=(), max_length=32)
+    device_visibility: KubernetesDeviceVisibility | None = None
     requests_equal_limits: Literal[True] = True
     security: RuntimeSecurityContext
 
@@ -141,6 +157,13 @@ class KubernetesRuntime(FrozenContractModel):
     def validate_runtime_class_name(cls, value: str) -> str:
         if not KUBERNETES_NAME_PATTERN.fullmatch(value):
             raise ValueError("runtime_class_name must be a Kubernetes DNS subdomain")
+        return value
+
+    @field_validator("scheduler_name")
+    @classmethod
+    def validate_scheduler_name(cls, value: str | None) -> str | None:
+        if value is not None and not KUBERNETES_NAME_PATTERN.fullmatch(value):
+            raise ValueError("scheduler_name must be a Kubernetes DNS subdomain")
         return value
 
     @field_validator("resource_name")
@@ -287,6 +310,14 @@ class RuntimeProfile(FrozenContractModel):
         selected_vendor = self.kubernetes.node_selector.get(VENDOR_NODE_SELECTOR)
         if selected_vendor != self.vendor.value:
             raise ValueError(f"node_selector must set {VENDOR_NODE_SELECTOR}={self.vendor.value}")
+        visibility = self.kubernetes.device_visibility
+        if visibility is not None:
+            if self.vendor != AcceleratorVendor.HUAWEI_ASCEND or self.kind != AcceleratorKind.NPU:
+                raise ValueError("device_visibility is restricted to Huawei Ascend NPU profiles")
+            if self.kubernetes.scheduler_name != "volcano":
+                raise ValueError("Ascend annotation visibility requires scheduler_name=volcano")
+            if visibility.annotation_key != self.kubernetes.resource_name:
+                raise ValueError("device visibility annotation_key must equal resource_name")
         if (
             self.evidence_status.value in _EVIDENCE_REFERENCE_REQUIRED
             and not self.evidence_references

@@ -62,6 +62,38 @@ The example profiles remain non-deployable after rendering support. The current 
 Kubernetes controller does not select them automatically; A7/A8 must provide independently
 validated runtime profiles and execution wiring.
 
+## Ascend A2 profile
+
+`ascend-vllm-k8s.yaml` is the first non-placeholder Ascend profile. It pins the official
+vLLM Ascend A2 image by multi-platform digest and binds the vLLM Ascend, upstream vLLM,
+CANN, PyTorch, torch-npu, MindCluster, product-generation, and Device Plugin contracts in
+`ascend-vllm-k8s.acceptance.json`.
+
+The profile is deliberately limited to Atlas A2 / Ascend 910B and Volcano full-card
+scheduling. In that documented MindCluster mode, `ASCEND_VISIBLE_DEVICES` is populated
+from the Device Plugin-owned `huawei.com/Ascend910` Pod annotation through the Kubernetes
+Downward API. The control plane never supplies a device list or invents physical IDs.
+Atlas A3, `huawei.com/npu`, vNPU, and non-Volcano scheduling need separate validated
+profiles even though the vendor-neutral renderer keeps the resource/annotation pair
+configurable.
+
+Validate the static contract from Ubuntu-24.04 WSL:
+
+```bash
+make validate-ascend-runtime
+uv run python scripts/ascend_runtime_acceptance.py diagnose
+```
+
+Cluster preflight and OpenAI-compatible engine acceptance are explicit real-environment
+steps. They do not run in generic CI and do not turn `REAL_HW_NOT_RUN` into hardware
+evidence:
+
+```bash
+uv run python scripts/ascend_runtime_acceptance.py preflight --kubeconfig /path/to/kubeconfig
+uv run python scripts/ascend_runtime_acceptance.py accept \
+  --base-url http://runtime.example.invalid:8000 --model /models/example
+```
+
 ## Compatibility metadata
 
 `python: profile-owned` keeps runtime Python independent of the control-plane interpreter.

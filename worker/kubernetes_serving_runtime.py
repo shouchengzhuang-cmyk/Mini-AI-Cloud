@@ -691,6 +691,7 @@ class KubernetesServingRuntimeAdapter:
         )
         liveness_probe: client.V1Probe | None = None
         runtime_class_name: str | None = None
+        scheduler_name: str | None = None
         node_selector: dict[str, str] | None = None
         tolerations: list[client.V1Toleration] | None = None
         if profile is not None:
@@ -708,9 +709,23 @@ class KubernetesServingRuntimeAdapter:
             environment.extend(
                 client.V1EnvVar(name=name, value=value) for name, value in spec.profile_environment
             )
+            visibility = profile.kubernetes.device_visibility
+            if visibility is not None:
+                environment.append(
+                    client.V1EnvVar(
+                        name=visibility.environment_name,
+                        value_from=client.V1EnvVarSource(
+                            field_ref=client.V1ObjectFieldSelector(
+                                api_version="v1",
+                                field_path=(f"metadata.annotations['{visibility.annotation_key}']"),
+                            )
+                        ),
+                    )
+                )
             readiness_probe = _http_probe(profile.probes.readiness)
             liveness_probe = _http_probe(profile.probes.health)
             runtime_class_name = profile.kubernetes.runtime_class_name
+            scheduler_name = profile.kubernetes.scheduler_name
             node_selector = dict(profile.kubernetes.node_selector)
             tolerations = [
                 client.V1Toleration(
@@ -771,6 +786,7 @@ class KubernetesServingRuntimeAdapter:
                 host_pid=False,
                 restart_policy="Never",
                 runtime_class_name=runtime_class_name,
+                scheduler_name=scheduler_name,
                 security_context=client.V1PodSecurityContext(
                     run_as_non_root=True,
                     run_as_user=10001,
@@ -1072,6 +1088,7 @@ def _pod_contract(pod: object) -> dict[str, object]:
             **(
                 {
                     "runtime_class_name": getattr(pod_spec, "runtime_class_name", None),
+                    "scheduler_name": getattr(pod_spec, "scheduler_name", None),
                     "node_selector": _string_mapping(getattr(pod_spec, "node_selector", None)),
                     "tolerations": tuple(
                         {
@@ -1115,12 +1132,7 @@ def _pod_contract(pod: object) -> dict[str, object]:
             "working_dir": getattr(container, "working_dir", None),
             "env_from_count": len(getattr(container, "env_from", None) or []),
             "env": tuple(
-                {
-                    "name": getattr(item, "name", None),
-                    "value": getattr(item, "value", None),
-                    "value_from": getattr(item, "value_from", None) is not None,
-                }
-                for item in (getattr(container, "env", None) or [])
+                _environment_contract(item) for item in (getattr(container, "env", None) or [])
             ),
             "ports": tuple(
                 {
@@ -1195,6 +1207,26 @@ def _string_mapping(value: object) -> dict[str, str]:
     if not isinstance(value, Mapping):
         return {}
     return {str(key): str(item) for key, item in value.items()}
+
+
+def _environment_contract(item: object) -> dict[str, object]:
+    value_from = getattr(item, "value_from", None)
+    contract: dict[str, object] = {
+        "name": getattr(item, "name", None),
+        "value": getattr(item, "value", None),
+        "value_from": value_from is not None,
+    }
+    if value_from is not None:
+        field_ref = getattr(value_from, "field_ref", None)
+        contract["field_ref"] = {
+            "api_version": getattr(field_ref, "api_version", None),
+            "field_path": getattr(field_ref, "field_path", None),
+        }
+        contract["other_sources_present"] = any(
+            getattr(value_from, name, None) is not None
+            for name in ("config_map_key_ref", "resource_field_ref", "secret_key_ref")
+        )
+    return contract
 
 
 def _probe_contract(probe: object) -> dict[str, object]:
