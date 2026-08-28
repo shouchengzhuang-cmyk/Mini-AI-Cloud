@@ -310,6 +310,9 @@ class ServingRequestUsage(Base):
     # Replica rows are operational and may eventually have a shorter retention
     # period than usage. Preserve the UUID as provenance without a live FK.
     replica_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    logical_model_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    model_variant_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    selected_vendor: Mapped[str | None] = mapped_column(String(64))
     path: Mapped[str] = mapped_column(String(64))
     outcome: Mapped[str] = mapped_column(String(64))
     error_code: Mapped[str | None] = mapped_column(String(64))

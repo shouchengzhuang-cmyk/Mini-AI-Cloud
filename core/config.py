@@ -186,6 +186,9 @@ class Settings(BaseSettings):
     service_proxy_connect_timeout: float = Field(default=5.0, gt=0)
     service_proxy_first_token_timeout: float = Field(default=30.0, gt=0)
     service_proxy_timeout: float = Field(default=120.0, gt=0)
+    service_proxy_fallback_attempts: int = Field(default=1, ge=0, le=1)
+    service_vendor_circuit_failure_threshold: int = Field(default=2, ge=1, le=100)
+    service_vendor_circuit_cooldown_seconds: int = Field(default=30, ge=1, le=3600)
     service_proxy_max_response_bytes: int = Field(
         default=16 * 1024 * 1024,
         ge=1024,

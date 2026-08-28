@@ -102,6 +102,9 @@ def create_app(
         first_token_timeout=resolved_settings.service_proxy_first_token_timeout,
         max_response_bytes=resolved_settings.service_proxy_max_response_bytes,
         endpoint_host_allowlist=resolved_settings.service_endpoint_host_allowlist,
+        fallback_attempts=resolved_settings.service_proxy_fallback_attempts,
+        circuit_failure_threshold=(resolved_settings.service_vendor_circuit_failure_threshold),
+        circuit_cooldown_seconds=(resolved_settings.service_vendor_circuit_cooldown_seconds),
     )
     service_health = ServiceHealthController(
         resolved_database,

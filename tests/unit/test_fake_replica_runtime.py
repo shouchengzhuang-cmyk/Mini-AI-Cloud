@@ -123,6 +123,20 @@ async def _wait_for_process_exit(process: asyncio.subprocess.Process) -> int:
     return await asyncio.to_thread(poll)
 
 
+async def _wait_for_listening_port(port: int) -> None:
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        try:
+            _reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        except OSError:
+            await asyncio.sleep(0.01)
+            continue
+        writer.close()
+        await writer.wait_closed()
+        return
+    raise TimeoutError("fake inference process did not start listening")
+
+
 def test_fake_runtime_claims_use_postgresql_skip_locked() -> None:
     compiled = str(
         FakeReplicaRuntimeController.claim_candidates_query(10).compile(
@@ -565,6 +579,7 @@ async def test_fake_runtime_restart_recovers_process_spawned_before_loading_is_p
             stderr=asyncio.subprocess.DEVNULL,
         )
         assert process.returncode is None
+        await _wait_for_listening_port(port)
 
         replacement = FakeReplicaRuntimeController(
             fake_runtime_database,
