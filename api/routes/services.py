@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.dependencies import (
     get_app_settings,
@@ -33,7 +34,11 @@ from core.rbac import Permission, Principal
 from core.runtime_profiles import RuntimeProfileCatalog
 from models.registry import RegisteredModel
 from models.service import ModelService, ServiceStatus, ServingRuntime
-from repositories.admission import AdmissionRepository, ServiceAdmissionSnapshot
+from repositories.admission import (
+    AdmissionRepository,
+    ServiceAdmissionResult,
+    ServiceAdmissionSnapshot,
+)
 from repositories.quotas import QuotaExceededError
 from repositories.registry import ImagePolicyRepository, RegisteredModelRepository
 from repositories.services import ServiceCounts, ServiceRepository
@@ -58,6 +63,7 @@ async def create_service(
         payload.require_current_accelerator_execution_support()
     except ValueError as exc:
         raise ConflictError("ACCELERATOR_EXECUTION_NOT_READY", str(exc)) from exc
+    admission_rejection: ConflictError | None = None
     try:
         async with database.session() as session, session.begin():
             if payload.registered_model_id is not None:
@@ -82,10 +88,6 @@ async def create_service(
 
             service_id = uuid.uuid4()
             admission: ServiceAdmissionSnapshot | None = None
-            model = payload.model
-            model_revision = payload.model_revision
-            image = payload.image
-            dtype: str = payload.dtype
             if payload.logical_model_id is not None:
                 result = await AdmissionRepository.admit_logical_model_service(
                     session,
@@ -99,129 +101,19 @@ async def create_service(
                     requested_dtype=payload.dtype,
                 )
                 if not result.allowed or result.snapshot is None:
-                    raise ConflictError(
-                        "VENDOR_ADMISSION_REJECTED",
-                        "No homogeneous accelerator pool satisfies the logical model request",
-                        details={
-                            "reason": result.reason.value if result.reason is not None else None,
-                            "vendor": (
-                                result.rejected_vendor.value
-                                if result.rejected_vendor is not None
-                                else None
-                            ),
-                            "candidates": list(result.summary),
-                        },
-                    )
-                admission = result.snapshot
-                profile = profiles.load_exact(
-                    profile_id=admission.runtime_profile_id,
-                    profile_version=admission.runtime_profile_version,
-                    semantic_digest=admission.runtime_profile_digest,
+                    admission_rejection = _vendor_admission_conflict(result)
+                else:
+                    admission = result.snapshot
+            if admission_rejection is None:
+                service, counts = await _persist_service_after_admission(
+                    session,
+                    profiles=profiles,
+                    payload=payload,
+                    settings=settings,
+                    project_id=project_id,
+                    service_id=service_id,
+                    admission=admission,
                 )
-                model = admission.artifact_source
-                model_revision = admission.artifact_revision
-                image = profile.image.reference
-                dtype = admission.dtype
-            if image is None and payload.runtime == ServingRuntime.VLLM:
-                image = settings.vllm_image
-            if image is None and payload.runtime_type == RuntimeType.KUBERNETES:
-                image = settings.kubernetes_serving_image
-            if image is None and (
-                payload.runtime != ServingRuntime.FAKE
-                or payload.runtime_type == RuntimeType.KUBERNETES
-            ):
-                raise ConflictError(
-                    "SERVICE_IMAGE_REQUIRED",
-                    "A container image is required for this serving runtime",
-                )
-            if image is not None:
-                try:
-                    decision = await ImagePolicyRepository.evaluate(
-                        session,
-                        project_id=project_id,
-                        image=image,
-                    )
-                except ValueError as exc:
-                    raise ConflictError("INVALID_IMAGE_REFERENCE", str(exc)) from exc
-                if not decision.allowed:
-                    raise ConflictError(
-                        "IMAGE_POLICY_DENIED",
-                        "The project image policy rejected this service image",
-                        details={"reason": decision.reason},
-                    )
-                image = decision.canonical_image
-            assert model is not None
-            service = await ServiceRepository.create(
-                session,
-                service_id=service_id,
-                project_id=project_id,
-                registered_model_id=payload.registered_model_id,
-                name=payload.name,
-                model=model,
-                model_revision=model_revision,
-                runtime=payload.runtime,
-                runtime_type=payload.runtime_type,
-                image=image,
-                cpu_millicores=payload.cpu_millicores,
-                memory_mb=payload.memory_mb,
-                gpu_count=payload.gpu_count,
-                gpu_memory_mb=payload.gpu_memory_mb,
-                gpu_model=payload.gpu_model,
-                tensor_parallel_size=payload.tensor_parallel_size,
-                dtype=dtype,
-                gpu_memory_utilization=payload.gpu_memory_utilization,
-                max_model_len=payload.max_model_len,
-                desired_replicas=payload.replicas,
-                autoscaling_enabled=(
-                    payload.autoscaling.enabled if payload.autoscaling is not None else False
-                ),
-                autoscaling_min_replicas=(
-                    payload.autoscaling.min_replicas if payload.autoscaling is not None else 1
-                ),
-                autoscaling_max_replicas=(
-                    payload.autoscaling.max_replicas if payload.autoscaling is not None else 4
-                ),
-                autoscaling_target_concurrency=(
-                    payload.autoscaling.target_concurrency if payload.autoscaling is not None else 8
-                ),
-                autoscaling_cooldown_seconds=(
-                    payload.autoscaling.cooldown_seconds if payload.autoscaling is not None else 60
-                ),
-                logical_model_id=(admission.logical_model_id if admission is not None else None),
-                model_variant_id=(admission.model_variant_id if admission is not None else None),
-                selected_vendor=(admission.vendor if admission is not None else None),
-                selected_kind=(admission.kind.value if admission is not None else None),
-                selected_model=(admission.selected_model if admission is not None else None),
-                runtime_profile_id=(
-                    admission.runtime_profile_id if admission is not None else None
-                ),
-                runtime_profile_version=(
-                    admission.runtime_profile_version if admission is not None else None
-                ),
-                runtime_profile_digest=(
-                    admission.runtime_profile_digest if admission is not None else None
-                ),
-                allocation_authority=(
-                    admission.allocation_authority.value if admission is not None else None
-                ),
-                accelerator_resource_name=(
-                    admission.accelerator_resource_name if admission is not None else None
-                ),
-                selection_policy=(
-                    admission.selection_policy.value if admission is not None else None
-                ),
-            )
-            await ServiceRepository.reconcile_locked(
-                session,
-                service,
-                drain_timeout_seconds=_drain_timeout_for_runtime(
-                    settings,
-                    service.runtime_type,
-                ),
-            )
-            counts = (await ServiceRepository.counts_for_service_ids(session, [service.id]))[
-                service.id
-            ]
     except QuotaExceededError as exc:
         raise _service_quota_conflict(exc) from exc
     except IntegrityError as exc:
@@ -231,7 +123,129 @@ async def create_service(
             "SERVICE_NAME_ALREADY_EXISTS",
             "A service with this name already exists in the project",
         ) from exc
+    if admission_rejection is not None:
+        raise admission_rejection
     return _service_response(service, counts)
+
+
+async def _persist_service_after_admission(
+    session: AsyncSession,
+    *,
+    profiles: RuntimeProfileCatalog,
+    payload: ServiceCreate,
+    settings: Settings,
+    project_id: uuid.UUID,
+    service_id: uuid.UUID,
+    admission: ServiceAdmissionSnapshot | None,
+) -> tuple[ModelService, ServiceCounts]:
+    model = payload.model
+    model_revision = payload.model_revision
+    image = payload.image
+    dtype: str = payload.dtype
+    if admission is not None:
+        profile = profiles.load_exact(
+            profile_id=admission.runtime_profile_id,
+            profile_version=admission.runtime_profile_version,
+            semantic_digest=admission.runtime_profile_digest,
+        )
+        model = admission.artifact_source
+        model_revision = admission.artifact_revision
+        image = profile.image.reference
+        dtype = admission.dtype
+    if image is None and payload.runtime == ServingRuntime.VLLM:
+        image = settings.vllm_image
+    if image is None and payload.runtime_type == RuntimeType.KUBERNETES:
+        image = settings.kubernetes_serving_image
+    if image is None and (
+        payload.runtime != ServingRuntime.FAKE or payload.runtime_type == RuntimeType.KUBERNETES
+    ):
+        raise ConflictError(
+            "SERVICE_IMAGE_REQUIRED",
+            "A container image is required for this serving runtime",
+        )
+    if image is not None:
+        try:
+            decision = await ImagePolicyRepository.evaluate(
+                session,
+                project_id=project_id,
+                image=image,
+            )
+        except ValueError as exc:
+            raise ConflictError("INVALID_IMAGE_REFERENCE", str(exc)) from exc
+        if not decision.allowed:
+            raise ConflictError(
+                "IMAGE_POLICY_DENIED",
+                "The project image policy rejected this service image",
+                details={"reason": decision.reason},
+            )
+        image = decision.canonical_image
+    assert model is not None
+    service = await ServiceRepository.create(
+        session,
+        service_id=service_id,
+        project_id=project_id,
+        registered_model_id=payload.registered_model_id,
+        name=payload.name,
+        model=model,
+        model_revision=model_revision,
+        runtime=payload.runtime,
+        runtime_type=payload.runtime_type,
+        image=image,
+        cpu_millicores=payload.cpu_millicores,
+        memory_mb=payload.memory_mb,
+        gpu_count=payload.gpu_count,
+        gpu_memory_mb=payload.gpu_memory_mb,
+        gpu_model=payload.gpu_model,
+        tensor_parallel_size=payload.tensor_parallel_size,
+        dtype=dtype,
+        gpu_memory_utilization=payload.gpu_memory_utilization,
+        max_model_len=payload.max_model_len,
+        desired_replicas=payload.replicas,
+        autoscaling_enabled=(
+            payload.autoscaling.enabled if payload.autoscaling is not None else False
+        ),
+        autoscaling_min_replicas=(
+            payload.autoscaling.min_replicas if payload.autoscaling is not None else 1
+        ),
+        autoscaling_max_replicas=(
+            payload.autoscaling.max_replicas if payload.autoscaling is not None else 4
+        ),
+        autoscaling_target_concurrency=(
+            payload.autoscaling.target_concurrency if payload.autoscaling is not None else 8
+        ),
+        autoscaling_cooldown_seconds=(
+            payload.autoscaling.cooldown_seconds if payload.autoscaling is not None else 60
+        ),
+        logical_model_id=(admission.logical_model_id if admission is not None else None),
+        model_variant_id=(admission.model_variant_id if admission is not None else None),
+        selected_vendor=(admission.vendor if admission is not None else None),
+        selected_kind=(admission.kind.value if admission is not None else None),
+        selected_model=(admission.selected_model if admission is not None else None),
+        runtime_profile_id=(admission.runtime_profile_id if admission is not None else None),
+        runtime_profile_version=(
+            admission.runtime_profile_version if admission is not None else None
+        ),
+        runtime_profile_digest=(
+            admission.runtime_profile_digest if admission is not None else None
+        ),
+        allocation_authority=(
+            admission.allocation_authority.value if admission is not None else None
+        ),
+        accelerator_resource_name=(
+            admission.accelerator_resource_name if admission is not None else None
+        ),
+        selection_policy=(admission.selection_policy.value if admission is not None else None),
+    )
+    await ServiceRepository.reconcile_locked(
+        session,
+        service,
+        drain_timeout_seconds=_drain_timeout_for_runtime(
+            settings,
+            service.runtime_type,
+        ),
+    )
+    counts = (await ServiceRepository.counts_for_service_ids(session, [service.id]))[service.id]
+    return service, counts
 
 
 @router.get("", response_model=ServiceListResponse)
@@ -301,6 +315,7 @@ async def scale_service(
     principal: Annotated[Principal, Depends(require_api_permission(Permission.MODEL_MANAGE))],
 ) -> ServiceResponse:
     project_id = _principal_project_id(principal)
+    admission_rejection: ConflictError | None = None
     try:
         async with database.session() as session, session.begin():
             existing = await ServiceRepository.get(
@@ -321,27 +336,49 @@ async def scale_service(
                     None,
                 ),
             )
-            service = await ServiceRepository.set_desired_replicas(
-                session,
-                service_id=service_id,
-                project_id=project_id,
-                desired_replicas=payload.replicas,
-            )
-            if service is None:
-                raise NotFoundError("SERVICE_NOT_FOUND", "Service not found")
-            await ServiceRepository.reconcile_locked(
-                session,
-                service,
-                drain_timeout_seconds=_drain_timeout_for_runtime(
-                    settings,
-                    service.runtime_type,
-                ),
-            )
-            counts = (await ServiceRepository.counts_for_service_ids(session, [service.id]))[
-                service.id
-            ]
+            if (
+                payload.replicas > existing.desired_replicas
+                and existing.logical_model_id is not None
+                and existing.runtime_type == RuntimeType.KUBERNETES
+            ):
+                profiles = getattr(request.app.state, "runtime_profile_catalog", None)
+                if profiles is None:
+                    profiles = RuntimeProfileCatalog.from_path(
+                        Path(settings.runtime_profile_manifest_path)
+                    )
+                result = await AdmissionRepository.revalidate_logical_model_service_scale(
+                    session,
+                    catalog=profiles,
+                    service=existing,
+                    desired_replicas=payload.replicas,
+                )
+                if not result.allowed or result.snapshot is None:
+                    admission_rejection = _vendor_admission_conflict(result)
+            if admission_rejection is None:
+                service = await ServiceRepository.set_desired_replicas(
+                    session,
+                    service_id=service_id,
+                    project_id=project_id,
+                    desired_replicas=payload.replicas,
+                )
+                if service is None:
+                    raise NotFoundError("SERVICE_NOT_FOUND", "Service not found")
+                await ServiceRepository.reconcile_locked(
+                    session,
+                    service,
+                    drain_timeout_seconds=_drain_timeout_for_runtime(
+                        settings,
+                        service.runtime_type,
+                    ),
+                )
+                counts = (await ServiceRepository.counts_for_service_ids(session, [service.id]))[
+                    service.id
+                ]
     except QuotaExceededError as exc:
         raise _service_quota_conflict(exc) from exc
+    if admission_rejection is not None:
+        raise admission_rejection
+    assert service is not None
     return _service_response(service, counts)
 
 
@@ -606,5 +643,19 @@ def _service_quota_conflict(exc: QuotaExceededError) -> ConflictError:
             "resource": exc.resource,
             "limit": str(exc.limit),
             "requested": str(exc.requested),
+        },
+    )
+
+
+def _vendor_admission_conflict(result: ServiceAdmissionResult) -> ConflictError:
+    return ConflictError(
+        "VENDOR_ADMISSION_REJECTED",
+        "No homogeneous accelerator pool satisfies the logical model request",
+        details={
+            "reason": result.reason.value if result.reason is not None else None,
+            "vendor": (
+                result.rejected_vendor.value if result.rejected_vendor is not None else None
+            ),
+            "candidates": list(result.summary),
         },
     )

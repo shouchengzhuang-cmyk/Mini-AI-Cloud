@@ -11,7 +11,9 @@ from api.services.gateway import ServiceLoad, ServiceMetricsSource
 from core.database import Database
 from core.enums import RuntimeType
 from core.logging import get_logger
+from core.runtime_profiles import RuntimeProfileCatalog
 from models.service import ModelService
+from repositories.admission import AdmissionRepository
 from repositories.clock import database_utcnow
 from repositories.quotas import QuotaExceededError, QuotaRepository
 from repositories.services import ServiceRepository
@@ -43,6 +45,7 @@ class ServiceAutoscaler:
         metric_max_age_seconds: float = 30.0,
         scale_to_zero_enabled: bool = False,
         kubernetes_runtime: KubernetesRuntimeAdmission | None = None,
+        runtime_profile_catalog: RuntimeProfileCatalog | None = None,
     ) -> None:
         if batch_size < 1:
             raise ValueError("batch_size must be at least one")
@@ -54,6 +57,7 @@ class ServiceAutoscaler:
         self.metric_max_age_seconds = metric_max_age_seconds
         self.scale_to_zero_enabled = scale_to_zero_enabled
         self.kubernetes_runtime = kubernetes_runtime
+        self.runtime_profile_catalog = runtime_profile_catalog
         self.logger = get_logger("service_autoscaler")
 
     async def run_once(self) -> AutoscaleRunResult:
@@ -107,6 +111,23 @@ class ServiceAutoscaler:
                 ):
                     held += 1
                     continue
+                if (
+                    service.runtime_type == RuntimeType.KUBERNETES
+                    and service.logical_model_id is not None
+                    and target > service.desired_replicas
+                ):
+                    if self.runtime_profile_catalog is None:
+                        held += 1
+                        continue
+                    admission = await AdmissionRepository.revalidate_logical_model_service_scale(
+                        session,
+                        catalog=self.runtime_profile_catalog,
+                        service=service,
+                        desired_replicas=target,
+                    )
+                    if not admission.allowed:
+                        held += 1
+                        continue
                 try:
                     updated = await ServiceRepository.set_desired_replicas(
                         session,

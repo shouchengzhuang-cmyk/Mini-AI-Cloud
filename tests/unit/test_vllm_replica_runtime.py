@@ -15,7 +15,7 @@ from sqlalchemy.dialects import postgresql
 
 from api.services.vllm_replica_runtime import VLLMReplicaRuntimeController
 from core.database import Database
-from core.enums import RuntimeType, WorkerStatus
+from core.enums import AcceleratorKind, AcceleratorVendor, RuntimeType, WorkerStatus
 from models.base import Base
 from models.identity import Project, User
 from models.model_variant import LogicalModel, ModelVariant
@@ -170,13 +170,14 @@ class _Runtime:
 
 def _gpu(device_uuid: str = "GPU-real-1", *, index: int = 0) -> GPUDevice:
     return GPUDevice(
-        uuid=device_uuid,
-        index=index,
-        vendor="nvidia",
+        device_id=device_uuid,
+        device_index=index,
+        vendor=AcceleratorVendor.NVIDIA,
+        kind=AcceleratorKind.GPU,
         model="NVIDIA A100",
         memory_total_mb=40_960,
         memory_free_mb=39_000,
-        compute_capability="8.0",
+        compute_arch="8.0",
     )
 
 
@@ -473,13 +474,14 @@ async def test_real_vllm_controller_rejects_fake_gpu_inventory(
     vllm_runtime_database: Database,
 ) -> None:
     fake = GPUDevice(
-        uuid="FAKE-device",
-        index=0,
-        vendor="fake",
+        device_id="FAKE-device",
+        device_index=0,
+        vendor=AcceleratorVendor.NVIDIA,
+        kind=AcceleratorKind.GPU,
         model="FAKE-A100",
         memory_total_mb=40960,
         memory_free_mb=40960,
-        compute_capability="0.0",
+        compute_arch="0.0",
         fake=True,
     )
     runtime = _Runtime()

@@ -18,6 +18,7 @@ from core.enums import (
     TaskStatus,
     WorkerStatus,
 )
+from core.runtime_profiles import RuntimeProfileCatalog
 from core.state_machine import ensure_transition
 from models.scheduling import (
     GPUDevice,
@@ -29,7 +30,7 @@ from models.scheduling import (
 from models.task import Task, TaskEvent
 from models.usage import ProjectQuotaState, TaskExecution
 from models.worker import Worker
-from repositories.admission import BatchAdmissionSnapshot
+from repositories.admission import AdmissionRepository, BatchAdmissionSnapshot
 from repositories.clock import database_utcnow
 from repositories.outbox import OutboxRepository
 from repositories.quotas import QuotaRepository
@@ -437,6 +438,7 @@ class SchedulingRepository:
         memory_price_per_gb_hour: float,
         gpu_price_per_hour: float,
         admission: BatchAdmissionSnapshot | None = None,
+        runtime_profile_catalog: RuntimeProfileCatalog | None = None,
     ) -> tuple[Task, uuid.UUID]:
         task = await session.scalar(
             select(Task)
@@ -475,6 +477,8 @@ class SchedulingRepository:
         requested_device_ids = tuple(uuid.UUID(value) for value in gpu_device_ids)
         devices: list[GPUDevice] = []
         if admission is not None:
+            if runtime_profile_catalog is None:
+                raise PlacementConflict("runtime profile catalog is unavailable")
             devices = list(
                 await session.scalars(
                     select(GPUDevice)
@@ -497,17 +501,12 @@ class SchedulingRepository:
                 for device in devices
                 if admission.runtime_profile_id in (device.runtime_profile_ids or [])
             ]
-            active_deferred = int(
-                await session.scalar(
-                    select(func.coalesce(func.sum(ResourceReservation.gpu_count), 0)).where(
-                        ResourceReservation.worker_id == worker.id,
-                        ResourceReservation.released_at.is_(None),
-                        ResourceReservation.allocation_authority
-                        == AllocationAuthority.KUBERNETES_DEVICE_PLUGIN.value,
-                        ResourceReservation.requested_vendor == admission.vendor.value,
-                    )
-                )
-                or 0
+            active_deferred = await AdmissionRepository.active_deferred_accelerators_for_pool(
+                session,
+                catalog=runtime_profile_catalog,
+                worker_id=worker.id,
+                vendor=admission.vendor,
+                resource_name=admission.accelerator_resource_name,
             )
             if len(devices) - active_deferred < task.gpu_count:
                 raise PlacementConflict("vendor accelerator capacity changed")

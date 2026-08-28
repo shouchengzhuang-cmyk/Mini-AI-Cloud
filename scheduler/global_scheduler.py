@@ -194,6 +194,7 @@ class GlobalScheduler:
                             memory_price_per_gb_hour=self._memory_price_per_gb_hour,
                             gpu_price_per_hour=self._gpu_price_per_hour,
                             admission=admission,
+                            runtime_profile_catalog=self._runtime_profile_catalog,
                         )
                 except QuotaExceededError as exc:
                     reason = "project_quota_exceeded"

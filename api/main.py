@@ -226,6 +226,7 @@ def create_app(
         batch_size=resolved_settings.batch_size,
         scale_to_zero_enabled=resolved_settings.service_scale_to_zero_enabled,
         kubernetes_runtime=kubernetes_replica_runtime,
+        runtime_profile_catalog=runtime_profile_catalog,
     )
     controllers.insert(
         2,
