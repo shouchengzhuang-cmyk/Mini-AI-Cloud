@@ -1,4 +1,5 @@
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
@@ -105,6 +106,8 @@ class QuotaRepository:
         max_service_replicas: int | None,
         max_artifact_bytes: int | None,
         daily_cost_limit: Decimal | None,
+        max_nvidia_gpus: int | None = None,
+        max_ascend_npus: int | None = None,
     ) -> QuotaSnapshot:
         values: dict[str, Decimal | int | None] = {
             "max_queued_tasks": max_queued_tasks,
@@ -112,6 +115,8 @@ class QuotaRepository:
             "max_cpu_millicores": max_cpu_millicores,
             "max_memory_mb": max_memory_mb,
             "max_gpus": max_gpus,
+            "max_nvidia_gpus": max_nvidia_gpus,
+            "max_ascend_npus": max_ascend_npus,
             "max_services": max_services,
             "max_service_replicas": max_service_replicas,
             "max_artifact_bytes": max_artifact_bytes,
@@ -142,12 +147,12 @@ class QuotaRepository:
         _check_limit("gpus", max_gpus, state.reserved_gpus + state.service_reserved_gpus)
         _check_limit(
             "nvidia_gpus",
-            quota.max_nvidia_gpus,
+            max_nvidia_gpus,
             state.reserved_nvidia_gpus + state.service_reserved_nvidia_gpus,
         )
         _check_limit(
             "ascend_npus",
-            quota.max_ascend_npus,
+            max_ascend_npus,
             state.reserved_ascend_npus + state.service_reserved_ascend_npus,
         )
         _check_limit("services", max_services, state.service_count)
@@ -185,6 +190,7 @@ class QuotaRepository:
         memory_mb: int,
         gpu_count: int,
         accelerator_vendor: AcceleratorVendor | str | None = None,
+        accelerator_vendors: Sequence[AcceleratorVendor | str] | None = None,
     ) -> None:
         """Reject a task that can never fit inside its project's hard limits."""
 
@@ -194,6 +200,27 @@ class QuotaRepository:
         _check_limit("cpu_millicores", quota.max_cpu_millicores, cpu_millicores)
         _check_limit("memory_mb", quota.max_memory_mb, memory_mb)
         _check_limit("gpus", quota.max_gpus, gpu_count)
+        if accelerator_vendors is not None:
+            if accelerator_vendor is not None:
+                raise ValueError("pass accelerator_vendor or accelerator_vendors, not both")
+            vendors = tuple(
+                _normalize_accelerator_vendor(value, gpu_count=gpu_count)
+                for value in accelerator_vendors
+            )
+            if not vendors or any(vendor is None for vendor in vendors):
+                raise ValueError("accelerator_vendors must contain supported vendors")
+            limits = {
+                AcceleratorVendor.NVIDIA: quota.max_nvidia_gpus,
+                AcceleratorVendor.HUAWEI_ASCEND: quota.max_ascend_npus,
+            }
+            candidate_limits = [limits[vendor] for vendor in vendors if vendor is not None]
+            if not any(limit is None or gpu_count <= limit for limit in candidate_limits):
+                raise QuotaExceededError(
+                    "vendor_accelerators",
+                    limit=max(int(limit or 0) for limit in candidate_limits),
+                    requested=gpu_count,
+                )
+            return
         vendor = _normalize_accelerator_vendor(accelerator_vendor, gpu_count=gpu_count)
         if vendor == AcceleratorVendor.NVIDIA:
             _check_limit("nvidia_gpus", quota.max_nvidia_gpus, gpu_count)

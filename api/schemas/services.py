@@ -19,7 +19,13 @@ from api.schemas.accelerators import (
     require_current_execution_support,
 )
 from api.schemas.common import PaginationMeta, RequestModel, ResponseModel
-from core.enums import RuntimeType
+from core.enums import (
+    AcceleratorKind,
+    AcceleratorSelectionPolicy,
+    AcceleratorVendor,
+    AllocationAuthority,
+    RuntimeType,
+)
 from models.service import (
     ReplicaHealth,
     ReplicaStatus,
@@ -59,9 +65,7 @@ class ServiceCreate(RequestModel):
     memory_mb: StrictInt = Field(default=1024, ge=16, le=1_048_576)
     accelerator: AcceleratorRequest | None = Field(
         default=None,
-        description=(
-            "Vendor-neutral NVIDIA/Ascend accelerator request used by A9 admission."
-        ),
+        description=("Vendor-neutral NVIDIA/Ascend accelerator request used by A9 admission."),
     )
     gpu_count: StrictInt = Field(
         default=0,
@@ -151,9 +155,13 @@ class ServiceCreate(RequestModel):
                     "logical model services require vllm with runtime_type='kubernetes'"
                 )
             if self.gpu_count == 0:
-                raise ValueError("logical model services require accelerator count greater than zero")
+                raise ValueError(
+                    "logical model services require accelerator count greater than zero"
+                )
         elif self.model is None and self.registered_model_id is None:
-            raise ValueError("model, registered_model_id or logical_model_id is required")
+            raise ValueError(
+                "model or registered_model_id is required unless logical_model_id is set"
+            )
 
         # Registry-backed requests are validated again after the project-scoped
         # registry defaults have been resolved into a complete service snapshot.
@@ -173,6 +181,10 @@ class ServiceCreate(RequestModel):
         elif self.runtime == ServingRuntime.VLLM:
             if self.runtime_type not in {RuntimeType.DOCKER, RuntimeType.KUBERNETES}:
                 raise ValueError("vllm serving runtime requires docker or kubernetes")
+            if self.runtime_type == RuntimeType.KUBERNETES and self.logical_model_id is None:
+                raise ValueError(
+                    "Kubernetes vllm services require logical_model_id for immutable admission"
+                )
             expected_tensor_parallel_size = max(1, self.gpu_count)
             if self.tensor_parallel_size is None:
                 self.tensor_parallel_size = expected_tensor_parallel_size
@@ -207,6 +219,14 @@ class ServiceCreate(RequestModel):
         )
 
     def require_current_accelerator_execution_support(self) -> None:
+        if (
+            self.logical_model_id is None
+            and self.accelerator is not None
+            and not self.accelerator.is_legacy_gpu_compatible()
+        ):
+            raise ValueError(
+                "vendor-aware services require logical_model_id and Kubernetes admission"
+            )
         require_current_execution_support(self.accelerator)
 
 
@@ -229,6 +249,17 @@ class ServiceResponse(ResponseModel):
     gpu_count: int = Field(ge=0)
     gpu_memory_mb: int = Field(ge=0)
     gpu_model: str | None
+    logical_model_id: uuid.UUID | None
+    model_variant_id: uuid.UUID | None
+    selected_vendor: AcceleratorVendor | None
+    selected_kind: AcceleratorKind | None
+    selected_model: str | None
+    runtime_profile_id: str | None
+    runtime_profile_version: str | None
+    runtime_profile_digest: str | None
+    allocation_authority: AllocationAuthority | None
+    accelerator_resource_name: str | None
+    selection_policy: AcceleratorSelectionPolicy | None
     tensor_parallel_size: int = Field(ge=1)
     dtype: VLLMDType
     gpu_memory_utilization: float = Field(gt=0, le=1)
@@ -269,6 +300,17 @@ class ServiceReplicaResponse(ResponseModel):
     last_health_at: datetime | None
     health_failure_count: int = Field(ge=0)
     active_requests: int = Field(ge=0)
+    logical_model_id: uuid.UUID | None
+    model_variant_id: uuid.UUID | None
+    selected_vendor: AcceleratorVendor | None
+    selected_kind: AcceleratorKind | None
+    selected_model: str | None
+    runtime_profile_id: str | None
+    runtime_profile_version: str | None
+    runtime_profile_digest: str | None
+    allocation_authority: AllocationAuthority | None
+    accelerator_resource_name: str | None
+    selection_policy: AcceleratorSelectionPolicy | None
     model_revision: str | None
     image_digest: str | None
     error_code: str | None

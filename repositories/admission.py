@@ -18,10 +18,15 @@ from core.enums import (
     WorkerStatus,
     WorkloadType,
 )
-from core.runtime_profiles import RuntimeProfileCatalog, RuntimeProfileCompatibilityError
+from core.runtime_profiles import (
+    RuntimeProfileCatalog,
+    RuntimeProfileCompatibilityError,
+    RuntimeProfileManifestEntry,
+)
 from models.admission import AdmissionEvent
 from models.model_variant import ModelVariant
 from models.scheduling import GPUDevice
+from models.task import Task
 from models.worker import Worker
 from repositories.clock import database_utcnow
 from repositories.model_variants import ModelVariantRepository
@@ -85,6 +90,33 @@ class ServiceAdmissionSnapshot:
 @dataclass(frozen=True, slots=True)
 class ServiceAdmissionResult:
     snapshot: ServiceAdmissionSnapshot | None
+    reason: AdmissionRejectionReason | None
+    rejected_vendor: AcceleratorVendor | None
+    summary: tuple[dict[str, object], ...]
+
+    @property
+    def allowed(self) -> bool:
+        return self.snapshot is not None
+
+
+@dataclass(frozen=True, slots=True)
+class BatchAdmissionSnapshot:
+    worker_id: str
+    worker_session_id: uuid.UUID
+    vendor: AcceleratorVendor
+    kind: AcceleratorKind
+    selected_model: str
+    runtime_profile_id: str
+    runtime_profile_version: str
+    runtime_profile_digest: str
+    allocation_authority: AllocationAuthority
+    accelerator_resource_name: str
+    selection_policy: AcceleratorSelectionPolicy
+
+
+@dataclass(frozen=True, slots=True)
+class BatchAdmissionResult:
+    snapshot: BatchAdmissionSnapshot | None
     reason: AdmissionRejectionReason | None
     rejected_vendor: AcceleratorVendor | None
     summary: tuple[dict[str, object], ...]
@@ -296,6 +328,186 @@ class AdmissionRepository:
         return event
 
     @staticmethod
+    async def admit_batch_task(
+        session: AsyncSession,
+        *,
+        catalog: RuntimeProfileCatalog,
+        task: Task,
+        request: AdmissionRequest,
+        allowed_worker_ids: frozenset[str] | None = None,
+    ) -> BatchAdmissionResult:
+        """Select one immutable Kubernetes accelerator pool without binding device rows."""
+
+        if task.runtime_type != RuntimeType.KUBERNETES:
+            raise ValueError("vendor-aware batch admission requires runtime_type='kubernetes'")
+        try:
+            quota = await QuotaRepository.get_locked(session, project_id=task.project_id)
+        except QuotaNotFoundError:
+            quota = await QuotaRepository.initialize(session, project_id=task.project_id)
+        inventory = await AdmissionRepository.list_healthy_inventory_devices(
+            session,
+            vendors=tuple(sorted(request.allowed_vendors, key=lambda item: item.value)),
+            kinds=tuple(sorted(request.allowed_kinds, key=lambda item: item.value)),
+            minimum_memory_mb=task.gpu_memory_mb,
+            runtime_type=RuntimeType.KUBERNETES,
+            for_update=True,
+        )
+        if allowed_worker_ids is not None:
+            inventory = [device for device in inventory if device.worker_id in allowed_worker_ids]
+
+        candidates: list[AdmissionCandidate] = []
+        bindings: dict[str, tuple[InventoryDeviceSnapshot, str, str, str]] = {}
+        groups: dict[
+            tuple[str, AcceleratorVendor, AcceleratorKind, str, str, str, str, str],
+            list[InventoryDeviceSnapshot],
+        ] = {}
+        latest_entries: dict[
+            tuple[AcceleratorVendor, AcceleratorKind, str], RuntimeProfileManifestEntry
+        ] = {}
+        for entry in catalog.manifest.profiles:
+            latest_key = (entry.vendor, entry.kind, entry.profile_id)
+            current = latest_entries.get(latest_key)
+            is_newer = current is None or _profile_version_key(
+                entry.profile_version
+            ) > _profile_version_key(current.profile_version)
+            if is_newer:
+                latest_entries[latest_key] = entry
+        for device in inventory:
+            for entry in latest_entries.values():
+                if (
+                    entry.profile_id not in device.runtime_profile_ids
+                    or entry.vendor != device.vendor
+                    or entry.kind != device.kind
+                    or (
+                        request.runtime_profile_id is not None
+                        and entry.profile_id != request.runtime_profile_id
+                    )
+                ):
+                    continue
+                profile = catalog.load_exact(
+                    profile_id=entry.profile_id,
+                    profile_version=entry.profile_version,
+                    semantic_digest=entry.semantic_digest,
+                )
+                if device.kubernetes_resource_name != profile.kubernetes.resource_name:
+                    continue
+                group_key = (
+                    device.worker_id,
+                    device.vendor,
+                    device.kind,
+                    device.model,
+                    entry.profile_id,
+                    entry.profile_version,
+                    entry.semantic_digest,
+                    profile.kubernetes.resource_name,
+                )
+                groups.setdefault(group_key, []).append(device)
+
+        for index, (group_key, devices) in enumerate(
+            sorted(groups.items(), key=lambda item: item[0])
+        ):
+            (
+                worker_id,
+                vendor,
+                kind,
+                model,
+                profile_id,
+                profile_version,
+                profile_digest,
+                resource_name,
+            ) = group_key
+            profile = catalog.load_exact(
+                profile_id=profile_id,
+                profile_version=profile_version,
+                semantic_digest=profile_digest,
+            )
+            capabilities = (
+                frozenset(
+                    set.intersection(*(set(device.capabilities) for device in devices))
+                    if devices
+                    else set()
+                )
+                | frozenset(profile.capabilities.features)
+                | frozenset(profile.capabilities.dtypes)
+            )
+            candidate_id = f"{worker_id}:{profile_id}@{profile_version}:{model}:{index}"
+            candidate = AdmissionCandidate(
+                candidate_id=candidate_id,
+                vendor=vendor,
+                kind=kind,
+                model=model,
+                runtime_profile_id=profile_id,
+                runtime_profile_version=profile_version,
+                runtime_profile_digest=profile_digest,
+                model_variant_id=None,
+                allocation_authority=AllocationAuthority.KUBERNETES_DEVICE_PLUGIN,
+                available_capacity=len(devices),
+                available_quota=typed_quota_available(quota, vendor),
+                healthy=True,
+                capabilities=capabilities,
+            )
+            candidates.append(candidate)
+            bindings[candidate_id] = (devices[0], resource_name, profile_id, profile_version)
+
+        decision = (
+            choose_admission(request, candidates) if candidates else _missing_pool_decision(request)
+        )
+        summary = candidate_summary(candidates, decision)
+        if not decision.allowed or decision.selected_candidate is None:
+            reason = decision.reason or _profile_reason(_ordered_vendors(request)[0])
+            rejected_vendor = (
+                decision.rejections[0].vendor
+                if decision.rejections
+                else _ordered_vendors(request)[0]
+            )
+            await AdmissionRepository.record_event(
+                session,
+                project_id=task.project_id,
+                workload_type=WorkloadType.BATCH_JOB,
+                workload_id=task.id,
+                policy=request.selection_policy,
+                outcome="rejected",
+                reason=reason.value,
+                summary=summary,
+            )
+            return BatchAdmissionResult(None, reason, rejected_vendor, summary)
+
+        selected = decision.selected_candidate
+        device, resource_name, _profile_id, _profile_version = bindings[selected.candidate_id]
+        await AdmissionRepository.record_event(
+            session,
+            project_id=task.project_id,
+            workload_type=WorkloadType.BATCH_JOB,
+            workload_id=task.id,
+            policy=request.selection_policy,
+            outcome="admitted",
+            reason="admitted",
+            summary=summary,
+            selected_candidate=selected,
+        )
+        assert selected.runtime_profile_id is not None
+        assert selected.runtime_profile_version is not None
+        assert selected.runtime_profile_digest is not None
+        return BatchAdmissionResult(
+            snapshot=BatchAdmissionSnapshot(
+                worker_id=device.worker_id,
+                worker_session_id=device.worker_session_id,
+                vendor=selected.vendor,
+                kind=selected.kind,
+                selected_model=selected.model,
+                runtime_profile_id=selected.runtime_profile_id,
+                runtime_profile_version=selected.runtime_profile_version,
+                runtime_profile_digest=selected.runtime_profile_digest,
+                allocation_authority=selected.allocation_authority,
+                accelerator_resource_name=resource_name,
+                selection_policy=request.selection_policy,
+            ),
+            reason=None,
+            rejected_vendor=None,
+            summary=summary,
+        )
+
+    @staticmethod
     async def admit_logical_model_service(
         session: AsyncSession,
         *,
@@ -458,9 +670,9 @@ def _service_candidates(
             )
         except RuntimeProfileCompatibilityError:
             pass
-        variant_ready = (
-            requested_dtype == "auto" or requested_dtype == variant.dtype
-        ) and len(variant.artifact_source) <= 512
+        variant_ready = (requested_dtype == "auto" or requested_dtype == variant.dtype) and len(
+            variant.artifact_source
+        ) <= 512
         relevant = [
             device
             for device in inventory
@@ -474,14 +686,14 @@ def _service_candidates(
         ]
         groups: dict[tuple[str, str, tuple[str, ...]], list[InventoryDeviceSnapshot]] = {}
         for device in profiled:
-            capabilities = set(device.capabilities)
-            capabilities.add(variant.dtype)
+            capabilities_set = set(device.capabilities)
+            capabilities_set.add(variant.dtype)
             if manifest_entry is not None:
-                capabilities.update(manifest_entry.features)
+                capabilities_set.update(manifest_entry.features)
             key = (
                 device.model,
                 device.kubernetes_resource_name or "",
-                tuple(sorted(capabilities)),
+                tuple(sorted(capabilities_set)),
             )
             groups.setdefault(key, []).append(device)
 
@@ -549,9 +761,7 @@ async def _record_rejected_service_admission(
 ) -> ServiceAdmissionResult:
     reason = decision.reason or _variant_reason(_ordered_vendors(request)[0])
     rejected_vendor = (
-        decision.rejections[0].vendor
-        if decision.rejections
-        else _ordered_vendors(request)[0]
+        decision.rejections[0].vendor if decision.rejections else _ordered_vendors(request)[0]
     )
     summary = candidate_summary(candidates, decision)
     await AdmissionRepository.record_event(
@@ -589,6 +799,21 @@ def _missing_variant_decision(request: AdmissionRequest) -> AdmissionDecision:
                 vendor=vendor,
                 reason=reason,
             ),
+        ),
+    )
+
+
+def _missing_pool_decision(request: AdmissionRequest) -> AdmissionDecision:
+    return AdmissionDecision(
+        accelerator_count=request.count,
+        selected_candidate=None,
+        rejections=tuple(
+            AdmissionRejection(
+                candidate_id=f"no-ready-{vendor.value}-pool",
+                vendor=vendor,
+                reason=_profile_reason(vendor),
+            )
+            for vendor in _ordered_vendors(request)
         ),
     )
 
@@ -659,3 +884,8 @@ def _summary_size(items: list[dict[str, object]]) -> int:
             sort_keys=True,
         ).encode("utf-8")
     )
+
+
+def _profile_version_key(value: str) -> tuple[int, int, int]:
+    major, minor, patch = value.split(".")
+    return int(major), int(minor), int(patch)

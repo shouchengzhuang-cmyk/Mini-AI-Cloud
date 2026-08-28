@@ -11,12 +11,7 @@ from sqlalchemy.exc import IntegrityError
 
 
 def _load_migration() -> Any:
-    path = (
-        Path(__file__).parents[2]
-        / "migrations"
-        / "versions"
-        / "0013_vendor_aware_admission.py"
-    )
+    path = Path(__file__).parents[2] / "migrations" / "versions" / "0013_vendor_aware_admission.py"
     spec = importlib.util.spec_from_file_location("migration_0013", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -147,25 +142,33 @@ def test_vendor_admission_migration_backfills_enforces_and_downgrades(
         legacy = _create_legacy_schema(connection)
         connection.execute(legacy["projects"].insert().values(id=project_id))
         connection.execute(
-            legacy["logical_models"].insert().values(
+            legacy["logical_models"]
+            .insert()
+            .values(
                 id=logical_model_id,
                 project_id=project_id,
             )
         )
         connection.execute(
-            legacy["model_variants"].insert().values(
+            legacy["model_variants"]
+            .insert()
+            .values(
                 id=variant_id,
                 logical_model_id=logical_model_id,
             )
         )
         connection.execute(
-            legacy["project_quotas"].insert().values(
+            legacy["project_quotas"]
+            .insert()
+            .values(
                 project_id=project_id,
                 max_gpus=8,
             )
         )
         connection.execute(
-            legacy["project_quota_state"].insert().values(
+            legacy["project_quota_state"]
+            .insert()
+            .values(
                 project_id=project_id,
                 queued_tasks=0,
                 running_tasks=1,
@@ -183,7 +186,9 @@ def test_vendor_admission_migration_backfills_enforces_and_downgrades(
             )
         )
         connection.execute(
-            legacy["tasks"].insert().values(
+            legacy["tasks"]
+            .insert()
+            .values(
                 id=task_id,
                 project_id=project_id,
                 status="running",
@@ -206,14 +211,10 @@ def test_vendor_admission_migration_backfills_enforces_and_downgrades(
             "requested_profile_version",
             "requested_profile_digest",
             "model_variant_id",
-        } <= {
-            column["name"] for column in inspector.get_columns("task_executions")
-        }
+        } <= {column["name"] for column in inspector.get_columns("task_executions")}
 
         quotas = sa.Table("project_quotas", sa.MetaData(), autoload_with=connection)
-        quota_state = sa.Table(
-            "project_quota_state", sa.MetaData(), autoload_with=connection
-        )
+        quota_state = sa.Table("project_quota_state", sa.MetaData(), autoload_with=connection)
         tasks = sa.Table("tasks", sa.MetaData(), autoload_with=connection)
         services = sa.Table("model_services", sa.MetaData(), autoload_with=connection)
         events = sa.Table("admission_events", sa.MetaData(), autoload_with=connection)
@@ -275,12 +276,11 @@ def test_vendor_admission_migration_backfills_enforces_and_downgrades(
             invalid_service.update(id=uuid.uuid4().hex, selected_kind="gpu")
             connection.execute(services.insert().values(**invalid_service))
 
-        with connection.begin_nested(), pytest.raises(
-            IntegrityError, match="task_accelerator_totals"
+        with (
+            connection.begin_nested(),
+            pytest.raises(IntegrityError, match="task_accelerator_totals"),
         ):
-            connection.execute(
-                quota_state.update().values(reserved_ascend_npus=1)
-            )
+            connection.execute(quota_state.update().values(reserved_ascend_npus=1))
 
         event = {
             "id": uuid.uuid4().hex,
@@ -297,8 +297,9 @@ def test_vendor_admission_migration_backfills_enforces_and_downgrades(
             "candidate_summary": [{"vendor": "nvidia", "healthy": True}],
         }
         connection.execute(events.insert().values(**event))
-        with connection.begin_nested(), pytest.raises(
-            IntegrityError, match="candidate_summary_size"
+        with (
+            connection.begin_nested(),
+            pytest.raises(IntegrityError, match="candidate_summary_size"),
         ):
             oversized = dict(event)
             oversized.update(
@@ -306,8 +307,9 @@ def test_vendor_admission_migration_backfills_enforces_and_downgrades(
                 candidate_summary=[{"reason": "x" * 17_000}],
             )
             connection.execute(events.insert().values(**oversized))
-        with connection.begin_nested(), pytest.raises(
-            IntegrityError, match="candidate_summary_devices"
+        with (
+            connection.begin_nested(),
+            pytest.raises(IntegrityError, match="candidate_summary_devices"),
         ):
             leaking = dict(event)
             leaking.update(

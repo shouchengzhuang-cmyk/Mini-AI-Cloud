@@ -94,8 +94,7 @@ class ProjectQuotaState(Base):
             name="task_accelerator_totals",
         ),
         CheckConstraint(
-            "service_reserved_gpus = service_reserved_nvidia_gpus "
-            "+ service_reserved_ascend_npus",
+            "service_reserved_gpus = service_reserved_nvidia_gpus + service_reserved_ascend_npus",
             name="service_accelerator_totals",
         ),
     )

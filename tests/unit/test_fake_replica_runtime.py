@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import time
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -18,6 +19,7 @@ from core.database import Database
 from core.enums import RuntimeType, WorkerStatus
 from models.base import Base
 from models.identity import Project, User
+from models.model_variant import LogicalModel, ModelVariant
 from models.outbox import OutboxEvent
 from models.registry import RegisteredModel
 from models.service import (
@@ -55,6 +57,8 @@ async def fake_runtime_database(tmp_path: Path) -> AsyncIterator[Database]:
                 cast(Table, ProjectQuotaState.__table__),
                 cast(Table, Worker.__table__),
                 cast(Table, RegisteredModel.__table__),
+                cast(Table, LogicalModel.__table__),
+                cast(Table, ModelVariant.__table__),
                 cast(Table, ModelService.__table__),
                 cast(Table, ServiceReplica.__table__),
                 cast(Table, OutboxEvent.__table__),
@@ -98,6 +102,25 @@ async def _replica(database: Database, service_id: uuid.UUID) -> ServiceReplica:
         replicas = await ServiceRepository.list_replicas(session, service_id)
     assert len(replicas) == 1
     return replicas[0]
+
+
+async def _wait_for_process_exit(process: asyncio.subprocess.Process) -> int:
+    def poll() -> int:
+        deadline = time.monotonic() + 3
+        stat_path = Path(f"/proc/{process.pid}/stat")
+        while time.monotonic() < deadline:
+            if process.returncode is not None:
+                return process.returncode
+            try:
+                state = stat_path.read_text(encoding="utf-8").split()[2]
+            except (FileNotFoundError, ProcessLookupError):
+                return 0
+            if state == "Z":
+                return 0
+            time.sleep(0.01)
+        raise TimeoutError("fake inference process did not exit")
+
+    return await asyncio.to_thread(poll)
 
 
 def test_fake_runtime_claims_use_postgresql_skip_locked() -> None:
@@ -469,7 +492,7 @@ async def test_fake_runtime_restart_cleans_owned_process_and_replaces_lost_repli
             probe_interval_seconds=0.05,
         )
         await replacement.run_once()
-        await asyncio.wait_for(old_process.wait(), timeout=3)
+        await _wait_for_process_exit(old_process)
         original = await _replica(fake_runtime_database, service_id)
         assert original.status == ReplicaStatus.LOST
         assert original.endpoint_url is None
@@ -553,7 +576,7 @@ async def test_fake_runtime_restart_recovers_process_spawned_before_loading_is_p
         )
         await replacement.run_once()
 
-        await asyncio.wait_for(process.wait(), timeout=3)
+        await _wait_for_process_exit(process)
         replica = await _replica(fake_runtime_database, service_id)
         assert replica.status == ReplicaStatus.LOST
         assert replica.endpoint_url is None

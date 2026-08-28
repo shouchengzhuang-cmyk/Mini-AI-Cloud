@@ -740,9 +740,10 @@ class KubernetesReplicaRuntimeController:
                 if not _retry_is_due(service, now):
                     waiting_backoff += 1
                     continue
-                if service.runtime == ServingRuntime.FAKE and (
-                    service.image or self.default_image
-                ) is None:
+                if (
+                    service.runtime == ServingRuntime.FAKE
+                    and (service.image or self.default_image) is None
+                ):
                     _record_scheduling_reason(
                         service,
                         reason=_IMAGE_REQUIRED_REASON,
@@ -1428,8 +1429,7 @@ def _runtime_profile_from_replica_snapshot(
             "Kubernetes accelerator launch requires kubernetes_device_plugin authority"
         )
     if (
-        policy == AcceleratorSelectionPolicy.NVIDIA_ONLY
-        and vendor != AcceleratorVendor.NVIDIA
+        policy == AcceleratorSelectionPolicy.NVIDIA_ONLY and vendor != AcceleratorVendor.NVIDIA
     ) or (
         policy == AcceleratorSelectionPolicy.ASCEND_ONLY
         and vendor != AcceleratorVendor.HUAWEI_ASCEND

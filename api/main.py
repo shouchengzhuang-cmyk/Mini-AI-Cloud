@@ -242,6 +242,7 @@ def create_app(
             cpu_price_per_hour=resolved_settings.cpu_price_per_hour,
             memory_price_per_gb_hour=resolved_settings.memory_price_per_gb_hour,
             gpu_price_per_hour=resolved_settings.gpu_price_per_hour,
+            runtime_profile_catalog=runtime_profile_catalog,
             preemption_enabled=resolved_settings.scheduler_preemption_enabled,
             preemption_min_delta=resolved_settings.scheduler_preemption_min_delta,
         )

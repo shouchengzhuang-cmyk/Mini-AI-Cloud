@@ -106,9 +106,7 @@ class TaskCreate(RequestModel):
     network_enabled: StrictBool = False
     accelerator: AcceleratorRequest | None = Field(
         default=None,
-        description=(
-            "Vendor-neutral NVIDIA/Ascend accelerator request used by A9 admission."
-        ),
+        description=("Vendor-neutral NVIDIA/Ascend accelerator request used by A9 admission."),
     )
     gpu_count: StrictInt = Field(
         default=0,

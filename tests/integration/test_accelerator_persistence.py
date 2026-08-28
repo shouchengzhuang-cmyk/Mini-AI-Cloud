@@ -75,6 +75,15 @@ async def _create_allocation(
             "observed_vendor": vendor.value if observed_device_ids is not None else None,
             "observed_at": now if observed_device_ids is not None else None,
         }
+        profile_snapshot = (
+            {
+                "requested_profile_id": "test-kubernetes-profile",
+                "requested_profile_version": "1.0.0",
+                "requested_profile_digest": "sha256:" + "a" * 64,
+            }
+            if authority == AllocationAuthority.KUBERNETES_DEVICE_PLUGIN
+            else {}
+        )
         session.add(
             TaskExecution(
                 id=execution_id,
@@ -97,6 +106,7 @@ async def _create_allocation(
                 assigned_at=now,
                 runtime_type=RuntimeType.KUBERNETES.value,
                 **observation,
+                **profile_snapshot,
             )
         )
         await session.flush()
@@ -115,6 +125,7 @@ async def _create_allocation(
             legacy_unbound=False,
             created_at=now,
             **observation,
+            **profile_snapshot,
         )
         session.add(reservation)
         await session.flush()

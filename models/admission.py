@@ -116,6 +116,4 @@ class AdmissionEvent(Base):
     )
     allocation_authority: Mapped[str | None] = mapped_column(String(64))
     candidate_summary: Mapped[list[dict[str, object]]] = mapped_column(JSON, default=list)
-    occurred_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow
-    )
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

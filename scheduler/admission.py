@@ -57,9 +57,7 @@ _VENDOR_REASONS = {
         _RejectionCategory.POLICY_EXCLUDED: AdmissionRejectionReason.NVIDIA_POLICY_EXCLUDED,
         _RejectionCategory.VENDOR_NOT_ALLOWED: AdmissionRejectionReason.NVIDIA_VENDOR_NOT_ALLOWED,
         _RejectionCategory.KIND_NOT_ALLOWED: AdmissionRejectionReason.NVIDIA_KIND_NOT_ALLOWED,
-        _RejectionCategory.MODEL_INCOMPATIBLE: (
-            AdmissionRejectionReason.NVIDIA_MODEL_INCOMPATIBLE
-        ),
+        _RejectionCategory.MODEL_INCOMPATIBLE: (AdmissionRejectionReason.NVIDIA_MODEL_INCOMPATIBLE),
         _RejectionCategory.PROFILE_INCOMPATIBLE: (
             AdmissionRejectionReason.NVIDIA_PROFILE_INCOMPATIBLE
         ),
@@ -82,9 +80,7 @@ _VENDOR_REASONS = {
         _RejectionCategory.POLICY_EXCLUDED: AdmissionRejectionReason.ASCEND_POLICY_EXCLUDED,
         _RejectionCategory.VENDOR_NOT_ALLOWED: AdmissionRejectionReason.ASCEND_VENDOR_NOT_ALLOWED,
         _RejectionCategory.KIND_NOT_ALLOWED: AdmissionRejectionReason.ASCEND_KIND_NOT_ALLOWED,
-        _RejectionCategory.MODEL_INCOMPATIBLE: (
-            AdmissionRejectionReason.ASCEND_MODEL_INCOMPATIBLE
-        ),
+        _RejectionCategory.MODEL_INCOMPATIBLE: (AdmissionRejectionReason.ASCEND_MODEL_INCOMPATIBLE),
         _RejectionCategory.PROFILE_INCOMPATIBLE: (
             AdmissionRejectionReason.ASCEND_PROFILE_INCOMPATIBLE
         ),
@@ -277,9 +273,7 @@ class AdmissionDecision:
             return
         if len(self.concrete_device_ids) != self.accelerator_count:
             raise ValueError("exact-device admission must return one device ID per accelerator")
-        if not set(self.concrete_device_ids).issubset(
-            self.selected_candidate.concrete_device_ids
-        ):
+        if not set(self.concrete_device_ids).issubset(self.selected_candidate.concrete_device_ids):
             raise ValueError("decision device IDs must belong to the selected candidate")
 
     @property

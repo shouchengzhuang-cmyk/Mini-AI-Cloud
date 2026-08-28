@@ -22,11 +22,11 @@ from worker.kubernetes_runtime import (
     NETWORK_POLICY_RESOURCE_KIND,
     PROJECT_ID_LABEL,
     RESOURCE_KIND_LABEL,
-    TASK_ID_LABEL,
-    WORKER_ID_LABEL,
     RUNTIME_PROFILE_DIGEST_ANNOTATION,
     RUNTIME_PROFILE_ID_LABEL,
     RUNTIME_PROFILE_VERSION_LABEL,
+    TASK_ID_LABEL,
+    WORKER_ID_LABEL,
     KubernetesGpuUnavailable,
     KubernetesImagePullFailed,
     KubernetesOomKilled,
@@ -178,7 +178,7 @@ async def test_prepare_renders_ascend_resource_from_exact_runtime_profile() -> N
     entry = next(
         profile
         for profile in catalog.manifest.profiles
-        if profile.vendor.value == "huawei-ascend"
+        if profile.identity == "ascend-vllm-k8s-a2@2.0.0"
     )
     spec = replace(
         _spec(),
@@ -198,9 +198,7 @@ async def test_prepare_renders_ascend_resource_from_exact_runtime_profile() -> N
     assert "nvidia.com/gpu" not in container.resources.requests
     assert pod.spec.runtime_class_name == "ascend"
     assert pod.spec.scheduler_name == "volcano"
-    assert pod.spec.node_selector == {
-        "accelerator.mini-ai-cloud/vendor": "huawei-ascend"
-    }
+    assert pod.spec.node_selector == {"accelerator.mini-ai-cloud/vendor": "huawei-ascend"}
     assert pod.spec.tolerations[0].key == "huawei.com/Ascend910"
     assert pod.metadata.labels[ACCELERATOR_VENDOR_LABEL] == "huawei-ascend"
     assert pod.metadata.labels[ACCELERATOR_KIND_LABEL] == "npu"

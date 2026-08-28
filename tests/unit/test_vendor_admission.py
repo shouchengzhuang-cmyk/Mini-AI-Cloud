@@ -25,9 +25,7 @@ def _request(
 ) -> AdmissionRequest:
     values: dict[str, Any] = {
         "count": count,
-        "allowed_vendors": frozenset(
-            {AcceleratorVendor.NVIDIA, AcceleratorVendor.HUAWEI_ASCEND}
-        ),
+        "allowed_vendors": frozenset({AcceleratorVendor.NVIDIA, AcceleratorVendor.HUAWEI_ASCEND}),
         "allowed_kinds": frozenset({AcceleratorKind.GPU, AcceleratorKind.NPU}),
         "required_capabilities": frozenset({"bf16", "tensor-parallel"}),
         "selection_policy": policy,
@@ -221,10 +219,7 @@ def test_requested_model_profile_digest_and_variant_are_hard_filters() -> None:
 
     assert model_decision.reason == AdmissionRejectionReason.ASCEND_MODEL_INCOMPATIBLE
     assert profile_decision.reason == AdmissionRejectionReason.ASCEND_PROFILE_INCOMPATIBLE
-    assert (
-        variant_decision.reason
-        == AdmissionRejectionReason.ASCEND_MODEL_VARIANT_INCOMPATIBLE
-    )
+    assert variant_decision.reason == AdmissionRejectionReason.ASCEND_MODEL_VARIANT_INCOMPATIBLE
 
 
 def test_a_gang_is_never_assembled_from_heterogeneous_capacity_pools() -> None:

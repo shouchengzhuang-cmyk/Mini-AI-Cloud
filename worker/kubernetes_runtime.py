@@ -498,9 +498,7 @@ class KubernetesRuntime:
                     value_from=client.V1EnvVarSource(
                         field_ref=client.V1ObjectFieldSelector(
                             api_version="v1",
-                            field_path=(
-                                f"metadata.annotations['{visibility.annotation_key}']"
-                            ),
+                            field_path=(f"metadata.annotations['{visibility.annotation_key}']"),
                         )
                     ),
                 )
@@ -576,9 +574,7 @@ class KubernetesRuntime:
                 runtime_class_name=(
                     profile.kubernetes.runtime_class_name if profile is not None else None
                 ),
-                scheduler_name=(
-                    profile.kubernetes.scheduler_name if profile is not None else None
-                ),
+                scheduler_name=(profile.kubernetes.scheduler_name if profile is not None else None),
                 security_context=client.V1PodSecurityContext(
                     run_as_non_root=True,
                     # Official Python and Alpine images do not declare USER. An

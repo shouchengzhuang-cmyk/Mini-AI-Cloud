@@ -29,6 +29,7 @@ from models.scheduling import (
 from models.task import Task, TaskEvent
 from models.usage import ProjectQuotaState, TaskExecution
 from models.worker import Worker
+from repositories.admission import BatchAdmissionSnapshot
 from repositories.clock import database_utcnow
 from repositories.outbox import OutboxRepository
 from repositories.quotas import QuotaRepository
@@ -435,6 +436,7 @@ class SchedulingRepository:
         cpu_price_per_hour: float,
         memory_price_per_gb_hour: float,
         gpu_price_per_hour: float,
+        admission: BatchAdmissionSnapshot | None = None,
     ) -> tuple[Task, uuid.UUID]:
         task = await session.scalar(
             select(Task)
@@ -454,6 +456,11 @@ class SchedulingRepository:
             raise PlacementConflict("task dependencies are not ready")
         if worker is None or worker.status != WorkerStatus.ONLINE or worker.overcommitted:
             raise PlacementConflict("worker is unavailable")
+        if admission is not None and (
+            admission.worker_id != worker.id
+            or admission.worker_session_id != worker.worker_session_id
+        ):
+            raise PlacementConflict("vendor admission worker fence changed")
         if worker.running_tasks >= worker.concurrency:
             raise PlacementConflict("worker has no free execution slot")
         if worker.reserved_cpu * 1000 + task.cpu_millicores > worker.cpu_allocatable_millicores:
@@ -461,9 +468,50 @@ class SchedulingRepository:
         if worker.reserved_memory_mb + task.memory_limit_mb > worker.memory_allocatable_mb:
             raise PlacementConflict("worker memory capacity changed")
 
+        if admission is not None and gpu_device_ids:
+            raise PlacementConflict(
+                "kubernetes_device_plugin admission must not bind database device rows"
+            )
         requested_device_ids = tuple(uuid.UUID(value) for value in gpu_device_ids)
         devices: list[GPUDevice] = []
-        if requested_device_ids:
+        if admission is not None:
+            devices = list(
+                await session.scalars(
+                    select(GPUDevice)
+                    .where(
+                        GPUDevice.worker_id == worker.id,
+                        GPUDevice.health == "healthy",
+                        GPUDevice.inventory_generation == worker.inventory_generation,
+                        GPUDevice.vendor == admission.vendor.value,
+                        GPUDevice.accelerator_kind == admission.kind.value,
+                        GPUDevice.model == admission.selected_model,
+                        GPUDevice.kubernetes_resource_name == admission.accelerator_resource_name,
+                    )
+                    .order_by(GPUDevice.device_uuid)
+                    .execution_options(populate_existing=True)
+                    .with_for_update()
+                )
+            )
+            devices = [
+                device
+                for device in devices
+                if admission.runtime_profile_id in (device.runtime_profile_ids or [])
+            ]
+            active_deferred = int(
+                await session.scalar(
+                    select(func.coalesce(func.sum(ResourceReservation.gpu_count), 0)).where(
+                        ResourceReservation.worker_id == worker.id,
+                        ResourceReservation.released_at.is_(None),
+                        ResourceReservation.allocation_authority
+                        == AllocationAuthority.KUBERNETES_DEVICE_PLUGIN.value,
+                        ResourceReservation.requested_vendor == admission.vendor.value,
+                    )
+                )
+                or 0
+            )
+            if len(devices) - active_deferred < task.gpu_count:
+                raise PlacementConflict("vendor accelerator capacity changed")
+        elif requested_device_ids:
             devices = list(
                 await session.scalars(
                     select(GPUDevice)
@@ -519,6 +567,14 @@ class SchedulingRepository:
                 f"worker no longer satisfies task requirements: {rejection.value}"
             )
 
+        authority = (
+            admission.allocation_authority
+            if admission is not None
+            else AllocationAuthority.CONTROL_PLANE_EXACT_DEVICE
+        )
+        requested_vendor = admission.vendor if admission is not None else AcceleratorVendor.NVIDIA
+        requested_kind = admission.kind if admission is not None else AcceleratorKind.GPU
+
         now = await database_utcnow(session)
         previous_status: TaskStatus = task.status
         ensure_transition(task.status, TaskStatus.SCHEDULING)
@@ -540,7 +596,17 @@ class SchedulingRepository:
         task.worker_id = worker.id
         task.execution_id = execution_id
         task.lease_expires_at = now + timedelta(seconds=lease_seconds)
-        task.gpu_device_ids = [device.device_uuid for device in devices]
+        task.gpu_device_ids = (
+            [] if admission is not None else [device.device_uuid for device in devices]
+        )
+        if admission is not None:
+            task.selected_vendor = admission.vendor.value
+            task.selected_kind = admission.kind.value
+            task.selected_model = admission.selected_model
+            task.runtime_profile_id = admission.runtime_profile_id
+            task.runtime_profile_version = admission.runtime_profile_version
+            task.runtime_profile_digest = admission.runtime_profile_digest
+            task.allocation_authority = admission.allocation_authority.value
         task.unschedulable_reason = None
         task.version += 1
         _record_task_event(
@@ -575,14 +641,23 @@ class SchedulingRepository:
             memory_mb=task.memory_limit_mb,
             gpu_count=task.gpu_count,
             gpu_model=task.gpu_model,
-            allocation_authority=AllocationAuthority.CONTROL_PLANE_EXACT_DEVICE.value,
-            requested_vendor=(AcceleratorVendor.NVIDIA.value if task.gpu_count else None),
-            requested_kind=(AcceleratorKind.GPU.value if task.gpu_count else None),
-            observed_device_ids_json=(
-                [device.device_uuid for device in devices] if devices else None
+            allocation_authority=authority.value,
+            requested_vendor=(requested_vendor.value if task.gpu_count else None),
+            requested_kind=(requested_kind.value if task.gpu_count else None),
+            requested_profile_id=(admission.runtime_profile_id if admission is not None else None),
+            requested_profile_version=(
+                admission.runtime_profile_version if admission is not None else None
             ),
-            observed_vendor=(AcceleratorVendor.NVIDIA.value if devices else None),
-            observed_at=(now if devices else None),
+            requested_profile_digest=(
+                admission.runtime_profile_digest if admission is not None else None
+            ),
+            observed_device_ids_json=(
+                [device.device_uuid for device in devices]
+                if devices and admission is None
+                else None
+            ),
+            observed_vendor=(requested_vendor.value if devices and admission is None else None),
+            observed_at=(now if devices and admission is None else None),
             cpu_price_per_hour=Decimal(str(cpu_price_per_hour)),
             memory_price_per_gb_hour=Decimal(str(memory_price_per_gb_hour)),
             gpu_price_per_hour=Decimal(str(gpu_price_per_hour)),
@@ -600,27 +675,37 @@ class SchedulingRepository:
             cpu_millicores=task.cpu_millicores,
             memory_mb=task.memory_limit_mb,
             gpu_count=task.gpu_count,
-            allocation_authority=AllocationAuthority.CONTROL_PLANE_EXACT_DEVICE.value,
-            requested_vendor=(AcceleratorVendor.NVIDIA.value if task.gpu_count else None),
-            requested_kind=(AcceleratorKind.GPU.value if task.gpu_count else None),
-            observed_device_ids_json=(
-                [device.device_uuid for device in devices] if devices else None
+            allocation_authority=authority.value,
+            requested_vendor=(requested_vendor.value if task.gpu_count else None),
+            requested_kind=(requested_kind.value if task.gpu_count else None),
+            requested_profile_id=(admission.runtime_profile_id if admission is not None else None),
+            requested_profile_version=(
+                admission.runtime_profile_version if admission is not None else None
             ),
-            observed_vendor=(AcceleratorVendor.NVIDIA.value if devices else None),
-            observed_at=(now if devices else None),
+            requested_profile_digest=(
+                admission.runtime_profile_digest if admission is not None else None
+            ),
+            observed_device_ids_json=(
+                [device.device_uuid for device in devices]
+                if devices and admission is None
+                else None
+            ),
+            observed_vendor=(requested_vendor.value if devices and admission is None else None),
+            observed_at=(now if devices and admission is None else None),
             state="active",
             created_at=now,
         )
         session.add(reservation)
         await session.flush()
-        for device in devices:
-            session.add(
-                ReservationGPUDevice(
-                    reservation_id=reservation.id,
-                    gpu_device_id=device.id,
-                    created_at=now,
+        if admission is None:
+            for device in devices:
+                session.add(
+                    ReservationGPUDevice(
+                        reservation_id=reservation.id,
+                        gpu_device_id=device.id,
+                        created_at=now,
+                    )
                 )
-            )
         await session.flush()
         await ReservationRepository.assert_exact_device_binding(session, reservation)
 
@@ -630,6 +715,7 @@ class SchedulingRepository:
             cpu_millicores=task.cpu_millicores,
             memory_mb=task.memory_limit_mb,
             gpu_count=task.gpu_count,
+            accelerator_vendor=(requested_vendor if task.gpu_count else None),
         )
 
         OutboxRepository.add(
