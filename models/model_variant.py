@@ -3,6 +3,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     CheckConstraint,
     DateTime,
     Enum,
@@ -15,7 +16,12 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
-from core.enums import AcceleratorKind, AcceleratorVendor, ModelAvailabilityStatus
+from core.enums import (
+    AcceleratorKind,
+    AcceleratorVendor,
+    GatewayRoutingPolicy,
+    ModelAvailabilityStatus,
+)
 from models.base import Base, utcnow
 
 
@@ -31,14 +37,29 @@ def _kind_values(enum_class: type[AcceleratorKind]) -> list[str]:
     return [item.value for item in enum_class]
 
 
+def _routing_policy_values(enum_class: type[GatewayRoutingPolicy]) -> list[str]:
+    return [item.value for item in enum_class]
+
+
 class LogicalModel(Base):
     __tablename__ = "logical_models"
     __table_args__ = (
         UniqueConstraint("project_id", "name", name="uq_logical_models_project_name"),
+        UniqueConstraint(
+            "project_id",
+            "public_name",
+            name="uq_logical_models_project_public_name",
+        ),
         CheckConstraint(
             "status IN ('ready','degraded','disabled')",
             name="logical_model_status",
         ),
+        CheckConstraint(
+            "routing_policy IN "
+            "('strict-nvidia','strict-ascend','prefer-nvidia','prefer-ascend','balanced')",
+            name="logical_model_routing_policy",
+        ),
+        CheckConstraint("routing_cursor >= 0", name="logical_model_routing_cursor"),
         Index("ix_logical_models_project_status_created", "project_id", "status", "created_at"),
     )
 
@@ -60,6 +81,18 @@ class LogicalModel(Base):
         ),
         default=ModelAvailabilityStatus.DISABLED,
     )
+    routing_policy: Mapped[GatewayRoutingPolicy] = mapped_column(
+        Enum(
+            GatewayRoutingPolicy,
+            native_enum=False,
+            length=32,
+            create_constraint=False,
+            values_callable=_routing_policy_values,
+            name="gateway_routing_policy",
+        ),
+        default=GatewayRoutingPolicy.BALANCED,
+    )
+    routing_cursor: Mapped[int] = mapped_column(BigInteger, default=0)
     metadata_json: Mapped[dict[str, object]] = mapped_column("metadata", JSON, default=dict)
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL")

@@ -8,7 +8,12 @@ from pydantic import Field, StrictStr, field_validator, model_validator
 
 from api.schemas.common import PaginationMeta, RequestModel, ResponseModel
 from core.accelerators import vendor_kind_is_compatible
-from core.enums import AcceleratorKind, AcceleratorVendor, ModelAvailabilityStatus
+from core.enums import (
+    AcceleratorKind,
+    AcceleratorVendor,
+    GatewayRoutingPolicy,
+    ModelAvailabilityStatus,
+)
 
 _RESOURCE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _PROFILE_ID = re.compile(r"^[a-z][a-z0-9-]{2,63}$")
@@ -39,6 +44,7 @@ def _normalized_reference(value: str, field: str) -> str:
 class LogicalModelCreate(RequestModel):
     name: StrictStr = Field(min_length=1, max_length=128)
     public_name: StrictStr = Field(min_length=1, max_length=255)
+    routing_policy: GatewayRoutingPolicy = GatewayRoutingPolicy.BALANCED
     description: StrictStr | None = Field(default=None, max_length=2_000)
     metadata: dict[str, object] = Field(default_factory=dict)
 
@@ -89,6 +95,10 @@ class LogicalModelStatusUpdate(RequestModel):
         return normalized
 
 
+class LogicalModelRoutingPolicyUpdate(RequestModel):
+    routing_policy: GatewayRoutingPolicy
+
+
 class LogicalModelResponse(ResponseModel):
     id: uuid.UUID
     project_id: uuid.UUID
@@ -96,6 +106,7 @@ class LogicalModelResponse(ResponseModel):
     public_name: str
     description: str | None
     status: ModelAvailabilityStatus
+    routing_policy: GatewayRoutingPolicy
     metadata: dict[str, object]
     created_by_user_id: uuid.UUID | None
     created_at: datetime

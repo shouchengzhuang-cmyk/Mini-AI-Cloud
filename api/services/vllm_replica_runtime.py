@@ -12,7 +12,7 @@ import psutil
 from sqlalchemy import Select, func, or_, select
 
 from core.database import Database
-from core.enums import ErrorCode, RuntimeType, WorkerStatus
+from core.enums import AcceleratorKind, AcceleratorVendor, ErrorCode, RuntimeType, WorkerStatus
 from core.logging import get_logger
 from models.service import (
     ModelService,
@@ -260,6 +260,11 @@ class VLLMReplicaRuntimeController:
         devices = await asyncio.to_thread(self.inventory_provider.list_devices)
         if any(device.fake for device in devices) and not self.allow_fake_gpu_inventory:
             raise ValueError("fake GPU inventory cannot launch real vLLM containers")
+        if any(
+            device.vendor != AcceleratorVendor.NVIDIA or device.kind != AcceleratorKind.GPU
+            for device in devices
+        ):
+            raise ValueError("Docker vLLM runtime only accepts NVIDIA GPU inventory")
         if len({device.uuid for device in devices}) != len(devices):
             raise ValueError("vLLM GPU inventory contains duplicate device UUIDs")
         self._devices = tuple(sorted(devices, key=lambda item: (item.index, item.uuid)))
@@ -293,11 +298,16 @@ class VLLMReplicaRuntimeController:
                     {
                         "uuid": item.uuid,
                         "index": item.index,
-                        "vendor": item.vendor,
+                        "vendor": item.vendor.value,
+                        "accelerator_kind": item.kind.value,
                         "model": item.model,
                         "memory_total_mb": item.memory_total_mb,
                         "memory_free_mb": item.memory_free_mb,
                         "compute_capability": item.compute_capability,
+                        "compute_arch": item.compute_arch,
+                        "runtime_profile_ids": list(item.runtime_profile_ids),
+                        "capabilities": list(item.capabilities),
+                        "kubernetes_resource_name": item.kubernetes_resource_name,
                         "fake": item.fake,
                     }
                     for item in self._devices

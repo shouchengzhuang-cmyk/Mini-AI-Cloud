@@ -19,6 +19,14 @@ class AcceleratorSelectionPolicy(StrEnum):
     PREFER_ASCEND = "prefer-ascend"
 
 
+class GatewayRoutingPolicy(StrEnum):
+    STRICT_NVIDIA = "strict-nvidia"
+    STRICT_ASCEND = "strict-ascend"
+    PREFER_NVIDIA = "prefer-nvidia"
+    PREFER_ASCEND = "prefer-ascend"
+    BALANCED = "balanced"
+
+
 class AllocationAuthority(StrEnum):
     CONTROL_PLANE_EXACT_DEVICE = "control_plane_exact_device"
     KUBERNETES_DEVICE_PLUGIN = "kubernetes_device_plugin"

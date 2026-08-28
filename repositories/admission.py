@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import uuid
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.accelerators import kind_for_vendor
 from core.enums import (
     AcceleratorKind,
     AcceleratorSelectionPolicy,
@@ -25,7 +26,8 @@ from core.runtime_profiles import (
 )
 from models.admission import AdmissionEvent
 from models.model_variant import ModelVariant
-from models.scheduling import GPUDevice
+from models.scheduling import GPUDevice, ResourceReservation
+from models.service import ModelService
 from models.task import Task
 from models.worker import Worker
 from repositories.clock import database_utcnow
@@ -44,7 +46,6 @@ from scheduler.admission import (
     choose_admission,
 )
 
-_UNBOUNDED_ACCELERATOR_QUOTA = 64
 _CANDIDATE_SUMMARY_MAX_BYTES = 15_500
 
 
@@ -52,6 +53,7 @@ _CANDIDATE_SUMMARY_MAX_BYTES = 15_500
 class InventoryDeviceSnapshot:
     device_id: uuid.UUID
     worker_id: str
+    node_name: str
     worker_session_id: uuid.UUID
     worker_status: WorkerStatus
     worker_runtime_types: tuple[str, ...]
@@ -132,8 +134,49 @@ class _ServiceCandidateBinding:
     resource_name: str | None
 
 
-def typed_quota_available(snapshot: QuotaSnapshot, vendor: AcceleratorVendor) -> int:
-    """Return remaining aggregate-and-vendor accelerator quota under a locked snapshot."""
+@dataclass(frozen=True, slots=True)
+class _DeferredReservationTotal:
+    worker_id: str
+    vendor: str
+    profile_id: str | None
+    profile_version: str | None
+    profile_digest: str | None
+    accelerator_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class _DeferredAcceleratorUsage:
+    by_worker_resource: Mapping[tuple[str, str, str], int] = field(default_factory=dict)
+    unknown_by_worker_vendor: Mapping[tuple[str, str], int] = field(default_factory=dict)
+
+    def for_pool(self, *, worker_id: str, vendor: AcceleratorVendor, resource_name: str) -> int:
+        vendor_value = vendor.value
+        return self.by_worker_resource.get(
+            (worker_id, vendor_value, resource_name),
+            0,
+        ) + self.unknown_by_worker_vendor.get((worker_id, vendor_value), 0)
+
+
+@dataclass(frozen=True, slots=True)
+class _ServiceAcceleratorUsage:
+    by_resource: Mapping[tuple[str, str], int] = field(default_factory=dict)
+    unknown_by_vendor: Mapping[str, int] = field(default_factory=dict)
+    unknown_vendor: int = 0
+
+    def for_pool(self, *, vendor: AcceleratorVendor, resource_name: str) -> int:
+        vendor_value = vendor.value
+        return (
+            self.by_resource.get((vendor_value, resource_name), 0)
+            + self.unknown_by_vendor.get(vendor_value, 0)
+            + self.unknown_vendor
+        )
+
+
+def typed_quota_available(
+    snapshot: QuotaSnapshot,
+    vendor: AcceleratorVendor,
+) -> int | None:
+    """Return finite remaining typed quota, or ``None`` when both limits are unlimited."""
 
     quota = snapshot.quota
     state = snapshot.state
@@ -151,7 +194,12 @@ def typed_quota_available(snapshot: QuotaSnapshot, vendor: AcceleratorVendor) ->
             quota.max_ascend_npus,
             state.reserved_ascend_npus + state.service_reserved_ascend_npus,
         )
-    return max(0, min(aggregate_available, typed_available))
+    finite_limits = tuple(
+        available for available in (aggregate_available, typed_available) if available is not None
+    )
+    if not finite_limits:
+        return None
+    return max(0, min(finite_limits))
 
 
 def candidate_summary(
@@ -212,13 +260,18 @@ class AdmissionRepository:
     ) -> list[InventoryDeviceSnapshot]:
         if minimum_memory_mb < 0:
             raise ValueError("minimum_memory_mb must not be negative")
+        accepted_health = (
+            ("healthy", "inventory-only")
+            if runtime_type == RuntimeType.KUBERNETES
+            else ("healthy",)
+        )
         query = (
             select(GPUDevice, Worker)
             .join(Worker, Worker.id == GPUDevice.worker_id)
             .where(
                 Worker.status == WorkerStatus.ONLINE,
                 Worker.overcommitted.is_(False),
-                GPUDevice.health == "healthy",
+                GPUDevice.health.in_(accepted_health),
                 GPUDevice.inventory_generation == Worker.inventory_generation,
                 GPUDevice.memory_free_mb >= minimum_memory_mb,
                 GPUDevice.vendor.in_(tuple(vendor.value for vendor in vendors)),
@@ -245,6 +298,7 @@ class AdmissionRepository:
                 InventoryDeviceSnapshot(
                     device_id=device.id,
                     worker_id=worker.id,
+                    node_name=worker.node_name or worker.id,
                     worker_session_id=worker.worker_session_id,
                     worker_status=worker.status,
                     worker_runtime_types=runtime_types,
@@ -262,6 +316,31 @@ class AdmissionRepository:
                 )
             )
         return result
+
+    @staticmethod
+    async def active_deferred_accelerators_for_pool(
+        session: AsyncSession,
+        *,
+        catalog: RuntimeProfileCatalog,
+        worker_id: str,
+        vendor: AcceleratorVendor,
+        resource_name: str,
+    ) -> int:
+        """Return active deferred usage for one exact Kubernetes resource pool."""
+
+        normalized_resource = resource_name.strip()
+        if not normalized_resource:
+            raise ValueError("resource_name must not be blank")
+        usage = await _active_deferred_accelerators(
+            session,
+            catalog=catalog,
+            worker_ids=frozenset({worker_id}),
+        )
+        return usage.for_pool(
+            worker_id=worker_id,
+            vendor=vendor,
+            resource_name=normalized_resource,
+        )
 
     @staticmethod
     async def record_event(
@@ -355,6 +434,12 @@ class AdmissionRepository:
         if allowed_worker_ids is not None:
             inventory = [device for device in inventory if device.worker_id in allowed_worker_ids]
 
+        active_deferred = await _active_deferred_accelerators(
+            session,
+            catalog=catalog,
+            worker_ids=frozenset(device.worker_id for device in inventory),
+        )
+
         candidates: list[AdmissionCandidate] = []
         bindings: dict[str, tuple[InventoryDeviceSnapshot, str, str, str]] = {}
         groups: dict[
@@ -431,6 +516,7 @@ class AdmissionRepository:
                 | frozenset(profile.capabilities.dtypes)
             )
             candidate_id = f"{worker_id}:{profile_id}@{profile_version}:{model}:{index}"
+            finite_quota = typed_quota_available(quota, vendor)
             candidate = AdmissionCandidate(
                 candidate_id=candidate_id,
                 vendor=vendor,
@@ -441,8 +527,16 @@ class AdmissionRepository:
                 runtime_profile_digest=profile_digest,
                 model_variant_id=None,
                 allocation_authority=AllocationAuthority.KUBERNETES_DEVICE_PLUGIN,
-                available_capacity=len(devices),
-                available_quota=typed_quota_available(quota, vendor),
+                available_capacity=max(
+                    0,
+                    len(devices)
+                    - active_deferred.for_pool(
+                        worker_id=worker_id,
+                        vendor=vendor,
+                        resource_name=resource_name,
+                    ),
+                ),
+                available_quota=(request.count if finite_quota is None else finite_quota),
                 healthy=True,
                 capabilities=capabilities,
             )
@@ -543,6 +637,12 @@ class AdmissionRepository:
             runtime_type=RuntimeType.KUBERNETES,
             for_update=True,
         )
+        service_usage = await _active_service_accelerators(session)
+        deferred_usage = await _active_deferred_accelerators(
+            session,
+            catalog=catalog,
+            worker_ids=frozenset(device.worker_id for device in inventory),
+        )
         candidates, bindings = _service_candidates(
             variants=variants,
             inventory=inventory,
@@ -551,6 +651,8 @@ class AdmissionRepository:
             request=request,
             desired_replicas=desired_replicas,
             requested_dtype=requested_dtype,
+            service_usage=service_usage,
+            deferred_usage=deferred_usage,
         )
         if candidates:
             decision = choose_admission(request, candidates)
@@ -642,6 +744,269 @@ class AdmissionRepository:
             summary=summary,
         )
 
+    @staticmethod
+    async def revalidate_logical_model_service_scale(
+        session: AsyncSession,
+        *,
+        catalog: RuntimeProfileCatalog,
+        service: ModelService,
+        desired_replicas: int,
+    ) -> ServiceAdmissionResult:
+        """Re-admit one immutable logical-service snapshot before a positive scale-up."""
+
+        if desired_replicas <= service.desired_replicas:
+            raise ValueError("service scale revalidation requires a positive replica delta")
+        try:
+            vendor = (
+                AcceleratorVendor(service.selected_vendor)
+                if service.selected_vendor is not None
+                else None
+            )
+        except ValueError:
+            vendor = None
+        try:
+            kind = (
+                AcceleratorKind(service.selected_kind)
+                if service.selected_kind is not None
+                else None
+            )
+        except ValueError:
+            kind = None
+        try:
+            policy = (
+                AcceleratorSelectionPolicy(service.selection_policy)
+                if service.selection_policy is not None
+                else None
+            )
+        except ValueError:
+            policy = None
+        invalid_snapshot = (
+            service.logical_model_id is None
+            or service.model_variant_id is None
+            or vendor is None
+            or kind is None
+            or kind != kind_for_vendor(vendor)
+            or service.selected_model is None
+            or not service.selected_model.strip()
+            or service.runtime_profile_id is None
+            or not service.runtime_profile_id.strip()
+            or service.runtime_profile_version is None
+            or not service.runtime_profile_version.strip()
+            or service.runtime_profile_digest is None
+            or not service.runtime_profile_digest.strip()
+            or service.accelerator_resource_name is None
+            or not service.accelerator_resource_name.strip()
+            or policy is None
+            or service.runtime_type != RuntimeType.KUBERNETES
+            or not 1 <= service.gpu_count <= 64
+            or service.tensor_parallel_size != service.gpu_count
+            or service.allocation_authority != AllocationAuthority.KUBERNETES_DEVICE_PLUGIN.value
+        )
+        if invalid_snapshot:
+            return await _record_invalid_service_snapshot(
+                session,
+                service=service,
+                vendor=vendor,
+                policy=policy,
+            )
+        assert service.logical_model_id is not None
+        assert service.model_variant_id is not None
+        assert vendor is not None
+        assert kind is not None
+        assert service.selected_model is not None
+        assert service.runtime_profile_id is not None
+        assert service.runtime_profile_version is not None
+        assert service.runtime_profile_digest is not None
+        assert service.accelerator_resource_name is not None
+        assert policy is not None
+        allowed_vendors = {vendor}
+        if policy == AcceleratorSelectionPolicy.PREFER_NVIDIA:
+            allowed_vendors.add(AcceleratorVendor.NVIDIA)
+        elif policy == AcceleratorSelectionPolicy.PREFER_ASCEND:
+            allowed_vendors.add(AcceleratorVendor.HUAWEI_ASCEND)
+        request = AdmissionRequest(
+            count=service.gpu_count,
+            allowed_vendors=frozenset(allowed_vendors),
+            allowed_kinds=frozenset(kind_for_vendor(item) for item in allowed_vendors),
+            allowed_models=frozenset({service.selected_model}),
+            runtime_profile_id=service.runtime_profile_id,
+            runtime_profile_version=service.runtime_profile_version,
+            runtime_profile_digest=service.runtime_profile_digest,
+            model_variant_id=str(service.model_variant_id),
+            selection_policy=policy,
+        )
+
+        variant = await ModelVariantRepository.get(
+            session,
+            project_id=service.project_id,
+            logical_model_id=service.logical_model_id,
+            variant_id=service.model_variant_id,
+            for_update=False,
+        )
+        invalid_snapshot = not _service_variant_snapshot_matches(
+            service,
+            variant,
+            vendor=vendor,
+            kind=kind,
+        )
+        if invalid_snapshot:
+            return await _record_rejected_service_admission(
+                session,
+                project_id=service.project_id,
+                service_id=service.id,
+                request=request,
+                candidates=(),
+                decision=_single_service_rejection(
+                    request,
+                    vendor=vendor,
+                    reason=_variant_reason(vendor),
+                    candidate_id="stale-service-admission-snapshot",
+                ),
+            )
+        assert variant is not None
+
+        try:
+            quota = await QuotaRepository.get_locked(session, project_id=service.project_id)
+        except QuotaNotFoundError:
+            quota = await QuotaRepository.initialize(session, project_id=service.project_id)
+        inventory = await AdmissionRepository.list_healthy_inventory_devices(
+            session,
+            vendors=(vendor,),
+            kinds=(kind,),
+            minimum_memory_mb=service.gpu_memory_mb,
+            runtime_type=RuntimeType.KUBERNETES,
+            for_update=True,
+        )
+        service_usage = await _active_service_accelerators(
+            session,
+            exclude_service_id=service.id,
+        )
+        deferred_usage = await _active_deferred_accelerators(
+            session,
+            catalog=catalog,
+            worker_ids=frozenset(device.worker_id for device in inventory),
+        )
+        candidates, bindings = _service_candidates(
+            variants=(variant,),
+            inventory=inventory,
+            catalog=catalog,
+            quota=quota,
+            request=request,
+            desired_replicas=desired_replicas,
+            requested_dtype=service.dtype,
+            service_usage=service_usage,
+            deferred_usage=deferred_usage,
+            quota_credit=service.gpu_count * service.desired_replicas,
+        )
+        decision = (
+            choose_admission(request, candidates)
+            if candidates
+            else _missing_variant_decision(request)
+        )
+        if not decision.allowed or decision.selected_candidate is None:
+            return await _record_rejected_service_admission(
+                session,
+                project_id=service.project_id,
+                service_id=service.id,
+                request=request,
+                candidates=candidates,
+                decision=decision,
+            )
+
+        selected = decision.selected_candidate
+        binding = bindings[selected.candidate_id]
+        locked_variant = await ModelVariantRepository.revalidate_ready_for_reservation(
+            session,
+            project_id=service.project_id,
+            logical_model_id=service.logical_model_id,
+            expected_variant_id=variant.id,
+            expected_vendor=variant.vendor,
+            expected_kind=variant.kind,
+            expected_runtime_profile_id=variant.runtime_profile_id,
+            expected_runtime_profile_version=variant.runtime_profile_version,
+            expected_artifact_digest=variant.artifact_digest,
+            expected_runtime_profile_digest=variant.runtime_profile_digest,
+        )
+        if not _service_variant_snapshot_matches(
+            service,
+            locked_variant,
+            vendor=vendor,
+            kind=kind,
+        ):
+            return await _record_rejected_service_admission(
+                session,
+                project_id=service.project_id,
+                service_id=service.id,
+                request=request,
+                candidates=candidates,
+                decision=_single_service_rejection(
+                    request,
+                    vendor=vendor,
+                    reason=_variant_reason(vendor),
+                    candidate_id=selected.candidate_id,
+                ),
+            )
+        assert locked_variant is not None
+        if (
+            selected.vendor != vendor
+            or selected.kind != kind
+            or selected.model != service.selected_model
+            or selected.runtime_profile_id != service.runtime_profile_id
+            or selected.runtime_profile_version != service.runtime_profile_version
+            or selected.runtime_profile_digest != service.runtime_profile_digest
+            or selected.model_variant_id != str(service.model_variant_id)
+            or selected.allocation_authority != AllocationAuthority.KUBERNETES_DEVICE_PLUGIN
+            or binding.resource_name != service.accelerator_resource_name
+        ):
+            return await _record_rejected_service_admission(
+                session,
+                project_id=service.project_id,
+                service_id=service.id,
+                request=request,
+                candidates=candidates,
+                decision=_single_service_rejection(
+                    request,
+                    vendor=vendor,
+                    reason=_profile_reason(vendor),
+                    candidate_id=selected.candidate_id,
+                ),
+            )
+
+        summary = candidate_summary(candidates, decision)
+        await AdmissionRepository.record_event(
+            session,
+            project_id=service.project_id,
+            workload_type=WorkloadType.MODEL_SERVICE,
+            workload_id=service.id,
+            policy=request.selection_policy,
+            outcome="admitted",
+            reason="scale_up_admitted",
+            summary=summary,
+            selected_candidate=selected,
+        )
+        return ServiceAdmissionResult(
+            snapshot=ServiceAdmissionSnapshot(
+                logical_model_id=service.logical_model_id,
+                model_variant_id=locked_variant.id,
+                vendor=vendor,
+                kind=kind,
+                selected_model=selected.model,
+                runtime_profile_id=locked_variant.runtime_profile_id,
+                runtime_profile_version=locked_variant.runtime_profile_version,
+                runtime_profile_digest=locked_variant.runtime_profile_digest,
+                allocation_authority=selected.allocation_authority,
+                accelerator_resource_name=service.accelerator_resource_name,
+                selection_policy=request.selection_policy,
+                artifact_source=locked_variant.artifact_source,
+                artifact_revision=locked_variant.artifact_revision,
+                artifact_digest=locked_variant.artifact_digest,
+                dtype=locked_variant.dtype,
+            ),
+            reason=None,
+            rejected_vendor=None,
+            summary=summary,
+        )
+
 
 def _service_candidates(
     *,
@@ -652,12 +1017,20 @@ def _service_candidates(
     request: AdmissionRequest,
     desired_replicas: int,
     requested_dtype: str,
+    service_usage: _ServiceAcceleratorUsage | None = None,
+    deferred_usage: _DeferredAcceleratorUsage | None = None,
+    quota_credit: int = 0,
 ) -> tuple[list[AdmissionCandidate], dict[str, _ServiceCandidateBinding]]:
+    if quota_credit < 0:
+        raise ValueError("quota_credit must not be negative")
     candidates: list[AdmissionCandidate] = []
     bindings: dict[str, _ServiceCandidateBinding] = {}
+    service_usage = service_usage or _ServiceAcceleratorUsage()
+    deferred_usage = deferred_usage or _DeferredAcceleratorUsage()
     commitment_divisor = max(1, desired_replicas)
     for variant in variants:
         manifest_entry = None
+        runtime_profile = None
         try:
             manifest_entry = catalog.resolve_compatible(
                 profile_id=variant.runtime_profile_id,
@@ -667,6 +1040,11 @@ def _service_candidates(
                 kind=variant.kind,
                 architecture=variant.architecture,
                 dtype=variant.dtype,
+            )
+            runtime_profile = catalog.load_exact(
+                profile_id=variant.runtime_profile_id,
+                profile_version=variant.runtime_profile_version,
+                semantic_digest=variant.runtime_profile_digest,
             )
         except RuntimeProfileCompatibilityError:
             pass
@@ -682,25 +1060,44 @@ def _service_candidates(
             device
             for device in relevant
             if variant.runtime_profile_id in device.runtime_profile_ids
-            and device.kubernetes_resource_name is not None
+            and runtime_profile is not None
+            and device.kubernetes_resource_name == runtime_profile.kubernetes.resource_name
         ]
-        groups: dict[tuple[str, str, tuple[str, ...]], list[InventoryDeviceSnapshot]] = {}
+        groups: dict[
+            tuple[str, str, str, str, tuple[str, ...]],
+            list[InventoryDeviceSnapshot],
+        ] = {}
         for device in profiled:
             capabilities_set = set(device.capabilities)
             capabilities_set.add(variant.dtype)
             if manifest_entry is not None:
                 capabilities_set.update(manifest_entry.features)
             key = (
+                device.worker_id,
+                device.node_name,
                 device.model,
                 device.kubernetes_resource_name or "",
                 tuple(sorted(capabilities_set)),
             )
             groups.setdefault(key, []).append(device)
 
-        available_quota = typed_quota_available(quota, variant.vendor) // commitment_divisor
+        finite_quota = typed_quota_available(quota, variant.vendor)
+        if finite_quota is not None:
+            finite_quota += quota_credit
+        available_quota = (
+            request.count if finite_quota is None else finite_quota // commitment_divisor
+        )
         for index, (key, devices) in enumerate(sorted(groups.items()), start=1):
-            model, resource_name, capabilities = key
+            worker_id, _node_name, model, resource_name, capabilities = key
             candidate_id = f"{variant.id}:{index}"
+            occupied = service_usage.for_pool(
+                vendor=variant.vendor,
+                resource_name=resource_name,
+            ) + deferred_usage.for_pool(
+                worker_id=worker_id,
+                vendor=variant.vendor,
+                resource_name=resource_name,
+            )
             candidate = AdmissionCandidate(
                 candidate_id=candidate_id,
                 vendor=variant.vendor,
@@ -711,7 +1108,7 @@ def _service_candidates(
                 runtime_profile_digest=variant.runtime_profile_digest,
                 model_variant_id=str(variant.id),
                 allocation_authority=AllocationAuthority.KUBERNETES_DEVICE_PLUGIN,
-                available_capacity=len(devices) // commitment_divisor,
+                available_capacity=max(0, len(devices) - occupied) // commitment_divisor,
                 available_quota=available_quota,
                 healthy=True,
                 capabilities=frozenset(capabilities),
@@ -748,6 +1145,81 @@ def _service_candidates(
         candidates.append(candidate)
         bindings[candidate_id] = _ServiceCandidateBinding(variant=variant, resource_name=None)
     return candidates, bindings
+
+
+def _service_variant_snapshot_matches(
+    service: ModelService,
+    variant: ModelVariant | None,
+    *,
+    vendor: AcceleratorVendor,
+    kind: AcceleratorKind,
+) -> bool:
+    return (
+        variant is not None
+        and variant.id == service.model_variant_id
+        and variant.logical_model_id == service.logical_model_id
+        and variant.vendor == vendor
+        and variant.kind == kind
+        and variant.runtime_profile_id == service.runtime_profile_id
+        and variant.runtime_profile_version == service.runtime_profile_version
+        and variant.runtime_profile_digest == service.runtime_profile_digest
+        and variant.artifact_source == service.model
+        and variant.artifact_revision == service.model_revision
+        and variant.dtype == service.dtype
+    )
+
+
+def _single_service_rejection(
+    request: AdmissionRequest,
+    *,
+    vendor: AcceleratorVendor,
+    reason: AdmissionRejectionReason,
+    candidate_id: str,
+) -> AdmissionDecision:
+    return AdmissionDecision(
+        accelerator_count=request.count,
+        selected_candidate=None,
+        rejections=(
+            AdmissionRejection(
+                candidate_id=candidate_id,
+                vendor=vendor,
+                reason=reason,
+            ),
+        ),
+    )
+
+
+async def _record_invalid_service_snapshot(
+    session: AsyncSession,
+    *,
+    service: ModelService,
+    vendor: AcceleratorVendor | None,
+    policy: AcceleratorSelectionPolicy | None,
+) -> ServiceAdmissionResult:
+    reason = _variant_reason(vendor) if vendor is not None else None
+    reason_value = reason.value if reason is not None else "invalid_service_admission_snapshot"
+    summary: tuple[dict[str, object], ...] = (
+        {
+            "candidate_id": "stale-service-admission-snapshot",
+            "reason": reason_value,
+        },
+    )
+    await AdmissionRepository.record_event(
+        session,
+        project_id=service.project_id,
+        workload_type=WorkloadType.MODEL_SERVICE,
+        workload_id=service.id,
+        policy=policy or AcceleratorSelectionPolicy.ANY,
+        outcome="rejected",
+        reason=reason_value,
+        summary=summary,
+    )
+    return ServiceAdmissionResult(
+        snapshot=None,
+        reason=reason,
+        rejected_vendor=vendor,
+        summary=summary,
+    )
 
 
 async def _record_rejected_service_admission(
@@ -852,9 +1324,142 @@ def _profile_reason(vendor: AcceleratorVendor) -> AdmissionRejectionReason:
     return AdmissionRejectionReason.ASCEND_PROFILE_UNAVAILABLE
 
 
-def _remaining(limit: int | None, used: int) -> int:
+async def _active_deferred_accelerators(
+    session: AsyncSession,
+    *,
+    catalog: RuntimeProfileCatalog,
+    worker_ids: frozenset[str],
+) -> _DeferredAcceleratorUsage:
+    if not worker_ids:
+        return _DeferredAcceleratorUsage()
+    rows = await session.execute(
+        select(
+            ResourceReservation.worker_id,
+            ResourceReservation.requested_vendor,
+            ResourceReservation.requested_profile_id,
+            ResourceReservation.requested_profile_version,
+            ResourceReservation.requested_profile_digest,
+            func.coalesce(func.sum(ResourceReservation.gpu_count), 0),
+        )
+        .where(
+            ResourceReservation.worker_id.in_(worker_ids),
+            ResourceReservation.released_at.is_(None),
+            ResourceReservation.allocation_authority
+            == AllocationAuthority.KUBERNETES_DEVICE_PLUGIN.value,
+            ResourceReservation.requested_vendor.is_not(None),
+        )
+        .group_by(
+            ResourceReservation.worker_id,
+            ResourceReservation.requested_vendor,
+            ResourceReservation.requested_profile_id,
+            ResourceReservation.requested_profile_version,
+            ResourceReservation.requested_profile_digest,
+        )
+    )
+    totals = [
+        _DeferredReservationTotal(
+            worker_id=worker_id,
+            vendor=vendor,
+            profile_id=profile_id,
+            profile_version=profile_version,
+            profile_digest=profile_digest,
+            accelerator_count=int(accelerator_count),
+        )
+        for (
+            worker_id,
+            vendor,
+            profile_id,
+            profile_version,
+            profile_digest,
+            accelerator_count,
+        ) in rows
+        if vendor is not None
+    ]
+    return _classify_deferred_accelerators(totals, catalog=catalog)
+
+
+def _classify_deferred_accelerators(
+    totals: Sequence[_DeferredReservationTotal],
+    *,
+    catalog: RuntimeProfileCatalog,
+) -> _DeferredAcceleratorUsage:
+    by_worker_resource: dict[tuple[str, str, str], int] = {}
+    unknown_by_worker_vendor: dict[tuple[str, str], int] = {}
+    for total in totals:
+        resource_name: str | None = None
+        if (
+            total.profile_id is not None
+            and total.profile_version is not None
+            and total.profile_digest is not None
+        ):
+            try:
+                profile = catalog.load_exact(
+                    profile_id=total.profile_id,
+                    profile_version=total.profile_version,
+                    semantic_digest=total.profile_digest,
+                )
+                if profile.vendor.value == total.vendor:
+                    resource_name = profile.kubernetes.resource_name
+            except RuntimeProfileCompatibilityError:
+                pass
+        if resource_name is None:
+            fallback_key = (total.worker_id, total.vendor)
+            unknown_by_worker_vendor[fallback_key] = (
+                unknown_by_worker_vendor.get(fallback_key, 0) + total.accelerator_count
+            )
+            continue
+        resource_key = (total.worker_id, total.vendor, resource_name)
+        by_worker_resource[resource_key] = (
+            by_worker_resource.get(resource_key, 0) + total.accelerator_count
+        )
+    return _DeferredAcceleratorUsage(
+        by_worker_resource=by_worker_resource,
+        unknown_by_worker_vendor=unknown_by_worker_vendor,
+    )
+
+
+async def _active_service_accelerators(
+    session: AsyncSession,
+    *,
+    exclude_service_id: uuid.UUID | None = None,
+) -> _ServiceAcceleratorUsage:
+    query = select(
+        ModelService.selected_vendor,
+        ModelService.accelerator_resource_name,
+        ModelService.gpu_count,
+        ModelService.tensor_parallel_size,
+        ModelService.desired_replicas,
+    ).where(
+        ModelService.runtime_type == RuntimeType.KUBERNETES,
+        ModelService.desired_replicas > 0,
+        ModelService.gpu_count > 0,
+    )
+    if exclude_service_id is not None:
+        query = query.where(ModelService.id != exclude_service_id)
+    rows = await session.execute(query.order_by(ModelService.id))
+    by_resource: dict[tuple[str, str], int] = {}
+    unknown_by_vendor: dict[str, int] = {}
+    unknown_vendor = 0
+    for vendor, resource_name, gpu_count, tensor_parallel_size, desired_replicas in rows:
+        accelerator_count = max(int(gpu_count), int(tensor_parallel_size)) * int(desired_replicas)
+        normalized_resource = (resource_name or "").strip()
+        if vendor is None:
+            unknown_vendor += accelerator_count
+        elif not normalized_resource:
+            unknown_by_vendor[vendor] = unknown_by_vendor.get(vendor, 0) + accelerator_count
+        else:
+            resource_key = (vendor, normalized_resource)
+            by_resource[resource_key] = by_resource.get(resource_key, 0) + accelerator_count
+    return _ServiceAcceleratorUsage(
+        by_resource=by_resource,
+        unknown_by_vendor=unknown_by_vendor,
+        unknown_vendor=unknown_vendor,
+    )
+
+
+def _remaining(limit: int | None, used: int) -> int | None:
     if limit is None:
-        return _UNBOUNDED_ACCELERATOR_QUOTA
+        return None
     return max(0, limit - used)
 
 

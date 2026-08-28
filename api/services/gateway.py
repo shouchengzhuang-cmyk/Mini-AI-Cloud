@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 import httpx
 from anyio import CancelScope
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.errors import APIError
 from api.schemas.gateway import OpenAIModelList, OpenAIModelObject
@@ -31,6 +32,7 @@ from core.metrics import (
     SERVICE_REQUEST_DURATION,
     SERVICE_REQUESTS,
 )
+from repositories.audit import AuditRepository
 from repositories.gateway_routing import GatewayRoute, GatewayRoutingRepository
 from repositories.services import EndpointSelection, ServiceRepository
 from repositories.usage import UsageRepository
@@ -78,6 +80,22 @@ _MAX_OBSERVED_SSE_EVENT_BYTES = 1024 * 1024
 
 class _UpstreamResponseTooLarge(Exception):
     pass
+
+
+class _PreDispatchFailure(Exception):
+    """A failure that proves the POST body was not delivered to an upstream."""
+
+    def __init__(
+        self,
+        error: APIError,
+        *,
+        accounting: _RequestAccounting,
+        outcome: str,
+    ) -> None:
+        super().__init__(error.message)
+        self.error = error
+        self.accounting = accounting
+        self.outcome = outcome
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,11 +201,32 @@ class _RequestAccounting:
     selected_vendor: str | None
     started_at: datetime
     started_monotonic: float
+    logical_started_monotonic: float
     tracked_in_memory: bool = False
     time_to_first_token_seconds: float | None = None
     token_usage: ReportedTokenUsage | None = None
+    attempt_released: bool = False
     finalized: bool = False
+    release_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     finalize_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _FallbackAttempt:
+    request_id: uuid.UUID
+    from_route: GatewayRoute
+    reason: str
+    failure: _PreDispatchFailure
+
+
+@dataclass(slots=True)
+class _RouteCompletion:
+    request_id: uuid.UUID
+    project_id: uuid.UUID
+    route: GatewayRoute
+    fallback: _FallbackAttempt | None
+    recorded: bool = False
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 
 @dataclass(slots=True)
@@ -284,10 +323,10 @@ class GatewayService:
         client_disconnected: Callable[[], Awaitable[bool]],
     ) -> GatewayForwardResult:
         request_id = uuid.uuid4()
+        request_started_at = datetime.now(UTC)
+        request_started_monotonic = time.monotonic()
         excluded_vendors: set[str] = set()
-        failed_route: GatewayRoute | None = None
-        fallback_reason: str | None = None
-        last_error: APIError | None = None
+        fallback: _FallbackAttempt | None = None
         for attempt in range(self.fallback_attempts + 1):
             async with self.database.session() as session, session.begin():
                 anchor, route = await GatewayRoutingRepository.choose_route(
@@ -297,13 +336,24 @@ class GatewayService:
                     excluded_vendors=frozenset(excluded_vendors),
                 )
             if anchor is None:
+                if fallback is not None:
+                    await self._finalize_predispatch_failure(fallback.failure)
+                    await self._record_fallback_without_route(
+                        fallback=fallback,
+                        error_code="MODEL_NOT_FOUND",
+                    )
                 _observe_gateway_error("MODEL_NOT_FOUND")
                 raise APIError(404, "MODEL_NOT_FOUND", "The requested model service was not found")
             if route is None:
-                if last_error is not None:
-                    raise last_error
+                if fallback is not None:
+                    await self._finalize_predispatch_failure(fallback.failure)
+                    await self._record_fallback_without_route(
+                        fallback=fallback,
+                        error_code=ErrorCode.NO_HEALTHY_REPLICA.value,
+                    )
+                    raise fallback.failure.error from fallback.failure.__cause__
                 unavailable_accounting = _RequestAccounting(
-                    request_id=uuid.uuid4(),
+                    request_id=request_id,
                     project_id=project_id,
                     service_id=anchor.id,
                     selection=None,
@@ -313,8 +363,9 @@ class GatewayService:
                     logical_model_id=anchor.logical_model_id,
                     model_variant_id=anchor.model_variant_id,
                     selected_vendor=anchor.selected_vendor,
-                    started_at=datetime.now(UTC),
-                    started_monotonic=time.monotonic(),
+                    started_at=request_started_at,
+                    started_monotonic=request_started_monotonic,
+                    logical_started_monotonic=request_started_monotonic,
                 )
                 await self._finalize_request(
                     unavailable_accounting,
@@ -329,85 +380,178 @@ class GatewayService:
                     headers={"Retry-After": "1"},
                 )
 
+            completion = _RouteCompletion(
+                request_id=request_id,
+                project_id=project_id,
+                route=route,
+                fallback=fallback,
+            )
             try:
                 result = await self._forward_route(
                     route=route,
-                    request_id=uuid.uuid4(),
+                    request_id=request_id,
                     project_id=project_id,
                     path=path,
                     payload=payload,
                     request_headers=request_headers,
                     stream_requested=stream_requested,
                     client_disconnected=client_disconnected,
+                    request_started_monotonic=request_started_monotonic,
+                    route_completion=completion,
                 )
+            except _PreDispatchFailure as failure:
+                await self._complete_route(
+                    completion,
+                    success=False,
+                    error_code=failure.error.code,
+                )
+                if (
+                    fallback is not None
+                    or attempt >= self.fallback_attempts
+                    or route.selected_vendor is None
+                ):
+                    await self._finalize_predispatch_failure(failure)
+                    raise failure.error from failure.__cause__
+                if not await self._release_request_attempt(failure.accounting):
+                    await self._finalize_predispatch_failure(failure)
+                    raise failure.error from failure.__cause__
+                excluded_vendors.add(route.selected_vendor)
+                fallback = _FallbackAttempt(
+                    request_id=request_id,
+                    from_route=route,
+                    reason=failure.error.code,
+                    failure=failure,
+                )
+                continue
             except APIError as exc:
-                await self._record_route_outcome(
-                    route=route,
-                    project_id=project_id,
+                await self._complete_route(
+                    completion,
                     success=False,
                     error_code=exc.code,
                 )
-                if attempt >= self.fallback_attempts or not _is_fallback_error(exc.code):
-                    raise
-                if route.selected_vendor is None:
-                    raise
-                excluded_vendors.add(route.selected_vendor)
-                failed_route = route
-                fallback_reason = exc.code
-                last_error = exc
-                continue
-
-            if result.status_code >= 500 and attempt < self.fallback_attempts:
-                await self._record_route_outcome(
-                    route=route,
-                    project_id=project_id,
-                    success=False,
-                    error_code="UPSTREAM_HTTP_5XX",
+                raise
+            except asyncio.CancelledError:
+                await self._complete_route(
+                    completion,
+                    success=None,
+                    error_code="CLIENT_DISCONNECTED",
                 )
-                if route.selected_vendor is not None:
-                    excluded_vendors.add(route.selected_vendor)
-                    failed_route = route
-                    fallback_reason = "UPSTREAM_HTTP_5XX"
-                    continue
+                raise
+            except Exception:
+                await self._complete_route(
+                    completion,
+                    success=False,
+                    error_code="INTERNAL_SERVER_ERROR",
+                )
+                raise
 
-            await self._record_route_outcome(
-                route=route,
-                project_id=project_id,
-                success=result.status_code < 500,
-                error_code=None if result.status_code < 500 else "UPSTREAM_HTTP_5XX",
-            )
-            if failed_route is not None and fallback_reason is not None:
-                async with self.database.session() as session, session.begin():
-                    await GatewayRoutingRepository.record_fallback(
-                        session,
-                        project_id=project_id,
-                        request_id=request_id,
-                        from_route=failed_route,
-                        to_route=route,
-                        reason=fallback_reason,
-                    )
+            if result.stream is None:
+                await self._complete_route(
+                    completion,
+                    success=result.status_code < 500,
+                    error_code=(None if result.status_code < 500 else "UPSTREAM_HTTP_5XX"),
+                )
             return result
-        assert last_error is not None
-        raise last_error
+        raise RuntimeError("gateway fallback loop exhausted without a result")
 
-    async def _record_route_outcome(
+    async def _complete_route(
         self,
+        completion: _RouteCompletion,
         *,
-        route: GatewayRoute,
-        project_id: uuid.UUID,
-        success: bool,
+        success: bool | None,
         error_code: str | None,
     ) -> None:
+        async with completion.lock:
+            if completion.recorded:
+                return
+            async with self.database.session() as session, session.begin():
+                if success is not None:
+                    await GatewayRoutingRepository.record_outcome(
+                        session,
+                        route=completion.route,
+                        project_id=completion.project_id,
+                        success=success,
+                        error_code=error_code,
+                        failure_threshold=self.circuit_failure_threshold,
+                        cooldown_seconds=self.circuit_cooldown_seconds,
+                    )
+                if completion.fallback is not None:
+                    if success is True:
+                        await GatewayRoutingRepository.record_fallback(
+                            session,
+                            project_id=completion.project_id,
+                            request_id=completion.request_id,
+                            from_route=completion.fallback.from_route,
+                            to_route=completion.route,
+                            reason=completion.fallback.reason,
+                        )
+                    else:
+                        await self._add_fallback_failure(
+                            session,
+                            fallback=completion.fallback,
+                            to_route=completion.route,
+                            error_code=error_code,
+                        )
+            completion.recorded = True
+
+    async def _record_fallback_without_route(
+        self,
+        *,
+        fallback: _FallbackAttempt,
+        error_code: str,
+    ) -> None:
         async with self.database.session() as session, session.begin():
-            await GatewayRoutingRepository.record_outcome(
+            await self._add_fallback_failure(
                 session,
-                route=route,
-                project_id=project_id,
-                success=success,
+                fallback=fallback,
+                to_route=None,
                 error_code=error_code,
-                failure_threshold=self.circuit_failure_threshold,
-                cooldown_seconds=self.circuit_cooldown_seconds,
             )
+
+    @staticmethod
+    async def _add_fallback_failure(
+        session: AsyncSession,
+        *,
+        fallback: _FallbackAttempt,
+        to_route: GatewayRoute | None,
+        error_code: str | None,
+    ) -> None:
+        from_route = fallback.from_route
+        await AuditRepository.record(
+            session,
+            project_id=fallback.failure.accounting.project_id,
+            actor_type="gateway",
+            actor_user_id=None,
+            api_key_id=None,
+            action="gateway.vendor_fallback",
+            resource_type="logical_model",
+            resource_id=(
+                str(from_route.logical_model_id)
+                if from_route.logical_model_id is not None
+                else None
+            ),
+            outcome="failure",
+            request_id=str(fallback.request_id),
+            source_ip=None,
+            details={
+                "from_service_id": str(from_route.service_id),
+                "from_variant_id": str(from_route.model_variant_id),
+                "from_vendor": from_route.selected_vendor,
+                "to_service_id": str(to_route.service_id) if to_route is not None else None,
+                "to_variant_id": (str(to_route.model_variant_id) if to_route is not None else None),
+                "to_vendor": to_route.selected_vendor if to_route is not None else None,
+                "reason": fallback.reason,
+                "failure_reason": error_code,
+            },
+        )
+
+    async def _finalize_predispatch_failure(self, failure: _PreDispatchFailure) -> None:
+        await self._finalize_request(
+            failure.accounting,
+            outcome=failure.outcome,
+            error_code=failure.error.code,
+            completed=False,
+        )
 
     async def _forward_route(
         self,
@@ -420,12 +564,14 @@ class GatewayService:
         request_headers: Mapping[str, str],
         stream_requested: bool,
         client_disconnected: Callable[[], Awaitable[bool]],
+        request_started_monotonic: float,
+        route_completion: _RouteCompletion,
     ) -> GatewayForwardResult:
         if path not in {"/v1/chat/completions", "/v1/completions"}:
             raise ValueError("unsupported gateway upstream path")
         started_monotonic = time.monotonic()
         started_at = datetime.now(UTC)
-        overall_deadline = started_monotonic + self.request_timeout
+        overall_deadline = request_started_monotonic + self.request_timeout
         first_token_deadline = min(
             overall_deadline,
             started_monotonic + self.first_token_timeout,
@@ -448,6 +594,7 @@ class GatewayService:
             selected_vendor=route.selected_vendor,
             started_at=started_at,
             started_monotonic=started_monotonic,
+            logical_started_monotonic=request_started_monotonic,
         )
         try:
             await self.metrics.request_started(service_id, selection.replica_id)
@@ -475,16 +622,14 @@ class GatewayService:
                 host_allowlist=self.endpoint_host_allowlist,
             )
         except ValueError as exc:
-            await self._finalize_request(
-                accounting,
+            raise _PreDispatchFailure(
+                APIError(
+                    503,
+                    "UNSAFE_REPLICA_ENDPOINT",
+                    "The selected model replica endpoint is not permitted",
+                ),
+                accounting=accounting,
                 outcome="unsafe_endpoint",
-                error_code="UNSAFE_REPLICA_ENDPOINT",
-                completed=False,
-            )
-            raise APIError(
-                503,
-                "UNSAFE_REPLICA_ENDPOINT",
-                "The selected model replica endpoint is not permitted",
             ) from exc
 
         upstream_payload = dict(payload)
@@ -506,17 +651,26 @@ class GatewayService:
                     follow_redirects=False,
                 )
         except httpx.ConnectTimeout as exc:
-            await self._finalize_request(
-                accounting,
+            raise _PreDispatchFailure(
+                APIError(
+                    503,
+                    ErrorCode.UPSTREAM_CONNECT_TIMEOUT.value,
+                    "The gateway could not connect to the model replica before the timeout",
+                    headers={"Retry-After": "1"},
+                ),
+                accounting=accounting,
                 outcome="connect_timeout",
-                error_code=ErrorCode.UPSTREAM_CONNECT_TIMEOUT.value,
-                completed=False,
-            )
-            raise APIError(
-                503,
-                ErrorCode.UPSTREAM_CONNECT_TIMEOUT.value,
-                "The gateway could not connect to the model replica before the timeout",
-                headers={"Retry-After": "1"},
+            ) from exc
+        except httpx.ConnectError as exc:
+            raise _PreDispatchFailure(
+                APIError(
+                    503,
+                    ErrorCode.UPSTREAM_DISCONNECTED.value,
+                    "The selected model replica is unavailable",
+                    headers={"Retry-After": "1"},
+                ),
+                accounting=accounting,
+                outcome="upstream_disconnected",
             ) from exc
         except TimeoutError as exc:
             await self._finalize_request(
@@ -675,6 +829,8 @@ class GatewayService:
                     outcome="client_disconnect",
                     error_code="CLIENT_DISCONNECTED",
                     completed=False,
+                    route_completion=route_completion,
+                    route_success=None,
                 )
 
             return GatewayForwardResult(
@@ -688,6 +844,7 @@ class GatewayService:
                     overall_deadline=overall_deadline,
                     usage_observer=usage_observer,
                     client_disconnected=client_disconnected,
+                    route_completion=route_completion,
                 ),
                 cleanup=cleanup_stream,
             )
@@ -822,6 +979,7 @@ class GatewayService:
         overall_deadline: float,
         usage_observer: _SSEUsageObserver,
         client_disconnected: Callable[[], Awaitable[bool]],
+        route_completion: _RouteCompletion,
     ) -> AsyncIterator[bytes]:
         outcome = "success"
         error_code: str | None = None
@@ -887,6 +1045,10 @@ class GatewayService:
                 outcome=outcome,
                 error_code=error_code,
                 completed=completed,
+                route_completion=route_completion,
+                route_success=(
+                    True if completed else None if error_code == "CLIENT_DISCONNECTED" else False
+                ),
             )
 
     async def _close_upstream_and_finalize(
@@ -897,17 +1059,27 @@ class GatewayService:
         outcome: str,
         error_code: str | None,
         completed: bool,
+        route_completion: _RouteCompletion | None = None,
+        route_success: bool | None = None,
     ) -> None:
         async def cleanup() -> None:
             try:
                 await upstream.aclose()
             finally:
-                await self._finalize_request_inner(
-                    accounting,
-                    outcome=outcome,
-                    error_code=error_code,
-                    completed=completed,
-                )
+                try:
+                    await self._finalize_request_inner(
+                        accounting,
+                        outcome=outcome,
+                        error_code=error_code,
+                        completed=completed,
+                    )
+                finally:
+                    if route_completion is not None:
+                        await self._complete_route(
+                            route_completion,
+                            success=route_success,
+                            error_code=error_code,
+                        )
 
         await _await_cancel_safe(cleanup())
 
@@ -948,6 +1120,54 @@ class GatewayService:
             if release_completed:
                 accounting.finalized = True
 
+    async def _release_request_attempt(self, accounting: _RequestAccounting) -> bool:
+        return await _await_cancel_safe(self._release_request_attempt_inner(accounting))
+
+    async def _release_request_attempt_inner(self, accounting: _RequestAccounting) -> bool:
+        async with accounting.release_lock:
+            if accounting.attempt_released:
+                return True
+
+            if accounting.selection is not None:
+                try:
+                    async with self.database.session() as session, session.begin():
+                        released = await ServiceRepository.release_endpoint_request(
+                            session,
+                            replica_id=accounting.selection.replica_id,
+                            generation=accounting.selection.generation,
+                            execution_id=accounting.selection.execution_id,
+                        )
+                    if not released:
+                        self.logger.warning(
+                            "gateway endpoint request release was rejected by its fence",
+                            service_id=str(accounting.service_id),
+                            replica_id=str(accounting.selection.replica_id),
+                            generation=accounting.selection.generation,
+                        )
+                except Exception:
+                    self.logger.exception(
+                        "failed to persist gateway endpoint request release",
+                        service_id=str(accounting.service_id),
+                        replica_id=str(accounting.selection.replica_id),
+                    )
+                    return False
+
+            if accounting.tracked_in_memory and accounting.selection is not None:
+                try:
+                    await self.metrics.request_finished(
+                        accounting.service_id,
+                        accounting.selection.replica_id,
+                    )
+                except Exception:
+                    self.logger.exception(
+                        "failed to release process-local gateway request metrics",
+                        service_id=str(accounting.service_id),
+                        replica_id=str(accounting.selection.replica_id),
+                    )
+
+            accounting.attempt_released = True
+            return True
+
     async def _persist_request_finalization(
         self,
         accounting: _RequestAccounting,
@@ -957,45 +1177,10 @@ class GatewayService:
         completed: bool,
     ) -> bool:
         duration = max(0.0, time.monotonic() - accounting.started_monotonic)
+        if not await self._release_request_attempt_inner(accounting):
+            return False
 
-        if accounting.selection is not None:
-            try:
-                async with self.database.session() as session, session.begin():
-                    released = await ServiceRepository.release_endpoint_request(
-                        session,
-                        replica_id=accounting.selection.replica_id,
-                        generation=accounting.selection.generation,
-                        execution_id=accounting.selection.execution_id,
-                    )
-                if not released:
-                    self.logger.warning(
-                        "gateway endpoint request release was rejected by its fence",
-                        service_id=str(accounting.service_id),
-                        replica_id=str(accounting.selection.replica_id),
-                        generation=accounting.selection.generation,
-                    )
-            except Exception:
-                self.logger.exception(
-                    "failed to persist gateway endpoint request release",
-                    service_id=str(accounting.service_id),
-                    replica_id=str(accounting.selection.replica_id),
-                )
-                return False
-
-        if accounting.tracked_in_memory and accounting.selection is not None:
-            try:
-                await self.metrics.request_finished(
-                    accounting.service_id,
-                    accounting.selection.replica_id,
-                )
-            except Exception:
-                self.logger.exception(
-                    "failed to release process-local gateway request metrics",
-                    service_id=str(accounting.service_id),
-                    replica_id=str(accounting.selection.replica_id),
-                )
-
-        _observe_gateway(outcome, accounting.started_monotonic)
+        _observe_gateway(outcome, accounting.logical_started_monotonic)
         if error_code is not None:
             _observe_gateway_error(error_code)
         if accounting.time_to_first_token_seconds is not None:
@@ -1136,20 +1321,23 @@ class _SSEUsageObserver:
         self._event_bytes = 0
 
 
-async def _await_cancel_safe(coroutine: Coroutine[Any, Any, None]) -> None:
+async def _await_cancel_safe[CleanupResult](
+    coroutine: Coroutine[Any, Any, CleanupResult],
+) -> CleanupResult:
     """Finish critical cleanup under AnyIO and direct asyncio cancellation."""
 
     interrupted: asyncio.CancelledError | None = None
     with CancelScope(shield=True):
-        cleanup_task: asyncio.Task[None] = asyncio.create_task(coroutine)
+        cleanup_task = asyncio.create_task(coroutine)
         while not cleanup_task.done():
             try:
                 await asyncio.shield(cleanup_task)
             except asyncio.CancelledError as exc:
                 interrupted = exc
-        cleanup_task.result()
+        result = cleanup_task.result()
     if interrupted is not None:
         raise interrupted
+    return result
 
 
 async def _read_first_nonempty_chunk(
@@ -1304,14 +1492,6 @@ def _observe_gateway(outcome: str, started_at: float) -> None:
     GATEWAY_DURATION.observe(duration)
     SERVICE_REQUESTS.labels(outcome).inc()
     SERVICE_REQUEST_DURATION.observe(duration)
-
-
-def _is_fallback_error(code: str) -> bool:
-    return code in {
-        ErrorCode.UPSTREAM_CONNECT_TIMEOUT.value,
-        ErrorCode.INFERENCE_REQUEST_TIMEOUT.value,
-        ErrorCode.UPSTREAM_DISCONNECTED.value,
-    }
 
 
 def _observe_gateway_error(code: str) -> None:

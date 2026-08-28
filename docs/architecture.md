@@ -107,6 +107,9 @@ B reports for B1       -> accepted
 
 Worker re-register 不得把旧 execution 已持有的 reservation 清零；它只更新声明的总资源和 inventory，过量占用时进入 draining，由 lease/终态路径负责释放。
 
+Accelerator 发现的 provider、可观测失败语义和 Kubernetes capacity-slot 边界见
+[Accelerator inventory providers](accelerator-inventory.md)。
+
 ### Accelerator allocation authority
 
 PostgreSQL 同时保存 accelerator 的请求快照与观测证据，但设备绑定方式由 `allocation_authority` 区分：

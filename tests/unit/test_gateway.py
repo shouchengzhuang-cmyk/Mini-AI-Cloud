@@ -26,6 +26,7 @@ from core.database import Database
 from core.enums import (
     AcceleratorKind,
     AcceleratorVendor,
+    GatewayRoutingPolicy,
     ModelAvailabilityStatus,
     ProjectRole,
     RuntimeType,
@@ -47,8 +48,9 @@ from models.service import (
 )
 from models.usage import AuditEvent, ProjectQuota, ProjectQuotaState, ServingRequestUsage
 from models.worker import Worker
+from repositories.gateway_routing import GatewayRoute, GatewayRoutingRepository
 from repositories.quotas import QuotaRepository
-from repositories.services import ServiceRepository
+from repositories.services import EndpointSelection, ServiceRepository
 from repositories.workers import WorkerRepository
 
 PROJECT_ID = uuid.UUID("20000000-0000-0000-0000-000000000001")
@@ -108,6 +110,20 @@ class FaultAfterFirstChunkStream(httpx.AsyncByteStream):
     async def __aiter__(self) -> AsyncIterator[bytes]:
         yield b'data: {"choices":[{"delta":{"content":"pinned"}}]}\n\n'
         raise httpx.ReadError("fault after stream start", request=self.request)
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class GatedCompletionStream(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.allow_completion = asyncio.Event()
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield b'data: {"choices":[]}\n\n'
+        await self.allow_completion.wait()
+        yield b"data: [DONE]\n\n"
 
     async def aclose(self) -> None:
         self.closed = True
@@ -215,6 +231,8 @@ async def _ready_service(database: Database) -> tuple[uuid.UUID, list[ServiceRep
 
 async def _ready_dual_vendor_services(
     database: Database,
+    *,
+    routing_policy: GatewayRoutingPolicy = GatewayRoutingPolicy.BALANCED,
 ) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
     nvidia_service_id, _ = await _ready_service(database)
     logical_model_id = uuid.uuid4()
@@ -230,6 +248,7 @@ async def _ready_dual_vendor_services(
                 name="logical-chat",
                 public_name="logical-chat",
                 status=ModelAvailabilityStatus.READY,
+                routing_policy=routing_policy,
             )
         )
         session.add_all(
@@ -1470,12 +1489,17 @@ async def test_logical_model_fallback_records_circuit_audit_and_physical_usage(
         gateway_database
     )
     hosts: list[str] = []
+    logical_started_at = datetime.now(UTC)
+    ascend_dispatched_at: datetime | None = None
 
     async def upstream(request: httpx.Request) -> httpx.Response:
+        nonlocal ascend_dispatched_at
         assert request.url.host is not None
         hosts.append(request.url.host)
         if request.url.host.startswith("worker-"):
+            await asyncio.sleep(0.1)
             raise httpx.ConnectError("injected nvidia connect fault", request=request)
+        ascend_dispatched_at = datetime.now(UTC)
         payload = json.loads(request.content)
         return httpx.Response(
             200,
@@ -1530,18 +1554,502 @@ async def test_logical_model_fallback_records_circuit_audit_and_physical_usage(
     assert by_vendor["nvidia"].state == "open"
     assert by_vendor["huawei-ascend"].state == "closed"
     assert audit is not None
+    assert audit.outcome == "success"
     assert audit.details["from_variant_id"] == str(nvidia_variant_id)
     assert audit.details["to_variant_id"] == str(ascend_variant_id)
-    assert {(item.selected_vendor, item.model_variant_id) for item in usage} == {
-        ("nvidia", nvidia_variant_id),
-        ("huawei-ascend", ascend_variant_id),
-    }
+    assert len(usage) == 1
+    physical_usage = usage[0]
+    assert (physical_usage.selected_vendor, physical_usage.model_variant_id) == (
+        "huawei-ascend",
+        ascend_variant_id,
+    )
+    assert physical_usage.total_tokens == 5
+    assert physical_usage.allocated_gpu_seconds == physical_usage.request_duration_seconds
+    assert audit.request_id == str(physical_usage.request_id)
+    assert ascend_dispatched_at is not None
+    usage_started_at = physical_usage.started_at.replace(tzinfo=UTC)
+    assert usage_started_at >= logical_started_at + timedelta(seconds=0.08)
+    assert usage_started_at <= ascend_dispatched_at
+
+
+@pytest.mark.parametrize(
+    ("public_model", "routing_policy", "strict_vendor"),
+    [
+        ("strict-nvidia-alias", GatewayRoutingPolicy.STRICT_NVIDIA, "nvidia"),
+        ("strict-ascend-alias", GatewayRoutingPolicy.STRICT_ASCEND, "huawei-ascend"),
+    ],
+)
+async def test_strict_vendor_policy_never_routes_an_alternate(
+    gateway_database: Database,
+    public_model: str,
+    routing_policy: GatewayRoutingPolicy,
+    strict_vendor: str,
+) -> None:
+    logical_model_id, _nvidia_variant_id, _ascend_variant_id = await _ready_dual_vendor_services(
+        gateway_database
+    )
+    async with gateway_database.session() as session, session.begin():
+        logical_model = await session.get(LogicalModel, logical_model_id)
+        assert logical_model is not None
+        logical_model.public_name = public_model
+        logical_model.routing_policy = routing_policy
+
+    async with gateway_database.session() as session, session.begin():
+        anchor, route = await GatewayRoutingRepository.choose_route(
+            session,
+            project_id=PROJECT_ID,
+            public_model=public_model,
+        )
+        assert anchor is not None
+        assert route is not None
+        assert route.selected_vendor == strict_vendor
+
+        retry_anchor, retry_route = await GatewayRoutingRepository.choose_route(
+            session,
+            project_id=PROJECT_ID,
+            public_model=public_model,
+            excluded_vendors=frozenset({strict_vendor}),
+        )
+        assert retry_anchor is not None
+        assert retry_route is None
+
+
+@pytest.mark.parametrize(
+    ("public_model", "routing_policy", "expected_host"),
+    [
+        ("strict-nvidia-alias", GatewayRoutingPolicy.STRICT_NVIDIA, "worker-"),
+        ("strict-ascend-alias", GatewayRoutingPolicy.STRICT_ASCEND, "ascend.test"),
+    ],
+)
+async def test_strict_vendor_failure_does_not_fallback_across_vendors(
+    gateway_database: Database,
+    public_model: str,
+    routing_policy: GatewayRoutingPolicy,
+    expected_host: str,
+) -> None:
+    logical_model_id, _nvidia_variant_id, _ascend_variant_id = await _ready_dual_vendor_services(
+        gateway_database
+    )
+    async with gateway_database.session() as session, session.begin():
+        logical_model = await session.get(LogicalModel, logical_model_id)
+        assert logical_model is not None
+        logical_model.public_name = public_model
+        logical_model.routing_policy = routing_policy
+
+    hosts: list[str] = []
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        assert request.url.host is not None
+        hosts.append(request.url.host)
+        raise httpx.ConnectError("injected strict-backend fault", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        gateway = GatewayService(
+            gateway_database,
+            client,
+            GatewayMetrics(),
+            request_timeout=2,
+            endpoint_host_allowlist="*.test",
+            fallback_attempts=1,
+        )
+        with pytest.raises(APIError) as error:
+            await gateway.forward(
+                project_id=PROJECT_ID,
+                public_model=public_model,
+                path="/v1/completions",
+                payload={"model": public_model, "prompt": "strict"},
+                request_headers={},
+                stream_requested=False,
+                client_disconnected=lambda: _false(),
+            )
+
+    assert error.value.code == "UPSTREAM_DISCONNECTED"
+    assert len(hosts) == 1
+    if expected_host.endswith("-"):
+        assert hosts[0].startswith(expected_host)
+    else:
+        assert hosts[0] == expected_host
+
+
+async def test_ready_logical_model_public_name_routes_to_physical_variant(
+    gateway_database: Database,
+) -> None:
+    logical_model_id, nvidia_variant_id, _ascend_variant_id = await _ready_dual_vendor_services(
+        gateway_database
+    )
+    async with gateway_database.session() as session, session.begin():
+        logical_model = await session.get(LogicalModel, logical_model_id)
+        assert logical_model is not None
+        logical_model.public_name = "Public Logical Chat"
+
+    async with gateway_database.session() as session, session.begin():
+        anchor, route = await GatewayRoutingRepository.choose_route(
+            session,
+            project_id=PROJECT_ID,
+            public_model="Public Logical Chat",
+        )
+
+    assert anchor is not None
+    assert anchor.name == "logical-chat"
+    assert route is not None
+    assert route.model_variant_id == nvidia_variant_id
+    assert route.selected_vendor == "nvidia"
+    assert route.upstream_model == "physical/nvidia"
+
+
+@pytest.mark.parametrize(
+    ("routing_policy", "expected_vendor"),
+    [
+        (GatewayRoutingPolicy.PREFER_NVIDIA, "nvidia"),
+        (GatewayRoutingPolicy.PREFER_ASCEND, "huawei-ascend"),
+    ],
+)
+async def test_prefer_routing_policy_is_deterministic(
+    gateway_database: Database,
+    routing_policy: GatewayRoutingPolicy,
+    expected_vendor: str,
+) -> None:
+    logical_model_id, _nvidia_variant_id, _ascend_variant_id = await _ready_dual_vendor_services(
+        gateway_database,
+        routing_policy=routing_policy,
+    )
+
+    selected_vendors: list[str | None] = []
+    for _ in range(3):
+        async with gateway_database.session() as session, session.begin():
+            _anchor, route = await GatewayRoutingRepository.choose_route(
+                session,
+                project_id=PROJECT_ID,
+                public_model="logical-chat",
+            )
+            assert route is not None
+            selected_vendors.append(route.selected_vendor)
+
+    async with gateway_database.session() as session:
+        logical_model = await session.get(LogicalModel, logical_model_id)
+    assert selected_vendors == [expected_vendor] * 3
+    assert logical_model is not None
+    assert logical_model.routing_cursor == 0
+
+
+async def test_balanced_policy_round_robins_without_mutating_logical_metadata(
+    gateway_database: Database,
+) -> None:
+    logical_model_id, _nvidia_variant_id, _ascend_variant_id = await _ready_dual_vendor_services(
+        gateway_database,
+        routing_policy=GatewayRoutingPolicy.BALANCED,
+    )
+    async with gateway_database.session() as session:
+        before = await session.get(LogicalModel, logical_model_id)
+        assert before is not None
+        before_status = before.status
+        before_version = before.version
+        before_updated_at = before.updated_at
+
+    selected_vendors: list[str | None] = []
+    for _ in range(4):
+        async with gateway_database.session() as session, session.begin():
+            _anchor, route = await GatewayRoutingRepository.choose_route(
+                session,
+                project_id=PROJECT_ID,
+                public_model="logical-chat",
+            )
+            assert route is not None
+            selected_vendors.append(route.selected_vendor)
+
+    async with gateway_database.session() as session:
+        after = await session.get(LogicalModel, logical_model_id)
+    assert selected_vendors == ["nvidia", "huawei-ascend", "nvidia", "huawei-ascend"]
+    assert after is not None
+    assert after.routing_cursor == 4
+    assert after.status is before_status
+    assert after.version == before_version
+    assert after.updated_at == before_updated_at
+
+
+async def test_balanced_policy_skips_unavailable_candidate_and_advances_past_selection(
+    gateway_database: Database,
+) -> None:
+    logical_model_id, nvidia_variant_id, ascend_variant_id = await _ready_dual_vendor_services(
+        gateway_database
+    )
+    async with gateway_database.session() as session, session.begin():
+        session.add(
+            VendorCircuitState(
+                project_id=PROJECT_ID,
+                logical_model_id=logical_model_id,
+                vendor="nvidia",
+                state="open",
+                failure_count=2,
+                opened_until=datetime.now(UTC) + timedelta(minutes=1),
+                last_error_code="UPSTREAM_DISCONNECTED",
+                version=2,
+                updated_at=datetime.now(UTC),
+            )
+        )
+
+    for expected_cursor in (2, 4):
+        async with gateway_database.session() as session, session.begin():
+            _anchor, route = await GatewayRoutingRepository.choose_route(
+                session,
+                project_id=PROJECT_ID,
+                public_model="logical-chat",
+            )
+            assert route is not None
+            assert route.model_variant_id == ascend_variant_id
+            assert [(skip.selected_vendor, skip.reason) for skip in route.preflight_skips] == [
+                ("nvidia", "circuit_open")
+            ]
+        async with gateway_database.session() as session:
+            logical_model = await session.get(LogicalModel, logical_model_id)
+            assert logical_model is not None
+            assert logical_model.routing_cursor == expected_cursor
+
+    async with gateway_database.session() as session, session.begin():
+        circuit = await session.scalar(
+            select(VendorCircuitState).where(
+                VendorCircuitState.project_id == PROJECT_ID,
+                VendorCircuitState.logical_model_id == logical_model_id,
+                VendorCircuitState.vendor == "nvidia",
+            )
+        )
+        assert circuit is not None
+        circuit.state = "closed"
+        circuit.opened_until = None
+
+    async with gateway_database.session() as session, session.begin():
+        _anchor, recovered_route = await GatewayRoutingRepository.choose_route(
+            session,
+            project_id=PROJECT_ID,
+            public_model="logical-chat",
+        )
+    assert recovered_route is not None
+    assert recovered_route.model_variant_id == nvidia_variant_id
+
+
+async def test_balanced_routing_cursor_wraps_without_bigint_overflow(
+    gateway_database: Database,
+) -> None:
+    logical_model_id, _nvidia_variant_id, ascend_variant_id = await _ready_dual_vendor_services(
+        gateway_database
+    )
+    async with gateway_database.session() as session, session.begin():
+        logical_model = await session.get(LogicalModel, logical_model_id)
+        assert logical_model is not None
+        logical_model.routing_cursor = 2**63 - 1
+
+    async with gateway_database.session() as session:
+        logical_model = await session.get(LogicalModel, logical_model_id)
+        assert logical_model is not None
+        original_version = logical_model.version
+        original_updated_at = logical_model.updated_at
+
+    async with gateway_database.session() as session, session.begin():
+        _anchor, route = await GatewayRoutingRepository.choose_route(
+            session,
+            project_id=PROJECT_ID,
+            public_model="logical-chat",
+        )
+        assert route is not None
+        assert route.model_variant_id == ascend_variant_id
+
+    async with gateway_database.session() as session:
+        logical_model = await session.get(LogicalModel, logical_model_id)
+    assert logical_model is not None
+    assert logical_model.routing_cursor == 0
+    assert logical_model.version == original_version
+    assert logical_model.updated_at == original_updated_at
+
+
+async def test_concurrent_balanced_routes_do_not_lose_cursor_updates(
+    gateway_database: Database,
+) -> None:
+    logical_model_id, _nvidia_variant_id, _ascend_variant_id = await _ready_dual_vendor_services(
+        gateway_database
+    )
+    start = asyncio.Event()
+
+    async def choose() -> str | None:
+        await start.wait()
+        async with gateway_database.session() as session, session.begin():
+            _anchor, route = await GatewayRoutingRepository.choose_route(
+                session,
+                project_id=PROJECT_ID,
+                public_model="logical-chat",
+            )
+            assert route is not None
+            return route.selected_vendor
+
+    contenders = [asyncio.create_task(choose()) for _ in range(8)]
+    await asyncio.sleep(0)
+    start.set()
+    selected_vendors = await asyncio.gather(*contenders)
+
+    async with gateway_database.session() as session:
+        logical_model = await session.get(LogicalModel, logical_model_id)
+    assert logical_model is not None
+    assert logical_model.routing_cursor == 8
+    assert selected_vendors.count("nvidia") == 4
+    assert selected_vendors.count("huawei-ascend") == 4
+
+
+@pytest.mark.parametrize(
+    "status",
+    [ModelAvailabilityStatus.DEGRADED, ModelAvailabilityStatus.DISABLED],
+)
+async def test_non_ready_logical_model_is_not_routable(
+    gateway_database: Database,
+    status: ModelAvailabilityStatus,
+) -> None:
+    logical_model_id, _nvidia_variant_id, _ascend_variant_id = await _ready_dual_vendor_services(
+        gateway_database
+    )
+    async with gateway_database.session() as session, session.begin():
+        logical_model = await session.get(LogicalModel, logical_model_id)
+        assert logical_model is not None
+        logical_model.status = status
+
+    async with gateway_database.session() as session, session.begin():
+        anchor, route = await GatewayRoutingRepository.choose_route(
+            session,
+            project_id=PROJECT_ID,
+            public_model="logical-chat",
+        )
+
+    assert anchor is not None
+    assert route is None
+
+
+@pytest.mark.parametrize(
+    "status",
+    [ModelAvailabilityStatus.DEGRADED, ModelAvailabilityStatus.DISABLED],
+)
+async def test_non_ready_preferred_variant_is_skipped_with_reason(
+    gateway_database: Database,
+    status: ModelAvailabilityStatus,
+) -> None:
+    _logical_model_id, nvidia_variant_id, ascend_variant_id = await _ready_dual_vendor_services(
+        gateway_database
+    )
+    async with gateway_database.session() as session, session.begin():
+        nvidia_variant = await session.get(ModelVariant, nvidia_variant_id)
+        assert nvidia_variant is not None
+        nvidia_variant.status = status
+
+    async with gateway_database.session() as session, session.begin():
+        _anchor, route = await GatewayRoutingRepository.choose_route(
+            session,
+            project_id=PROJECT_ID,
+            public_model="logical-chat",
+        )
+
+    assert route is not None
+    assert route.model_variant_id == ascend_variant_id
+    assert route.selected_vendor == "huawei-ascend"
+    assert [(skip.selected_vendor, skip.reason) for skip in route.preflight_skips] == [
+        ("nvidia", "variant_not_ready")
+    ]
+
+
+async def test_route_metadata_identifies_preferred_vendor_open_circuit_skip(
+    gateway_database: Database,
+) -> None:
+    logical_model_id, _nvidia_variant_id, ascend_variant_id = await _ready_dual_vendor_services(
+        gateway_database
+    )
+    async with gateway_database.session() as session, session.begin():
+        session.add(
+            VendorCircuitState(
+                project_id=PROJECT_ID,
+                logical_model_id=logical_model_id,
+                vendor="nvidia",
+                state="open",
+                failure_count=2,
+                opened_until=datetime.now(UTC) + timedelta(minutes=1),
+                last_error_code="UPSTREAM_DISCONNECTED",
+                version=2,
+                updated_at=datetime.now(UTC),
+            )
+        )
+
+    async with gateway_database.session() as session, session.begin():
+        _anchor, route = await GatewayRoutingRepository.choose_route(
+            session,
+            project_id=PROJECT_ID,
+            public_model="logical-chat",
+        )
+
+    assert route is not None
+    assert route.model_variant_id == ascend_variant_id
+    assert route.selected_vendor == "huawei-ascend"
+    assert [(skip.selected_vendor, skip.reason) for skip in route.preflight_skips] == [
+        ("nvidia", "circuit_open")
+    ]
+
+
+async def test_concurrent_first_circuit_outcomes_create_one_state_row(
+    gateway_database: Database,
+) -> None:
+    logical_model_id, nvidia_variant_id, _ascend_variant_id = await _ready_dual_vendor_services(
+        gateway_database
+    )
+    route = GatewayRoute(
+        service_id=uuid.uuid4(),
+        logical_model_id=logical_model_id,
+        model_variant_id=nvidia_variant_id,
+        selected_vendor="nvidia",
+        upstream_model="physical/nvidia",
+        gpu_count=1,
+        selection=EndpointSelection(
+            service_id=uuid.uuid4(),
+            replica_id=uuid.uuid4(),
+            generation=1,
+            execution_id=uuid.uuid4(),
+            endpoint_url="http://worker-a.test:8000",
+        ),
+    )
+    start = asyncio.Event()
+
+    async def record_failure() -> None:
+        await start.wait()
+        async with gateway_database.session() as session, session.begin():
+            await GatewayRoutingRepository.record_outcome(
+                session,
+                route=route,
+                project_id=PROJECT_ID,
+                success=False,
+                error_code="UPSTREAM_DISCONNECTED",
+                failure_threshold=100,
+                cooldown_seconds=30,
+            )
+
+    tasks = [asyncio.create_task(record_failure()) for _ in range(8)]
+    await asyncio.sleep(0)
+    start.set()
+    await asyncio.gather(*tasks)
+
+    async with gateway_database.session() as session:
+        states = list(
+            await session.scalars(
+                select(VendorCircuitState).where(
+                    VendorCircuitState.project_id == PROJECT_ID,
+                    VendorCircuitState.logical_model_id == logical_model_id,
+                    VendorCircuitState.vendor == "nvidia",
+                )
+            )
+        )
+    assert len(states) == 1
+    assert states[0].state == "closed"
+    assert states[0].failure_count == 8
+    assert states[0].version == 8
 
 
 async def test_vendor_fallback_is_bounded_to_one_alternate(
     gateway_database: Database,
 ) -> None:
-    await _ready_dual_vendor_services(gateway_database)
+    _logical_model_id, nvidia_variant_id, ascend_variant_id = await _ready_dual_vendor_services(
+        gateway_database
+    )
     calls = 0
 
     async def upstream(request: httpx.Request) -> httpx.Response:
@@ -1571,11 +2079,279 @@ async def test_vendor_fallback_is_bounded_to_one_alternate(
     assert error.value.code == "UPSTREAM_DISCONNECTED"
     assert calls == 2
 
+    async with gateway_database.session() as session:
+        audits = list(
+            await session.scalars(
+                select(AuditEvent).where(AuditEvent.action == "gateway.vendor_fallback")
+            )
+        )
+        usages = list(await session.scalars(select(ServingRequestUsage)))
+    assert len(audits) == 1
+    assert audits[0].outcome == "failure"
+    assert audits[0].details["from_variant_id"] == str(nvidia_variant_id)
+    assert audits[0].details["from_vendor"] == "nvidia"
+    assert audits[0].details["to_variant_id"] == str(ascend_variant_id)
+    assert audits[0].details["to_vendor"] == "huawei-ascend"
+    assert audits[0].details["from_service_id"] != audits[0].details["to_service_id"]
+    assert audits[0].details["reason"] == "UPSTREAM_DISCONNECTED"
+    assert audits[0].details["failure_reason"] == "UPSTREAM_DISCONNECTED"
+    assert len(usages) == 1
+    assert (usages[0].selected_vendor, usages[0].model_variant_id) == (
+        "huawei-ascend",
+        ascend_variant_id,
+    )
+    assert usages[0].outcome == "upstream_disconnected"
+    assert usages[0].allocated_gpu_seconds is None
+    assert audits[0].request_id == str(usages[0].request_id)
+
+
+async def test_upstream_5xx_is_returned_without_cross_vendor_replay(
+    gateway_database: Database,
+) -> None:
+    logical_model_id, nvidia_variant_id, _ascend_variant_id = await _ready_dual_vendor_services(
+        gateway_database
+    )
+    hosts: list[str] = []
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        assert request.url.host is not None
+        hosts.append(request.url.host)
+        return httpx.Response(503, json={"error": "backend unavailable"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        gateway = GatewayService(
+            gateway_database,
+            client,
+            GatewayMetrics(),
+            request_timeout=2,
+            endpoint_host_allowlist="*.test",
+            fallback_attempts=1,
+            circuit_failure_threshold=1,
+        )
+        result = await gateway.forward(
+            project_id=PROJECT_ID,
+            public_model="logical-chat",
+            path="/v1/chat/completions",
+            payload={"model": "logical-chat", "messages": []},
+            request_headers={},
+            stream_requested=False,
+            client_disconnected=lambda: _false(),
+        )
+
+    assert result.status_code == 503
+    assert len(hosts) == 1
+    assert hosts[0].startswith("worker-")
+    async with gateway_database.session() as session:
+        circuit = await session.scalar(
+            select(VendorCircuitState).where(
+                VendorCircuitState.logical_model_id == logical_model_id,
+                VendorCircuitState.vendor == "nvidia",
+            )
+        )
+        audits = list(
+            await session.scalars(
+                select(AuditEvent).where(AuditEvent.action == "gateway.vendor_fallback")
+            )
+        )
+        usages = list(await session.scalars(select(ServingRequestUsage)))
+    assert circuit is not None and circuit.state == "open"
+    assert audits == []
+    assert len(usages) == 1
+    assert (usages[0].selected_vendor, usages[0].model_variant_id) == (
+        "nvidia",
+        nvidia_variant_id,
+    )
+    assert usages[0].outcome == "upstream_error"
+
+
+@pytest.mark.parametrize(
+    ("failure_type", "expected_code"),
+    [
+        ("read_timeout", "INFERENCE_REQUEST_TIMEOUT"),
+        ("write_timeout", "INFERENCE_REQUEST_TIMEOUT"),
+        ("pool_timeout", "INFERENCE_REQUEST_TIMEOUT"),
+        ("read_error", "UPSTREAM_DISCONNECTED"),
+    ],
+)
+async def test_ambiguous_transport_failure_never_cross_vendor_replays_post(
+    gateway_database: Database,
+    failure_type: str,
+    expected_code: str,
+) -> None:
+    _logical_model_id, nvidia_variant_id, _ascend_variant_id = await _ready_dual_vendor_services(
+        gateway_database
+    )
+    calls = 0
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        failure_class = {
+            "read_timeout": httpx.ReadTimeout,
+            "write_timeout": httpx.WriteTimeout,
+            "pool_timeout": httpx.PoolTimeout,
+            "read_error": httpx.ReadError,
+        }[failure_type]
+        raise failure_class("ambiguous transport failure", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        gateway = GatewayService(
+            gateway_database,
+            client,
+            GatewayMetrics(),
+            request_timeout=2,
+            endpoint_host_allowlist="*.test",
+            fallback_attempts=1,
+        )
+        with pytest.raises(APIError) as error:
+            await gateway.forward(
+                project_id=PROJECT_ID,
+                public_model="logical-chat",
+                path="/v1/completions",
+                payload={"model": "logical-chat", "prompt": failure_type},
+                request_headers={},
+                stream_requested=False,
+                client_disconnected=lambda: _false(),
+            )
+
+    assert error.value.code == expected_code
+    assert calls == 1
+    async with gateway_database.session() as session:
+        audits = list(
+            await session.scalars(
+                select(AuditEvent).where(AuditEvent.action == "gateway.vendor_fallback")
+            )
+        )
+        usages = list(await session.scalars(select(ServingRequestUsage)))
+    assert audits == []
+    assert len(usages) == 1
+    assert (usages[0].selected_vendor, usages[0].model_variant_id) == (
+        "nvidia",
+        nvidia_variant_id,
+    )
+
+
+async def test_buffered_response_read_failure_never_cross_vendor_replays_post(
+    gateway_database: Database,
+) -> None:
+    _logical_model_id, nvidia_variant_id, _ascend_variant_id = await _ready_dual_vendor_services(
+        gateway_database
+    )
+    hosts: list[str] = []
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        assert request.url.host is not None
+        hosts.append(request.url.host)
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            stream=FaultAfterFirstChunkStream(request),
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        gateway = GatewayService(
+            gateway_database,
+            client,
+            GatewayMetrics(),
+            request_timeout=2,
+            endpoint_host_allowlist="*.test",
+            fallback_attempts=1,
+        )
+        with pytest.raises(APIError) as error:
+            await gateway.forward(
+                project_id=PROJECT_ID,
+                public_model="logical-chat",
+                path="/v1/completions",
+                payload={"model": "logical-chat", "prompt": "read-fault"},
+                request_headers={},
+                stream_requested=False,
+                client_disconnected=lambda: _false(),
+            )
+
+    assert error.value.code == "UPSTREAM_DISCONNECTED"
+    assert len(hosts) == 1
+    assert hosts[0].startswith("worker-")
+    async with gateway_database.session() as session:
+        audits = list(
+            await session.scalars(
+                select(AuditEvent).where(AuditEvent.action == "gateway.vendor_fallback")
+            )
+        )
+        usages = list(await session.scalars(select(ServingRequestUsage)))
+    assert audits == []
+    assert len(usages) == 1
+    assert (usages[0].selected_vendor, usages[0].model_variant_id) == (
+        "nvidia",
+        nvidia_variant_id,
+    )
+    assert usages[0].outcome == "upstream_disconnected"
+
+
+async def test_unsafe_endpoint_preflight_can_fallback_before_post_dispatch(
+    gateway_database: Database,
+) -> None:
+    _logical_model_id, _nvidia_variant_id, ascend_variant_id = await _ready_dual_vendor_services(
+        gateway_database
+    )
+    async with gateway_database.session() as session, session.begin():
+        nvidia_service = await session.scalar(
+            select(ModelService).where(ModelService.selected_vendor == "nvidia")
+        )
+        assert nvidia_service is not None
+        nvidia_replicas = await ServiceRepository.list_replicas(
+            session,
+            nvidia_service.id,
+            for_update=True,
+        )
+        for replica in nvidia_replicas:
+            replica.endpoint_url = "http://public.example:8000"
+
+    hosts: list[str] = []
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        assert request.url.host is not None
+        hosts.append(request.url.host)
+        return httpx.Response(200, json={"choices": []})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        gateway = GatewayService(
+            gateway_database,
+            client,
+            GatewayMetrics(),
+            request_timeout=2,
+            endpoint_host_allowlist="ascend.test",
+            fallback_attempts=1,
+        )
+        result = await gateway.forward(
+            project_id=PROJECT_ID,
+            public_model="logical-chat",
+            path="/v1/completions",
+            payload={"model": "logical-chat", "prompt": "preflight"},
+            request_headers={},
+            stream_requested=False,
+            client_disconnected=lambda: _false(),
+        )
+
+    assert result.status_code == 200
+    assert hosts == ["ascend.test"]
+    async with gateway_database.session() as session:
+        audit = await session.scalar(
+            select(AuditEvent).where(AuditEvent.action == "gateway.vendor_fallback")
+        )
+        usages = list(await session.scalars(select(ServingRequestUsage)))
+    assert audit is not None and audit.outcome == "success"
+    assert audit.details["reason"] == "UNSAFE_REPLICA_ENDPOINT"
+    assert len(usages) == 1
+    assert (usages[0].selected_vendor, usages[0].model_variant_id) == (
+        "huawei-ascend",
+        ascend_variant_id,
+    )
+
 
 async def test_sse_stream_start_pins_vendor_and_does_not_fallback(
     gateway_database: Database,
 ) -> None:
-    _logical_model_id, nvidia_variant_id, _ascend_variant_id = await _ready_dual_vendor_services(
+    logical_model_id, nvidia_variant_id, _ascend_variant_id = await _ready_dual_vendor_services(
         gateway_database
     )
     hosts: list[str] = []
@@ -1599,6 +2375,7 @@ async def test_sse_stream_start_pins_vendor_and_does_not_fallback(
             request_timeout=2,
             endpoint_host_allowlist="*.test",
             fallback_attempts=1,
+            circuit_failure_threshold=1,
         )
         result = await gateway.forward(
             project_id=PROJECT_ID,
@@ -1616,3 +2393,108 @@ async def test_sse_stream_start_pins_vendor_and_does_not_fallback(
     assert len(hosts) == 1
     assert hosts[0].startswith("worker-")
     assert result.headers["x-mini-ai-model-variant-id"] == str(nvidia_variant_id)
+    async with gateway_database.session() as session:
+        circuit = await session.scalar(
+            select(VendorCircuitState).where(
+                VendorCircuitState.logical_model_id == logical_model_id,
+                VendorCircuitState.vendor == "nvidia",
+            )
+        )
+        audits = list(
+            await session.scalars(
+                select(AuditEvent).where(AuditEvent.action == "gateway.vendor_fallback")
+            )
+        )
+        usages = list(await session.scalars(select(ServingRequestUsage)))
+    assert circuit is not None and circuit.state == "open"
+    assert circuit.last_error_code == "UPSTREAM_DISCONNECTED"
+    assert audits == []
+    assert len(usages) == 1
+    assert usages[0].outcome == "upstream_disconnected"
+    assert usages[0].error_code == "UPSTREAM_DISCONNECTED"
+
+
+async def test_fallback_stream_defers_success_circuit_audit_and_usage_until_completion(
+    gateway_database: Database,
+) -> None:
+    logical_model_id, _nvidia_variant_id, ascend_variant_id = await _ready_dual_vendor_services(
+        gateway_database
+    )
+    stream = GatedCompletionStream()
+    hosts: list[str] = []
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        assert request.url.host is not None
+        hosts.append(request.url.host)
+        if request.url.host.startswith("worker-"):
+            raise httpx.ConnectError("injected nvidia connect fault", request=request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=stream,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        gateway = GatewayService(
+            gateway_database,
+            client,
+            GatewayMetrics(),
+            request_timeout=2,
+            endpoint_host_allowlist="*.test",
+            fallback_attempts=1,
+            circuit_failure_threshold=1,
+        )
+        result = await gateway.forward(
+            project_id=PROJECT_ID,
+            public_model="logical-chat",
+            path="/v1/chat/completions",
+            payload={"model": "logical-chat", "messages": [], "stream": True},
+            request_headers={},
+            stream_requested=True,
+            client_disconnected=lambda: _false(),
+        )
+
+        async with gateway_database.session() as session:
+            ascend_circuit_before = await session.scalar(
+                select(VendorCircuitState).where(
+                    VendorCircuitState.logical_model_id == logical_model_id,
+                    VendorCircuitState.vendor == "huawei-ascend",
+                )
+            )
+            audits_before = list(
+                await session.scalars(
+                    select(AuditEvent).where(AuditEvent.action == "gateway.vendor_fallback")
+                )
+            )
+            usages_before = list(await session.scalars(select(ServingRequestUsage)))
+        assert ascend_circuit_before is None
+        assert audits_before == []
+        assert usages_before == []
+
+        stream.allow_completion.set()
+        assert result.stream is not None
+        chunks = [chunk async for chunk in result.stream]
+
+    assert chunks == [b'data: {"choices":[]}\n\n', b"data: [DONE]\n\n"]
+    assert stream.closed is True
+    assert len(hosts) == 2
+    async with gateway_database.session() as session:
+        ascend_circuit = await session.scalar(
+            select(VendorCircuitState).where(
+                VendorCircuitState.logical_model_id == logical_model_id,
+                VendorCircuitState.vendor == "huawei-ascend",
+            )
+        )
+        audits = list(
+            await session.scalars(
+                select(AuditEvent).where(AuditEvent.action == "gateway.vendor_fallback")
+            )
+        )
+        usages = list(await session.scalars(select(ServingRequestUsage)))
+    assert ascend_circuit is not None and ascend_circuit.state == "closed"
+    assert len(audits) == 1 and audits[0].outcome == "success"
+    assert len(usages) == 1
+    assert (usages[0].selected_vendor, usages[0].model_variant_id) == (
+        "huawei-ascend",
+        ascend_variant_id,
+    )

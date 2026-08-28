@@ -1,0 +1,5 @@
+NPU ID                         : 0
+Chip Count                     : 1
+Chip ID                        : 0
+Total Capacity(MB)             : 65536
+Capacity(MB)                   : 64000
