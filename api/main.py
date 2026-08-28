@@ -176,7 +176,6 @@ def create_app(
         should_start_control
         and resolved_settings.control_plane_enabled
         and resolved_settings.kubernetes_serving_enabled
-        and resolved_settings.kubernetes_serving_fake_enabled
     ):
         kubernetes_replica_runtime = KubernetesReplicaRuntimeController(
             resolved_database,
@@ -196,6 +195,7 @@ def create_app(
             app_env=resolved_settings.app_env,
             cluster_id=resolved_settings.kubernetes_serving_cluster_id,
             image=resolved_settings.kubernetes_serving_image,
+            runtime_profile_catalog=runtime_profile_catalog,
             fake_enabled=resolved_settings.kubernetes_serving_fake_enabled,
             batch_size=resolved_settings.batch_size,
             startup_timeout_seconds=resolved_settings.kubernetes_serving_startup_timeout,
@@ -242,6 +242,7 @@ def create_app(
             cpu_price_per_hour=resolved_settings.cpu_price_per_hour,
             memory_price_per_gb_hour=resolved_settings.memory_price_per_gb_hour,
             gpu_price_per_hour=resolved_settings.gpu_price_per_hour,
+            runtime_profile_catalog=runtime_profile_catalog,
             preemption_enabled=resolved_settings.scheduler_preemption_enabled,
             preemption_min_delta=resolved_settings.scheduler_preemption_min_delta,
         )

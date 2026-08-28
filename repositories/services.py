@@ -9,7 +9,7 @@ from sqlalchemy import Select, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.pagination import CursorKey
-from core.enums import RuntimeType
+from core.enums import AcceleratorVendor, RuntimeType
 from models.service import (
     ModelService,
     ReplicaHealth,
@@ -105,7 +105,24 @@ class ServiceRepository:
         autoscaling_max_replicas: int = 4,
         autoscaling_target_concurrency: int = 8,
         autoscaling_cooldown_seconds: int = 60,
+        service_id: uuid.UUID | None = None,
+        logical_model_id: uuid.UUID | None = None,
+        model_variant_id: uuid.UUID | None = None,
+        selected_vendor: AcceleratorVendor | str | None = None,
+        selected_kind: str | None = None,
+        selected_model: str | None = None,
+        runtime_profile_id: str | None = None,
+        runtime_profile_version: str | None = None,
+        runtime_profile_digest: str | None = None,
+        allocation_authority: str | None = None,
+        accelerator_resource_name: str | None = None,
+        selection_policy: str | None = None,
     ) -> ModelService:
+        vendor_value = (
+            selected_vendor.value
+            if isinstance(selected_vendor, AcceleratorVendor)
+            else selected_vendor
+        )
         await QuotaRepository.replace_service_commitment(
             session,
             project_id=project_id,
@@ -114,9 +131,11 @@ class ServiceRepository:
             cpu_millicores=cpu_millicores,
             memory_mb=memory_mb,
             gpu_count=gpu_count,
+            accelerator_vendor=vendor_value,
         )
         now = await database_utcnow(session)
         service = ModelService(
+            id=service_id or uuid.uuid4(),
             project_id=project_id,
             registered_model_id=registered_model_id,
             name=name,
@@ -130,6 +149,17 @@ class ServiceRepository:
             gpu_count=gpu_count,
             gpu_memory_mb=gpu_memory_mb,
             gpu_model=gpu_model,
+            logical_model_id=logical_model_id,
+            model_variant_id=model_variant_id,
+            selected_vendor=vendor_value,
+            selected_kind=selected_kind,
+            selected_model=selected_model,
+            runtime_profile_id=runtime_profile_id,
+            runtime_profile_version=runtime_profile_version,
+            runtime_profile_digest=runtime_profile_digest,
+            allocation_authority=allocation_authority,
+            accelerator_resource_name=accelerator_resource_name,
+            selection_policy=selection_policy,
             tensor_parallel_size=(
                 tensor_parallel_size if tensor_parallel_size is not None else max(1, gpu_count)
             ),
@@ -312,6 +342,7 @@ class ServiceRepository:
             cpu_millicores=service.cpu_millicores,
             memory_mb=service.memory_mb,
             gpu_count=service.gpu_count,
+            accelerator_vendor=service.selected_vendor,
         )
         now = await database_utcnow(session)
         service.desired_replicas = desired_replicas
@@ -600,6 +631,17 @@ class ServiceRepository:
                 status=ReplicaStatus.PENDING,
                 health=ReplicaHealth.UNKNOWN,
                 active_requests=0,
+                logical_model_id=service.logical_model_id,
+                model_variant_id=service.model_variant_id,
+                selected_vendor=service.selected_vendor,
+                selected_kind=service.selected_kind,
+                selected_model=service.selected_model,
+                runtime_profile_id=service.runtime_profile_id,
+                runtime_profile_version=service.runtime_profile_version,
+                runtime_profile_digest=service.runtime_profile_digest,
+                allocation_authority=service.allocation_authority,
+                accelerator_resource_name=service.accelerator_resource_name,
+                selection_policy=service.selection_policy,
                 model_revision=service.model_revision,
                 image_digest=_image_digest(service.image),
                 created_at=changed_at,

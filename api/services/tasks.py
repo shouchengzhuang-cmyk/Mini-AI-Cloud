@@ -134,6 +134,7 @@ class TaskService:
                     labels=dict(payload.labels),
                     network_enabled=payload.network_enabled,
                     gpu_count=payload.gpu_count,
+                    accelerator_request_json=payload.effective_accelerator.model_dump(mode="json"),
                     idempotency_key=key,
                     request_hash=request_hash if key is not None else None,
                     project_id=resolved_principal.project_id,

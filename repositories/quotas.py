@@ -1,4 +1,5 @@
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
@@ -6,6 +7,7 @@ from decimal import Decimal
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.enums import AcceleratorVendor
 from core.rbac import ProjectStatus
 from models.identity import Project
 from models.usage import ProjectQuota, ProjectQuotaState
@@ -104,6 +106,8 @@ class QuotaRepository:
         max_service_replicas: int | None,
         max_artifact_bytes: int | None,
         daily_cost_limit: Decimal | None,
+        max_nvidia_gpus: int | None = None,
+        max_ascend_npus: int | None = None,
     ) -> QuotaSnapshot:
         values: dict[str, Decimal | int | None] = {
             "max_queued_tasks": max_queued_tasks,
@@ -111,6 +115,8 @@ class QuotaRepository:
             "max_cpu_millicores": max_cpu_millicores,
             "max_memory_mb": max_memory_mb,
             "max_gpus": max_gpus,
+            "max_nvidia_gpus": max_nvidia_gpus,
+            "max_ascend_npus": max_ascend_npus,
             "max_services": max_services,
             "max_service_replicas": max_service_replicas,
             "max_artifact_bytes": max_artifact_bytes,
@@ -120,6 +126,7 @@ class QuotaRepository:
             if value is not None and value < 0:
                 raise ValueError(f"{field} must be non-negative")
         snapshot = await QuotaRepository.get_locked(session, project_id=project_id)
+        quota = snapshot.quota
         state = snapshot.state
         _check_limit("queued_tasks", max_queued_tasks, state.queued_tasks)
         _check_limit(
@@ -138,6 +145,16 @@ class QuotaRepository:
             state.reserved_memory_mb + state.service_reserved_memory_mb,
         )
         _check_limit("gpus", max_gpus, state.reserved_gpus + state.service_reserved_gpus)
+        _check_limit(
+            "nvidia_gpus",
+            max_nvidia_gpus,
+            state.reserved_nvidia_gpus + state.service_reserved_nvidia_gpus,
+        )
+        _check_limit(
+            "ascend_npus",
+            max_ascend_npus,
+            state.reserved_ascend_npus + state.service_reserved_ascend_npus,
+        )
         _check_limit("services", max_services, state.service_count)
         _check_limit("service_replicas", max_service_replicas, state.service_replicas)
         _check_limit("artifact_bytes", max_artifact_bytes, state.artifact_bytes)
@@ -146,7 +163,6 @@ class QuotaRepository:
             daily_cost_limit,
             state.daily_reserved_cost + state.daily_settled_cost,
         )
-        quota = snapshot.quota
         for field, value in values.items():
             setattr(quota, field, value)
         quota.version += 1
@@ -173,6 +189,8 @@ class QuotaRepository:
         cpu_millicores: int,
         memory_mb: int,
         gpu_count: int,
+        accelerator_vendor: AcceleratorVendor | str | None = None,
+        accelerator_vendors: Sequence[AcceleratorVendor | str] | None = None,
     ) -> None:
         """Reject a task that can never fit inside its project's hard limits."""
 
@@ -182,6 +200,32 @@ class QuotaRepository:
         _check_limit("cpu_millicores", quota.max_cpu_millicores, cpu_millicores)
         _check_limit("memory_mb", quota.max_memory_mb, memory_mb)
         _check_limit("gpus", quota.max_gpus, gpu_count)
+        if accelerator_vendors is not None:
+            if accelerator_vendor is not None:
+                raise ValueError("pass accelerator_vendor or accelerator_vendors, not both")
+            vendors = tuple(
+                _normalize_accelerator_vendor(value, gpu_count=gpu_count)
+                for value in accelerator_vendors
+            )
+            if not vendors or any(vendor is None for vendor in vendors):
+                raise ValueError("accelerator_vendors must contain supported vendors")
+            limits = {
+                AcceleratorVendor.NVIDIA: quota.max_nvidia_gpus,
+                AcceleratorVendor.HUAWEI_ASCEND: quota.max_ascend_npus,
+            }
+            candidate_limits = [limits[vendor] for vendor in vendors if vendor is not None]
+            if not any(limit is None or gpu_count <= limit for limit in candidate_limits):
+                raise QuotaExceededError(
+                    "vendor_accelerators",
+                    limit=max(int(limit or 0) for limit in candidate_limits),
+                    requested=gpu_count,
+                )
+            return
+        vendor = _normalize_accelerator_vendor(accelerator_vendor, gpu_count=gpu_count)
+        if vendor == AcceleratorVendor.NVIDIA:
+            _check_limit("nvidia_gpus", quota.max_nvidia_gpus, gpu_count)
+        elif vendor == AcceleratorVendor.HUAWEI_ASCEND:
+            _check_limit("ascend_npus", quota.max_ascend_npus, gpu_count)
 
     @staticmethod
     async def release_queued(
@@ -205,6 +249,7 @@ class QuotaRepository:
         memory_mb: int,
         gpu_count: int,
         estimated_cost: Decimal = ZERO_COST,
+        accelerator_vendor: AcceleratorVendor | str | None = None,
     ) -> ProjectQuotaState:
         """Atomically move one admitted task from queued to running."""
 
@@ -212,6 +257,7 @@ class QuotaRepository:
         snapshot = await QuotaRepository.get_locked(session, project_id=project_id)
         quota = snapshot.quota
         state = snapshot.state
+        vendor = _normalize_accelerator_vendor(accelerator_vendor, gpu_count=gpu_count)
         if state.queued_tasks < 1:
             raise QuotaInvariantViolation("cannot reserve an execution without a queued task")
         _check_limit(
@@ -234,6 +280,22 @@ class QuotaRepository:
             quota.max_gpus,
             state.reserved_gpus + state.service_reserved_gpus + gpu_count,
         )
+        prospective_nvidia = state.reserved_nvidia_gpus + (
+            gpu_count if vendor == AcceleratorVendor.NVIDIA else 0
+        )
+        prospective_ascend = state.reserved_ascend_npus + (
+            gpu_count if vendor == AcceleratorVendor.HUAWEI_ASCEND else 0
+        )
+        _check_limit(
+            "nvidia_gpus",
+            quota.max_nvidia_gpus,
+            prospective_nvidia + state.service_reserved_nvidia_gpus,
+        )
+        _check_limit(
+            "ascend_npus",
+            quota.max_ascend_npus,
+            prospective_ascend + state.service_reserved_ascend_npus,
+        )
         _check_limit(
             "daily_cost",
             quota.daily_cost_limit,
@@ -243,7 +305,9 @@ class QuotaRepository:
         state.running_tasks += 1
         state.reserved_cpu_millicores += cpu_millicores
         state.reserved_memory_mb += memory_mb
-        state.reserved_gpus += gpu_count
+        state.reserved_nvidia_gpus = prospective_nvidia
+        state.reserved_ascend_npus = prospective_ascend
+        state.reserved_gpus = prospective_nvidia + prospective_ascend
         state.daily_reserved_cost += estimated_cost
         await _touch_state(session, state)
         return state
@@ -258,6 +322,7 @@ class QuotaRepository:
         cpu_millicores: int,
         memory_mb: int,
         gpu_count: int,
+        accelerator_vendor: AcceleratorVendor | str | None = None,
     ) -> ProjectQuotaState:
         """Atomically replace one service's desired resource commitment.
 
@@ -280,13 +345,21 @@ class QuotaRepository:
             snapshot = await QuotaRepository.initialize(session, project_id=project_id)
         quota = snapshot.quota
         state = snapshot.state
+        vendor = _normalize_accelerator_vendor(accelerator_vendor, gpu_count=gpu_count)
         replica_delta = desired_replicas - current_replicas
         service_delta = int(desired_replicas > 0) - int(current_replicas > 0)
         prospective_service_count = state.service_count + service_delta
         prospective_replicas = state.service_replicas + replica_delta
         prospective_cpu = state.service_reserved_cpu_millicores + (cpu_millicores * replica_delta)
         prospective_memory = state.service_reserved_memory_mb + memory_mb * replica_delta
-        prospective_gpus = state.service_reserved_gpus + gpu_count * replica_delta
+        accelerator_delta = gpu_count * replica_delta
+        prospective_nvidia = state.service_reserved_nvidia_gpus + (
+            accelerator_delta if vendor == AcceleratorVendor.NVIDIA else 0
+        )
+        prospective_ascend = state.service_reserved_ascend_npus + (
+            accelerator_delta if vendor == AcceleratorVendor.HUAWEI_ASCEND else 0
+        )
+        prospective_gpus = prospective_nvidia + prospective_ascend
         if (
             min(
                 prospective_service_count,
@@ -294,6 +367,8 @@ class QuotaRepository:
                 prospective_cpu,
                 prospective_memory,
                 prospective_gpus,
+                prospective_nvidia,
+                prospective_ascend,
             )
             < 0
         ):
@@ -319,6 +394,16 @@ class QuotaRepository:
             state.reserved_memory_mb + prospective_memory,
         )
         _check_limit("gpus", quota.max_gpus, state.reserved_gpus + prospective_gpus)
+        _check_limit(
+            "nvidia_gpus",
+            quota.max_nvidia_gpus,
+            state.reserved_nvidia_gpus + prospective_nvidia,
+        )
+        _check_limit(
+            "ascend_npus",
+            quota.max_ascend_npus,
+            state.reserved_ascend_npus + prospective_ascend,
+        )
 
         if replica_delta == 0:
             return state
@@ -327,6 +412,8 @@ class QuotaRepository:
         state.service_reserved_cpu_millicores = prospective_cpu
         state.service_reserved_memory_mb = prospective_memory
         state.service_reserved_gpus = prospective_gpus
+        state.service_reserved_nvidia_gpus = prospective_nvidia
+        state.service_reserved_ascend_npus = prospective_ascend
         await _touch_state(session, state)
         return state
 
@@ -341,6 +428,7 @@ class QuotaRepository:
         reserved_cost: Decimal = ZERO_COST,
         settled_cost: Decimal = ZERO_COST,
         reservation_accounting_date: date | None = None,
+        accelerator_vendor: AcceleratorVendor | str | None = None,
     ) -> ProjectQuotaState:
         """Release one execution, raising instead of hiding duplicate release.
 
@@ -354,11 +442,18 @@ class QuotaRepository:
             raise ValueError("settled_cost must be non-negative")
         snapshot = await QuotaRepository.get_locked(session, project_id=project_id)
         state = snapshot.state
+        vendor = _normalize_accelerator_vendor(accelerator_vendor, gpu_count=gpu_count)
+        typed_reserved = 0
+        if vendor == AcceleratorVendor.NVIDIA:
+            typed_reserved = state.reserved_nvidia_gpus
+        elif vendor == AcceleratorVendor.HUAWEI_ASCEND:
+            typed_reserved = state.reserved_ascend_npus
         if (
             state.running_tasks < 1
             or state.reserved_cpu_millicores < cpu_millicores
             or state.reserved_memory_mb < memory_mb
             or state.reserved_gpus < gpu_count
+            or typed_reserved < gpu_count
         ):
             raise QuotaInvariantViolation("project quota state is below the execution reservation")
         release_cost_today = (
@@ -370,7 +465,11 @@ class QuotaRepository:
         state.running_tasks -= 1
         state.reserved_cpu_millicores -= cpu_millicores
         state.reserved_memory_mb -= memory_mb
-        state.reserved_gpus -= gpu_count
+        if vendor == AcceleratorVendor.NVIDIA:
+            state.reserved_nvidia_gpus -= gpu_count
+        elif vendor == AcceleratorVendor.HUAWEI_ASCEND:
+            state.reserved_ascend_npus -= gpu_count
+        state.reserved_gpus = state.reserved_nvidia_gpus + state.reserved_ascend_npus
         if release_cost_today:
             state.daily_reserved_cost -= reserved_cost
         state.daily_settled_cost += settled_cost
@@ -404,11 +503,15 @@ def _assert_state_nonnegative(state: ProjectQuotaState) -> None:
         "reserved_cpu_millicores": state.reserved_cpu_millicores,
         "reserved_memory_mb": state.reserved_memory_mb,
         "reserved_gpus": state.reserved_gpus,
+        "reserved_nvidia_gpus": state.reserved_nvidia_gpus,
+        "reserved_ascend_npus": state.reserved_ascend_npus,
         "service_count": state.service_count,
         "service_replicas": state.service_replicas,
         "service_reserved_cpu_millicores": state.service_reserved_cpu_millicores,
         "service_reserved_memory_mb": state.service_reserved_memory_mb,
         "service_reserved_gpus": state.service_reserved_gpus,
+        "service_reserved_nvidia_gpus": state.service_reserved_nvidia_gpus,
+        "service_reserved_ascend_npus": state.service_reserved_ascend_npus,
         "artifact_bytes": state.artifact_bytes,
         "daily_reserved_cost": state.daily_reserved_cost,
         "daily_settled_cost": state.daily_settled_cost,
@@ -418,6 +521,28 @@ def _assert_state_nonnegative(state: ProjectQuotaState) -> None:
         raise QuotaInvariantViolation(
             f"project quota state has negative counters: {', '.join(invalid)}"
         )
+    if state.reserved_gpus != state.reserved_nvidia_gpus + state.reserved_ascend_npus:
+        raise QuotaInvariantViolation("task accelerator aggregate does not match typed counters")
+    if (
+        state.service_reserved_gpus
+        != state.service_reserved_nvidia_gpus + state.service_reserved_ascend_npus
+    ):
+        raise QuotaInvariantViolation("service accelerator aggregate does not match typed counters")
+
+
+def _normalize_accelerator_vendor(
+    value: AcceleratorVendor | str | None,
+    *,
+    gpu_count: int,
+) -> AcceleratorVendor | None:
+    if gpu_count == 0:
+        return None
+    if value is None:
+        return AcceleratorVendor.NVIDIA
+    try:
+        return AcceleratorVendor(value)
+    except ValueError as exc:
+        raise ValueError(f"unsupported accelerator vendor: {value}") from exc
 
 
 def _roll_daily_state(state: ProjectQuotaState, current_date: date) -> bool:

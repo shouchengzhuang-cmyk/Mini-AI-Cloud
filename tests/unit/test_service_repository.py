@@ -13,6 +13,7 @@ from core.database import Database
 from core.enums import RuntimeType
 from models.base import Base
 from models.identity import Project, User
+from models.model_variant import LogicalModel, ModelVariant
 from models.outbox import OutboxEvent
 from models.registry import RegisteredModel
 from models.service import (
@@ -54,6 +55,8 @@ async def service_database(tmp_path: Any) -> AsyncIterator[Database]:
                 cast(Table, ProjectQuotaState.__table__),
                 cast(Table, Worker.__table__),
                 cast(Table, RegisteredModel.__table__),
+                cast(Table, LogicalModel.__table__),
+                cast(Table, ModelVariant.__table__),
                 cast(Table, ModelService.__table__),
                 cast(Table, ServiceReplica.__table__),
                 cast(Table, OutboxEvent.__table__),

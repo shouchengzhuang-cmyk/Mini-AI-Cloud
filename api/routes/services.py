@@ -1,4 +1,5 @@
 import uuid
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Request, status
@@ -6,7 +7,11 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
 
-from api.dependencies import get_app_settings, get_database, require_api_permission
+from api.dependencies import (
+    get_app_settings,
+    get_database,
+    require_api_permission,
+)
 from api.errors import ConflictError, NotFoundError
 from api.pagination import encode_cursor
 from api.routes._pagination import parse_list_cursor
@@ -25,11 +30,14 @@ from core.config import Settings
 from core.database import Database
 from core.enums import RuntimeType
 from core.rbac import Permission, Principal
+from core.runtime_profiles import RuntimeProfileCatalog
 from models.registry import RegisteredModel
 from models.service import ModelService, ServiceStatus, ServingRuntime
+from repositories.admission import AdmissionRepository, ServiceAdmissionSnapshot
 from repositories.quotas import QuotaExceededError
 from repositories.registry import ImagePolicyRepository, RegisteredModelRepository
 from repositories.services import ServiceCounts, ServiceRepository
+from scheduler.admission import AdmissionRequest
 
 router = APIRouter(prefix="/api/v1/services", tags=["services"])
 
@@ -43,6 +51,9 @@ async def create_service(
     principal: Annotated[Principal, Depends(require_api_permission(Permission.MODEL_MANAGE))],
 ) -> ServiceResponse:
     project_id = _principal_project_id(principal)
+    profiles = getattr(request.app.state, "runtime_profile_catalog", None)
+    if profiles is None:
+        profiles = RuntimeProfileCatalog.from_path(Path(settings.runtime_profile_manifest_path))
     try:
         payload.require_current_accelerator_execution_support()
     except ValueError as exc:
@@ -69,7 +80,48 @@ async def create_service(
                 ),
             )
 
+            service_id = uuid.uuid4()
+            admission: ServiceAdmissionSnapshot | None = None
+            model = payload.model
+            model_revision = payload.model_revision
             image = payload.image
+            dtype: str = payload.dtype
+            if payload.logical_model_id is not None:
+                result = await AdmissionRepository.admit_logical_model_service(
+                    session,
+                    catalog=profiles,
+                    project_id=project_id,
+                    service_id=service_id,
+                    logical_model_id=payload.logical_model_id,
+                    request=_admission_request(payload),
+                    minimum_memory_mb=payload.gpu_memory_mb,
+                    desired_replicas=payload.replicas,
+                    requested_dtype=payload.dtype,
+                )
+                if not result.allowed or result.snapshot is None:
+                    raise ConflictError(
+                        "VENDOR_ADMISSION_REJECTED",
+                        "No homogeneous accelerator pool satisfies the logical model request",
+                        details={
+                            "reason": result.reason.value if result.reason is not None else None,
+                            "vendor": (
+                                result.rejected_vendor.value
+                                if result.rejected_vendor is not None
+                                else None
+                            ),
+                            "candidates": list(result.summary),
+                        },
+                    )
+                admission = result.snapshot
+                profile = profiles.load_exact(
+                    profile_id=admission.runtime_profile_id,
+                    profile_version=admission.runtime_profile_version,
+                    semantic_digest=admission.runtime_profile_digest,
+                )
+                model = admission.artifact_source
+                model_revision = admission.artifact_revision
+                image = profile.image.reference
+                dtype = admission.dtype
             if image is None and payload.runtime == ServingRuntime.VLLM:
                 image = settings.vllm_image
             if image is None and payload.runtime_type == RuntimeType.KUBERNETES:
@@ -98,14 +150,15 @@ async def create_service(
                         details={"reason": decision.reason},
                     )
                 image = decision.canonical_image
-            assert payload.model is not None
+            assert model is not None
             service = await ServiceRepository.create(
                 session,
+                service_id=service_id,
                 project_id=project_id,
                 registered_model_id=payload.registered_model_id,
                 name=payload.name,
-                model=payload.model,
-                model_revision=payload.model_revision,
+                model=model,
+                model_revision=model_revision,
                 runtime=payload.runtime,
                 runtime_type=payload.runtime_type,
                 image=image,
@@ -115,7 +168,7 @@ async def create_service(
                 gpu_memory_mb=payload.gpu_memory_mb,
                 gpu_model=payload.gpu_model,
                 tensor_parallel_size=payload.tensor_parallel_size,
-                dtype=payload.dtype,
+                dtype=dtype,
                 gpu_memory_utilization=payload.gpu_memory_utilization,
                 max_model_len=payload.max_model_len,
                 desired_replicas=payload.replicas,
@@ -133,6 +186,29 @@ async def create_service(
                 ),
                 autoscaling_cooldown_seconds=(
                     payload.autoscaling.cooldown_seconds if payload.autoscaling is not None else 60
+                ),
+                logical_model_id=(admission.logical_model_id if admission is not None else None),
+                model_variant_id=(admission.model_variant_id if admission is not None else None),
+                selected_vendor=(admission.vendor if admission is not None else None),
+                selected_kind=(admission.kind.value if admission is not None else None),
+                selected_model=(admission.selected_model if admission is not None else None),
+                runtime_profile_id=(
+                    admission.runtime_profile_id if admission is not None else None
+                ),
+                runtime_profile_version=(
+                    admission.runtime_profile_version if admission is not None else None
+                ),
+                runtime_profile_digest=(
+                    admission.runtime_profile_digest if admission is not None else None
+                ),
+                allocation_authority=(
+                    admission.allocation_authority.value if admission is not None else None
+                ),
+                accelerator_resource_name=(
+                    admission.accelerator_resource_name if admission is not None else None
+                ),
+                selection_policy=(
+                    admission.selection_policy.value if admission is not None else None
                 ),
             )
             await ServiceRepository.reconcile_locked(
@@ -331,20 +407,17 @@ def _validate_kubernetes_runtime_configuration(
     runtime: ServingRuntime,
     settings: Settings,
 ) -> None:
-    if runtime != ServingRuntime.FAKE:
-        raise ConflictError(
-            "KUBERNETES_SERVING_RUNTIME_UNSUPPORTED",
-            "Phase IV-A supports Kubernetes-backed fake inference only",
-        )
-    if settings.app_env == "production":
-        raise ConflictError(
-            "KUBERNETES_FAKE_SERVING_FORBIDDEN",
-            "Kubernetes fake serving is not permitted in production",
-        )
     if not settings.kubernetes_serving_enabled:
         raise ConflictError(
             "KUBERNETES_SERVING_DISABLED",
             "Kubernetes serving is disabled by configuration",
+        )
+    if runtime != ServingRuntime.FAKE:
+        return
+    if settings.app_env == "production":
+        raise ConflictError(
+            "KUBERNETES_FAKE_SERVING_FORBIDDEN",
+            "Kubernetes fake serving is not permitted in production",
         )
     if not settings.kubernetes_serving_fake_enabled:
         raise ConflictError(
@@ -464,6 +537,17 @@ def _service_response(service: ModelService, counts: ServiceCounts) -> ServiceRe
         gpu_count=service.gpu_count,
         gpu_memory_mb=service.gpu_memory_mb,
         gpu_model=service.gpu_model,
+        logical_model_id=service.logical_model_id,
+        model_variant_id=service.model_variant_id,
+        selected_vendor=service.selected_vendor,
+        selected_kind=service.selected_kind,
+        selected_model=service.selected_model,
+        runtime_profile_id=service.runtime_profile_id,
+        runtime_profile_version=service.runtime_profile_version,
+        runtime_profile_digest=service.runtime_profile_digest,
+        allocation_authority=service.allocation_authority,
+        accelerator_resource_name=service.accelerator_resource_name,
+        selection_policy=service.selection_policy,
         tensor_parallel_size=service.tensor_parallel_size,
         dtype=service.dtype,
         gpu_memory_utilization=service.gpu_memory_utilization,
@@ -488,6 +572,22 @@ def _service_response(service: ModelService, counts: ServiceCounts) -> ServiceRe
         updated_at=service.updated_at,
         stopped_at=service.stopped_at,
         version=service.version,
+    )
+
+
+def _admission_request(payload: ServiceCreate) -> AdmissionRequest:
+    accelerator = payload.effective_accelerator
+    return AdmissionRequest(
+        count=accelerator.count,
+        allowed_vendors=frozenset(accelerator.allowed_vendors),
+        allowed_kinds=frozenset(accelerator.allowed_kinds),
+        allowed_models=frozenset(accelerator.allowed_models),
+        required_capabilities=frozenset(accelerator.required_capabilities),
+        runtime_profile_id=accelerator.runtime_profile,
+        model_variant_id=(
+            str(payload.model_variant_id) if payload.model_variant_id is not None else None
+        ),
+        selection_policy=accelerator.selection_policy,
     )
 
 

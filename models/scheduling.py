@@ -70,9 +70,32 @@ class ResourceReservation(Base):
         ),
         CheckConstraint(
             "(gpu_count = 0 AND requested_vendor IS NULL AND requested_kind IS NULL "
-            "AND requested_profile_id IS NULL) OR "
+            "AND requested_profile_id IS NULL AND requested_profile_version IS NULL "
+            "AND requested_profile_digest IS NULL AND model_variant_id IS NULL) OR "
             "(gpu_count > 0 AND requested_vendor IS NOT NULL AND requested_kind IS NOT NULL)",
             name="accelerator_request",
+        ),
+        CheckConstraint(
+            "(requested_profile_id IS NULL AND requested_profile_version IS NULL "
+            "AND requested_profile_digest IS NULL) OR "
+            "(requested_profile_id IS NOT NULL AND requested_profile_version IS NOT NULL "
+            "AND requested_profile_digest IS NOT NULL)",
+            name="requested_profile_snapshot",
+        ),
+        CheckConstraint(
+            "requested_profile_digest IS NULL OR "
+            "(length(requested_profile_digest) = 71 "
+            "AND requested_profile_digest LIKE 'sha256:%')",
+            name="requested_profile_digest",
+        ),
+        CheckConstraint(
+            "model_variant_id IS NULL OR requested_profile_id IS NOT NULL",
+            name="model_variant_profile",
+        ),
+        CheckConstraint(
+            "gpu_count = 0 OR allocation_authority != 'kubernetes_device_plugin' "
+            "OR requested_profile_id IS NOT NULL",
+            name="requested_profile_authority",
         ),
         CheckConstraint(
             "requested_vendor IS NULL OR "
@@ -99,6 +122,7 @@ class ResourceReservation(Base):
         UniqueConstraint("execution_id", name="uq_resource_reservations_execution"),
         Index("ix_reservations_worker_state", "worker_id", "state"),
         Index("ix_reservations_task_state", "task_id", "state"),
+        Index("ix_reservations_variant_state", "model_variant_id", "state"),
         Index(
             "uq_reservations_active_task",
             "task_id",
@@ -131,6 +155,11 @@ class ResourceReservation(Base):
     requested_vendor: Mapped[str | None] = mapped_column(String(64))
     requested_kind: Mapped[str | None] = mapped_column(String(32))
     requested_profile_id: Mapped[str | None] = mapped_column(String(128))
+    requested_profile_version: Mapped[str | None] = mapped_column(String(32))
+    requested_profile_digest: Mapped[str | None] = mapped_column(String(71))
+    model_variant_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("model_variants.id", ondelete="RESTRICT")
+    )
     observed_device_ids_json: Mapped[list[str] | None] = mapped_column(JSON(none_as_null=True))
     observed_vendor: Mapped[str | None] = mapped_column(String(64))
     observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

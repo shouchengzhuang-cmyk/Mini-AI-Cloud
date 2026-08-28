@@ -149,7 +149,7 @@ def test_legacy_gpu_request_maps_to_the_vendor_neutral_contract() -> None:
     )
 
     assert request.effective_accelerator == AcceleratorRequest.model_validate(_nvidia_request())
-    assert "accelerator" not in request.model_dump(mode="json")
+    assert request.model_dump(mode="json")["accelerator"] is None
 
 
 def test_legacy_gpu_model_is_normalized_before_conflict_checks_and_persistence() -> None:
@@ -193,13 +193,16 @@ def test_consistent_legacy_and_new_fields_are_accepted_but_conflicts_fail_closed
         TaskCreate.model_validate(_task_payload(accelerator=_ascend_request(), gpu_count=1))
 
 
-def test_ascend_schema_is_available_but_execution_remains_fail_closed_in_a1() -> None:
+def test_ascend_request_is_normalized_for_vendor_aware_admission() -> None:
     request = TaskCreate.model_validate(_task_payload(accelerator=_ascend_request()))
 
     assert request.effective_accelerator.allowed_vendors == [AcceleratorVendor.HUAWEI_ASCEND]
-    assert request.gpu_count == 0
-    with pytest.raises(ValueError, match="schema-ready"):
-        request.require_current_accelerator_execution_support()
+    assert request.gpu_count == 1
+    assert request.gpu_memory_mb == 32_000
+    assert request.model_dump(mode="json")["accelerator"] == AcceleratorRequest.model_validate(
+        _ascend_request()
+    ).model_dump(mode="json")
+    request.require_current_accelerator_execution_support()
 
 
 def test_legacy_gpu_details_require_a_positive_count() -> None:

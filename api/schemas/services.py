@@ -19,7 +19,13 @@ from api.schemas.accelerators import (
     require_current_execution_support,
 )
 from api.schemas.common import PaginationMeta, RequestModel, ResponseModel
-from core.enums import RuntimeType
+from core.enums import (
+    AcceleratorKind,
+    AcceleratorSelectionPolicy,
+    AcceleratorVendor,
+    AllocationAuthority,
+    RuntimeType,
+)
 from models.service import (
     ReplicaHealth,
     ReplicaStatus,
@@ -49,6 +55,8 @@ class ServiceCreate(RequestModel):
     name: StrictStr = Field(min_length=1, max_length=128)
     model: StrictStr | None = Field(default=None, min_length=1, max_length=512)
     registered_model_id: uuid.UUID | None = None
+    logical_model_id: uuid.UUID | None = None
+    model_variant_id: uuid.UUID | None = None
     model_revision: StrictStr | None = Field(default=None, min_length=1, max_length=255)
     runtime: ServingRuntime = ServingRuntime.VLLM
     runtime_type: RuntimeType = RuntimeType.DOCKER
@@ -57,11 +65,7 @@ class ServiceCreate(RequestModel):
     memory_mb: StrictInt = Field(default=1024, ge=16, le=1_048_576)
     accelerator: AcceleratorRequest | None = Field(
         default=None,
-        exclude=True,
-        description=(
-            "Vendor-neutral accelerator request. A1 accepts the complete NVIDIA/Ascend "
-            "schema while preserving the current execution boundary."
-        ),
+        description=("Vendor-neutral NVIDIA/Ascend accelerator request used by A9 admission."),
     )
     gpu_count: StrictInt = Field(
         default=0,
@@ -139,8 +143,25 @@ class ServiceCreate(RequestModel):
         object.__setattr__(self, "gpu_count", gpu_count)
         object.__setattr__(self, "gpu_memory_mb", gpu_memory_mb)
         object.__setattr__(self, "gpu_model", gpu_model)
-        if self.model is None and self.registered_model_id is None:
-            raise ValueError("model or registered_model_id is required")
+        if self.model_variant_id is not None and self.logical_model_id is None:
+            raise ValueError("model_variant_id requires logical_model_id")
+        if self.logical_model_id is not None:
+            if self.model is not None or self.registered_model_id is not None:
+                raise ValueError(
+                    "logical_model_id cannot be combined with model or registered_model_id"
+                )
+            if self.runtime != ServingRuntime.VLLM or self.runtime_type != RuntimeType.KUBERNETES:
+                raise ValueError(
+                    "logical model services require vllm with runtime_type='kubernetes'"
+                )
+            if self.gpu_count == 0:
+                raise ValueError(
+                    "logical model services require accelerator count greater than zero"
+                )
+        elif self.model is None and self.registered_model_id is None:
+            raise ValueError(
+                "model or registered_model_id is required unless logical_model_id is set"
+            )
 
         # Registry-backed requests are validated again after the project-scoped
         # registry defaults have been resolved into a complete service snapshot.
@@ -158,8 +179,12 @@ class ServiceCreate(RequestModel):
                 raise ValueError("CPU and fake services require tensor_parallel_size=1")
             self.tensor_parallel_size = 1
         elif self.runtime == ServingRuntime.VLLM:
-            if self.runtime_type != RuntimeType.DOCKER:
-                raise ValueError("vllm serving runtime currently requires runtime_type='docker'")
+            if self.runtime_type not in {RuntimeType.DOCKER, RuntimeType.KUBERNETES}:
+                raise ValueError("vllm serving runtime requires docker or kubernetes")
+            if self.runtime_type == RuntimeType.KUBERNETES and self.logical_model_id is None:
+                raise ValueError(
+                    "Kubernetes vllm services require logical_model_id for immutable admission"
+                )
             expected_tensor_parallel_size = max(1, self.gpu_count)
             if self.tensor_parallel_size is None:
                 self.tensor_parallel_size = expected_tensor_parallel_size
@@ -194,6 +219,14 @@ class ServiceCreate(RequestModel):
         )
 
     def require_current_accelerator_execution_support(self) -> None:
+        if (
+            self.logical_model_id is None
+            and self.accelerator is not None
+            and not self.accelerator.is_legacy_gpu_compatible()
+        ):
+            raise ValueError(
+                "vendor-aware services require logical_model_id and Kubernetes admission"
+            )
         require_current_execution_support(self.accelerator)
 
 
@@ -216,6 +249,17 @@ class ServiceResponse(ResponseModel):
     gpu_count: int = Field(ge=0)
     gpu_memory_mb: int = Field(ge=0)
     gpu_model: str | None
+    logical_model_id: uuid.UUID | None
+    model_variant_id: uuid.UUID | None
+    selected_vendor: AcceleratorVendor | None
+    selected_kind: AcceleratorKind | None
+    selected_model: str | None
+    runtime_profile_id: str | None
+    runtime_profile_version: str | None
+    runtime_profile_digest: str | None
+    allocation_authority: AllocationAuthority | None
+    accelerator_resource_name: str | None
+    selection_policy: AcceleratorSelectionPolicy | None
     tensor_parallel_size: int = Field(ge=1)
     dtype: VLLMDType
     gpu_memory_utilization: float = Field(gt=0, le=1)
@@ -256,6 +300,17 @@ class ServiceReplicaResponse(ResponseModel):
     last_health_at: datetime | None
     health_failure_count: int = Field(ge=0)
     active_requests: int = Field(ge=0)
+    logical_model_id: uuid.UUID | None
+    model_variant_id: uuid.UUID | None
+    selected_vendor: AcceleratorVendor | None
+    selected_kind: AcceleratorKind | None
+    selected_model: str | None
+    runtime_profile_id: str | None
+    runtime_profile_version: str | None
+    runtime_profile_digest: str | None
+    allocation_authority: AllocationAuthority | None
+    accelerator_resource_name: str | None
+    selection_policy: AcceleratorSelectionPolicy | None
     model_revision: str | None
     image_digest: str | None
     error_code: str | None

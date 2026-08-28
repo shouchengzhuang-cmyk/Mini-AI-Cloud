@@ -13,7 +13,15 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import Select, func, select
 
 from core.database import Database
-from core.enums import ErrorCode, RuntimeType, WorkerStatus
+from core.enums import (
+    AcceleratorKind,
+    AcceleratorSelectionPolicy,
+    AcceleratorVendor,
+    AllocationAuthority,
+    ErrorCode,
+    RuntimeType,
+    WorkerStatus,
+)
 from core.logging import get_logger
 from core.metrics import (
     K8S_SERVING_LAUNCH_FAILURES,
@@ -21,6 +29,11 @@ from core.metrics import (
     K8S_SERVING_PODS,
     K8S_SERVING_RECONCILE_DURATION,
     K8S_SERVING_REPLACEMENTS,
+)
+from core.runtime_profiles import (
+    RuntimeProfile,
+    RuntimeProfileCatalog,
+    RuntimeProfileCompatibilityError,
 )
 from models.service import (
     ModelService,
@@ -50,6 +63,7 @@ from worker.kubernetes_serving_runtime import (
 
 _BACKOFF_REASON = "KUBERNETES_SERVING_BACKOFF"
 _IMAGE_REQUIRED_REASON = "KUBERNETES_SERVING_IMAGE_REQUIRED"
+_RUNTIME_PROFILE_INVALID_REASON = "KUBERNETES_RUNTIME_PROFILE_INVALID"
 _MAX_ERROR_MESSAGE_BYTES = 4096
 _MAX_BACKOFF_SECONDS = 300.0
 _MAX_RECOVERY_CONFLICT_WARNINGS = 20
@@ -97,6 +111,9 @@ class KubernetesReplicaClaim:
     cpu_millicores: int
     memory_mb: int
     claimed_at: datetime
+    accelerator_count: int = 0
+    tensor_parallel_size: int = 1
+    runtime_profile: RuntimeProfile | None = None
     replacement_reason: str | None = None
 
 
@@ -126,7 +143,7 @@ class _ManagedReplica:
 
 
 class KubernetesReplicaRuntimeController:
-    """Converge fenced Fake service replicas onto Kubernetes Pods.
+    """Converge fenced profile-backed and explicitly enabled Fake replicas onto Pods.
 
     The controller uses a stable virtual Worker id and a process-scoped Worker
     session.  PostgreSQL remains the ownership authority; Kubernetes labels are
@@ -143,6 +160,7 @@ class KubernetesReplicaRuntimeController:
         app_env: str,
         cluster_id: str,
         image: str | None,
+        runtime_profile_catalog: RuntimeProfileCatalog | None = None,
         fake_enabled: bool = False,
         worker_id: str | None = None,
         batch_size: int = 10,
@@ -155,10 +173,8 @@ class KubernetesReplicaRuntimeController:
         fake_startup_delay_seconds: float = 0.0,
         fake_chunk_delay_seconds: float = 0.0,
     ) -> None:
-        if app_env not in {"development", "test"}:
+        if fake_enabled and app_env not in {"development", "test"}:
             raise ValueError("Kubernetes Fake serving is prohibited outside development and test")
-        if not fake_enabled:
-            raise ValueError("Kubernetes Fake serving requires explicit opt-in")
         resolved_cluster_id = cluster_id.strip()
         if not _KUBERNETES_LABEL_VALUE.fullmatch(resolved_cluster_id):
             raise ValueError("cluster_id must be a Kubernetes label value")
@@ -184,6 +200,8 @@ class KubernetesReplicaRuntimeController:
         self.runtime = runtime
         self.cluster_id = resolved_cluster_id
         self.default_image = image.strip() if image is not None and image.strip() else None
+        self.runtime_profile_catalog = runtime_profile_catalog
+        self.fake_enabled = fake_enabled
         self.worker_id = resolved_worker_id
         self.worker_session_id = uuid.uuid4()
         self.batch_size = batch_size
@@ -221,7 +239,14 @@ class KubernetesReplicaRuntimeController:
         )
 
     @staticmethod
-    def claim_candidates_query(limit: int) -> Select[tuple[ModelService]]:
+    def claim_candidates_query(
+        limit: int,
+        *,
+        fake_enabled: bool = True,
+    ) -> Select[tuple[ModelService]]:
+        supported_runtimes = {ServingRuntime.VLLM}
+        if fake_enabled:
+            supported_runtimes.add(ServingRuntime.FAKE)
         pending_exists = (
             select(ServiceReplica.id)
             .where(
@@ -234,7 +259,7 @@ class KubernetesReplicaRuntimeController:
         return (
             select(ModelService)
             .where(
-                ModelService.runtime == ServingRuntime.FAKE,
+                ModelService.runtime.in_(supported_runtimes),
                 ModelService.runtime_type == RuntimeType.KUBERNETES,
                 ModelService.desired_replicas > 0,
                 pending_exists,
@@ -502,7 +527,10 @@ class KubernetesReplicaRuntimeController:
                     select(ServiceReplica, ModelService)
                     .join(ModelService, ModelService.id == ServiceReplica.service_id)
                     .where(
-                        ModelService.runtime == ServingRuntime.FAKE,
+                        ModelService.runtime.in_(
+                            {ServingRuntime.VLLM}
+                            | ({ServingRuntime.FAKE} if self.fake_enabled else set())
+                        ),
                         ModelService.runtime_type == RuntimeType.KUBERNETES,
                         ServiceReplica.worker_id == self.worker_id,
                         ServiceReplica.execution_id.is_not(None),
@@ -559,7 +587,22 @@ class KubernetesReplicaRuntimeController:
                 continue
             replica, service = pair
             assert replica.execution_id is not None
-            claim = _claim_from_models(replica, service, self.default_image)
+            try:
+                claim = _claim_from_models(
+                    replica,
+                    service,
+                    self.default_image,
+                    self.runtime_profile_catalog,
+                )
+            except RuntimeProfileCompatibilityError as error:
+                self.logger.warning(
+                    "Kubernetes serving replica profile rejected during recovery",
+                    service_id=str(service.id),
+                    replica_id=str(replica.id),
+                    reason=_bounded_message(str(error)),
+                )
+                matched_replica_ids.add(replica.id)
+                continue
             if claim is None:
                 if not await self._force_cleanup_if_current(handle):
                     raise StaleKubernetesServingController(
@@ -609,7 +652,15 @@ class KubernetesReplicaRuntimeController:
             if replica.id in matched_replica_ids:
                 continue
             assert replica.execution_id is not None
-            claim = _claim_from_models(replica, service, self.default_image)
+            try:
+                claim = _claim_from_models(
+                    replica,
+                    service,
+                    self.default_image,
+                    self.runtime_profile_catalog,
+                )
+            except RuntimeProfileCompatibilityError:
+                claim = None
             if claim is None:
                 claim = KubernetesReplicaClaim(
                     service_id=service.id,
@@ -671,7 +722,14 @@ class KubernetesReplicaRuntimeController:
         claims: list[KubernetesReplicaClaim] = []
         waiting_backoff = 0
         async with self.database.session() as session, session.begin():
-            services = list(await session.scalars(self.claim_candidates_query(self.batch_size)))
+            services = list(
+                await session.scalars(
+                    self.claim_candidates_query(
+                        self.batch_size,
+                        fake_enabled=self.fake_enabled,
+                    )
+                )
+            )
             if not services:
                 return [], 0
             now = await database_utcnow(session)
@@ -682,8 +740,10 @@ class KubernetesReplicaRuntimeController:
                 if not _retry_is_due(service, now):
                     waiting_backoff += 1
                     continue
-                image = service.image or self.default_image
-                if image is None:
+                if (
+                    service.runtime == ServingRuntime.FAKE
+                    and (service.image or self.default_image) is None
+                ):
                     _record_scheduling_reason(
                         service,
                         reason=_IMAGE_REQUIRED_REASON,
@@ -726,6 +786,33 @@ class KubernetesReplicaRuntimeController:
                     )
                 )
                 for replica in replicas:
+                    try:
+                        runtime_profile = _runtime_profile_from_replica_snapshot(
+                            replica=replica,
+                            service_runtime=service.runtime,
+                            catalog=self.runtime_profile_catalog,
+                        )
+                    except RuntimeProfileCompatibilityError as error:
+                        _record_scheduling_reason(
+                            service,
+                            reason=_RUNTIME_PROFILE_INVALID_REASON,
+                            details={"message": _bounded_message(str(error))},
+                            now=now,
+                        )
+                        continue
+                    image = (
+                        runtime_profile.image.reference
+                        if runtime_profile is not None
+                        else service.image or self.default_image
+                    )
+                    if image is None:
+                        _record_scheduling_reason(
+                            service,
+                            reason=_IMAGE_REQUIRED_REASON,
+                            details={},
+                            now=now,
+                        )
+                        continue
                     execution_id = uuid.uuid4()
                     accepted = await ServiceRepository.bind_replica_execution(
                         session,
@@ -738,18 +825,29 @@ class KubernetesReplicaRuntimeController:
                     )
                     if accepted:
                         assert replica.started_at is not None
+                        claim = _claim_from_models(
+                            replica,
+                            service,
+                            self.default_image,
+                            self.runtime_profile_catalog,
+                        )
+                        if claim is None:
+                            raise RuntimeError("claimed Kubernetes replica has no launch image")
                         claims.append(
                             KubernetesReplicaClaim(
-                                service_id=service.id,
-                                replica_id=replica.id,
-                                project_id=service.project_id,
-                                generation=service.generation,
-                                execution_id=execution_id,
-                                image=image,
-                                model=service.model,
-                                cpu_millicores=service.cpu_millicores,
-                                memory_mb=service.memory_mb,
-                                claimed_at=_as_utc(replica.started_at),
+                                service_id=claim.service_id,
+                                replica_id=claim.replica_id,
+                                project_id=claim.project_id,
+                                generation=claim.generation,
+                                execution_id=claim.execution_id,
+                                image=claim.image,
+                                model=claim.model,
+                                cpu_millicores=claim.cpu_millicores,
+                                memory_mb=claim.memory_mb,
+                                claimed_at=claim.claimed_at,
+                                accelerator_count=claim.accelerator_count,
+                                tensor_parallel_size=claim.tensor_parallel_size,
+                                runtime_profile=claim.runtime_profile,
                                 replacement_reason=_replacement_metric_reason(service, replica),
                             )
                         )
@@ -769,6 +867,9 @@ class KubernetesReplicaRuntimeController:
             startup_delay_seconds=self.fake_startup_delay_seconds,
             chunk_delay_seconds=self.fake_chunk_delay_seconds,
             container_port=8000,
+            accelerator_count=claim.accelerator_count,
+            tensor_parallel_size=claim.tensor_parallel_size,
+            runtime_profile=claim.runtime_profile,
         )
         handle: KubernetesServingHandle | None = None
         try:
@@ -1232,12 +1333,21 @@ def _claim_from_models(
     replica: ServiceReplica,
     service: ModelService,
     default_image: str | None,
+    runtime_profile_catalog: RuntimeProfileCatalog | None,
 ) -> KubernetesReplicaClaim | None:
     if replica.execution_id is None:
         return None
-    image = service.image or default_image
+    runtime_profile = _runtime_profile_from_replica_snapshot(
+        replica=replica,
+        service_runtime=service.runtime,
+        catalog=runtime_profile_catalog,
+    )
+    image = runtime_profile.image.reference if runtime_profile is not None else service.image
+    image = image or default_image
     if image is None:
         return None
+    accelerator_count = service.tensor_parallel_size if runtime_profile is not None else 0
+    tensor_parallel_size = service.tensor_parallel_size if runtime_profile is not None else 1
     return KubernetesReplicaClaim(
         service_id=service.id,
         replica_id=replica.id,
@@ -1249,7 +1359,103 @@ def _claim_from_models(
         cpu_millicores=service.cpu_millicores,
         memory_mb=service.memory_mb,
         claimed_at=_replica_claimed_at(replica),
+        accelerator_count=accelerator_count,
+        tensor_parallel_size=tensor_parallel_size,
+        runtime_profile=runtime_profile,
     )
+
+
+def _runtime_profile_from_replica_snapshot(
+    *,
+    replica: ServiceReplica,
+    service_runtime: ServingRuntime,
+    catalog: RuntimeProfileCatalog | None,
+) -> RuntimeProfile | None:
+    snapshot = {
+        "model_variant_id": replica.model_variant_id,
+        "selected_vendor": replica.selected_vendor,
+        "selected_kind": replica.selected_kind,
+        "selected_model": replica.selected_model,
+        "runtime_profile_id": replica.runtime_profile_id,
+        "runtime_profile_version": replica.runtime_profile_version,
+        "runtime_profile_digest": replica.runtime_profile_digest,
+        "allocation_authority": replica.allocation_authority,
+        "accelerator_resource_name": replica.accelerator_resource_name,
+        "selection_policy": replica.selection_policy,
+    }
+    has_snapshot = any(value is not None for value in snapshot.values())
+    if service_runtime == ServingRuntime.FAKE:
+        if has_snapshot:
+            raise RuntimeProfileCompatibilityError(
+                "Fake Kubernetes replicas must not carry an accelerator snapshot"
+            )
+        return None
+    if service_runtime != ServingRuntime.VLLM:
+        raise RuntimeProfileCompatibilityError(
+            f"unsupported Kubernetes serving runtime: {service_runtime.value}"
+        )
+
+    missing = sorted(
+        name
+        for name, value in snapshot.items()
+        if value is None or (isinstance(value, str) and not value.strip())
+    )
+    if missing:
+        raise RuntimeProfileCompatibilityError(
+            f"incomplete replica accelerator snapshot: {', '.join(missing)}"
+        )
+    if catalog is None:
+        raise RuntimeProfileCompatibilityError("runtime profile catalog is unavailable")
+
+    assert replica.selected_vendor is not None
+    assert replica.selected_kind is not None
+    assert replica.runtime_profile_id is not None
+    assert replica.runtime_profile_version is not None
+    assert replica.runtime_profile_digest is not None
+    assert replica.allocation_authority is not None
+    assert replica.accelerator_resource_name is not None
+    assert replica.selection_policy is not None
+    try:
+        vendor = AcceleratorVendor(replica.selected_vendor)
+        kind = AcceleratorKind(replica.selected_kind)
+        authority = AllocationAuthority(replica.allocation_authority)
+        policy = AcceleratorSelectionPolicy(replica.selection_policy)
+    except ValueError as error:
+        raise RuntimeProfileCompatibilityError(
+            "replica accelerator snapshot contains an unsupported enum value"
+        ) from error
+    if authority != AllocationAuthority.KUBERNETES_DEVICE_PLUGIN:
+        raise RuntimeProfileCompatibilityError(
+            "Kubernetes accelerator launch requires kubernetes_device_plugin authority"
+        )
+    if (
+        policy == AcceleratorSelectionPolicy.NVIDIA_ONLY and vendor != AcceleratorVendor.NVIDIA
+    ) or (
+        policy == AcceleratorSelectionPolicy.ASCEND_ONLY
+        and vendor != AcceleratorVendor.HUAWEI_ASCEND
+    ):
+        raise RuntimeProfileCompatibilityError(
+            "replica selection policy does not match the selected vendor"
+        )
+
+    profile = catalog.load_exact(
+        profile_id=replica.runtime_profile_id,
+        profile_version=replica.runtime_profile_version,
+        semantic_digest=replica.runtime_profile_digest,
+    )
+    if profile.vendor is not vendor or profile.kind is not kind:
+        raise RuntimeProfileCompatibilityError(
+            "replica vendor/kind does not match the runtime profile"
+        )
+    if profile.allocation_authority is not authority:
+        raise RuntimeProfileCompatibilityError(
+            "replica allocation authority does not match the runtime profile"
+        )
+    if profile.kubernetes.resource_name != replica.accelerator_resource_name:
+        raise RuntimeProfileCompatibilityError(
+            "replica accelerator resource does not match the runtime profile"
+        )
+    return profile
 
 
 def _replica_claimed_at(replica: ServiceReplica) -> datetime:

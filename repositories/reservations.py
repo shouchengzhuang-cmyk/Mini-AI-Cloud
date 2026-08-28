@@ -256,6 +256,7 @@ class ReservationRepository:
                     cpu_millicores=reservation.cpu_millicores,
                     memory_mb=reservation.memory_mb,
                     gpu_count=reservation.gpu_count,
+                    accelerator_vendor=reservation.requested_vendor,
                     settled_cost=cost,
                     reservation_accounting_date=reservation.created_at.date(),
                 )
@@ -266,6 +267,7 @@ class ReservationRepository:
                     cpu_millicores=reservation.cpu_millicores,
                     memory_mb=reservation.memory_mb,
                     gpu_count=reservation.gpu_count,
+                    accelerator_vendor=reservation.requested_vendor,
                     reservation_accounting_date=reservation.created_at.date(),
                 )
         else:
@@ -275,6 +277,7 @@ class ReservationRepository:
                 cpu_millicores=reservation.cpu_millicores,
                 memory_mb=reservation.memory_mb,
                 gpu_count=reservation.gpu_count,
+                accelerator_vendor=reservation.requested_vendor,
                 reservation_accounting_date=reservation.created_at.date(),
             )
         return True

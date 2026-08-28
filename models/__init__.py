@@ -1,3 +1,4 @@
+from models.admission import AdmissionEvent
 from models.artifact import (
     Artifact,
     Dataset,
@@ -39,6 +40,7 @@ from models.usage import (
 from models.worker import Worker
 
 __all__ = [
+    "AdmissionEvent",
     "ApiKey",
     "Artifact",
     "AuditEvent",

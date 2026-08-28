@@ -17,13 +17,16 @@ from api.services.kubernetes_replica_runtime import (
     KubernetesReplicaRuntimeController,
     StaleKubernetesServingController,
     _as_utc,
+    _claim_from_models,
     _pod_metric_state,
 )
 from core.database import Database
-from core.enums import RuntimeType
+from core.enums import AcceleratorSelectionPolicy, AllocationAuthority, RuntimeType
 from core.metrics import K8S_SERVING_LAUNCH_FAILURES, K8S_SERVING_REPLACEMENTS
+from core.runtime_profiles import RuntimeProfileCatalog, RuntimeProfileCompatibilityError
 from models.base import Base
 from models.identity import Project, User
+from models.model_variant import LogicalModel, ModelVariant
 from models.outbox import OutboxEvent
 from models.registry import RegisteredModel
 from models.scheduling import GPUDevice as PersistedGPUDevice
@@ -58,6 +61,7 @@ from worker.kubernetes_serving_runtime import (
 )
 
 PROJECT_ID = uuid.UUID("d1000000-0000-0000-0000-000000000001")
+REPOSITORY_ROOT = Path(__file__).parents[2]
 pytestmark = pytest.mark.integration
 
 
@@ -85,6 +89,8 @@ async def kubernetes_controller_database(tmp_path: Path) -> AsyncIterator[Databa
                 cast(Table, Worker.__table__),
                 cast(Table, PersistedGPUDevice.__table__),
                 cast(Table, RegisteredModel.__table__),
+                cast(Table, LogicalModel.__table__),
+                cast(Table, ModelVariant.__table__),
                 cast(Table, ModelService.__table__),
                 cast(Table, ServiceReplica.__table__),
                 cast(Table, OutboxEvent.__table__),
@@ -288,6 +294,138 @@ async def _replicas(database: Database, service_id: uuid.UUID) -> list[ServiceRe
         return await ServiceRepository.list_replicas(session, service_id)
 
 
+def _profile_backed_models() -> tuple[ModelService, ServiceReplica, RuntimeProfileCatalog]:
+    catalog = RuntimeProfileCatalog.from_path(REPOSITORY_ROOT / "runtime_profiles/manifest.json")
+    entry = next(
+        item for item in catalog.manifest.profiles if item.identity == "nvidia-vllm-k8s@2.0.0"
+    )
+    profile = catalog.load_exact(
+        profile_id=entry.profile_id,
+        profile_version=entry.profile_version,
+        semantic_digest=entry.semantic_digest,
+    )
+    service_id = uuid.uuid4()
+    service = ModelService(
+        id=service_id,
+        project_id=PROJECT_ID,
+        name="profile-backed-service",
+        model="org/model",
+        runtime=ServingRuntime.VLLM,
+        runtime_type=RuntimeType.KUBERNETES,
+        image="service-image-is-not-authoritative",
+        cpu_millicores=1_000,
+        memory_mb=4_096,
+        gpu_count=0,
+        tensor_parallel_size=2,
+        desired_replicas=1,
+        generation=1,
+        # These mutable service fields deliberately disagree with the replica.
+        selected_vendor="huawei-ascend",
+        selected_kind="npu",
+        runtime_profile_id="service-profile-must-not-be-used",
+        runtime_profile_version="1.0.0",
+        runtime_profile_digest="sha256:" + "0" * 64,
+        allocation_authority=AllocationAuthority.CONTROL_PLANE_EXACT_DEVICE.value,
+    )
+    replica = ServiceReplica(
+        id=uuid.uuid4(),
+        service_id=service_id,
+        runtime=ServingRuntime.VLLM,
+        generation=1,
+        ordinal=0,
+        status=ReplicaStatus.STARTING,
+        execution_id=uuid.uuid4(),
+        model_variant_id=uuid.uuid4(),
+        selected_vendor=profile.vendor.value,
+        selected_kind=profile.kind.value,
+        selected_model="NVIDIA A100",
+        runtime_profile_id=profile.id,
+        runtime_profile_version=profile.version,
+        runtime_profile_digest=profile.semantic_digest(),
+        allocation_authority=AllocationAuthority.KUBERNETES_DEVICE_PLUGIN.value,
+        accelerator_resource_name=profile.kubernetes.resource_name,
+        selection_policy=AcceleratorSelectionPolicy.NVIDIA_ONLY.value,
+        started_at=datetime.now(UTC),
+    )
+    return service, replica, catalog
+
+
+def test_profile_backed_claim_uses_only_the_replica_admission_snapshot() -> None:
+    service, replica, catalog = _profile_backed_models()
+
+    claim = _claim_from_models(replica, service, None, catalog)
+
+    assert claim is not None
+    assert claim.runtime_profile is not None
+    assert claim.runtime_profile.id == replica.runtime_profile_id
+    assert claim.runtime_profile.semantic_digest() == replica.runtime_profile_digest
+    assert claim.image == claim.runtime_profile.image.reference
+    assert claim.accelerator_count == 2
+    assert claim.tensor_parallel_size == 2
+    assert not hasattr(claim, "concrete_device_ids")
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("runtime_profile_version", None, "incomplete replica accelerator snapshot"),
+        (
+            "allocation_authority",
+            AllocationAuthority.CONTROL_PLANE_EXACT_DEVICE.value,
+            "requires kubernetes_device_plugin authority",
+        ),
+        ("runtime_profile_digest", "sha256:" + "0" * 64, "immutable manifest"),
+        ("accelerator_resource_name", "nvidia.com/mig", "resource does not match"),
+    ],
+)
+def test_profile_backed_claim_fails_closed_on_snapshot_drift(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    service, replica, catalog = _profile_backed_models()
+    setattr(replica, field, value)
+
+    with pytest.raises(RuntimeProfileCompatibilityError, match=message):
+        _claim_from_models(replica, service, None, catalog)
+
+
+def test_fake_cpu_claim_remains_profile_free() -> None:
+    service_id = uuid.uuid4()
+    service = ModelService(
+        id=service_id,
+        project_id=PROJECT_ID,
+        name="fake-cpu-service",
+        model="fake-model",
+        runtime=ServingRuntime.FAKE,
+        runtime_type=RuntimeType.KUBERNETES,
+        image="mini-ai-cloud:kind-serving",
+        cpu_millicores=250,
+        memory_mb=128,
+        gpu_count=0,
+        tensor_parallel_size=1,
+        desired_replicas=1,
+        generation=1,
+    )
+    replica = ServiceReplica(
+        id=uuid.uuid4(),
+        service_id=service_id,
+        runtime=ServingRuntime.FAKE,
+        generation=1,
+        ordinal=0,
+        status=ReplicaStatus.STARTING,
+        execution_id=uuid.uuid4(),
+        started_at=datetime.now(UTC),
+    )
+
+    claim = _claim_from_models(replica, service, None, None)
+
+    assert claim is not None
+    assert claim.runtime_profile is None
+    assert claim.accelerator_count == 0
+    assert claim.tensor_parallel_size == 1
+
+
 def test_claim_query_is_exact_and_skip_locked() -> None:
     compiled = str(
         KubernetesReplicaRuntimeController.claim_candidates_query(10).compile(
@@ -300,7 +438,7 @@ def test_claim_query_is_exact_and_skip_locked() -> None:
     assert "model_services.runtime_type" in compiled
 
 
-def test_controller_rejects_unsafe_fake_modes() -> None:
+def test_controller_rejects_unsafe_fake_mode_but_allows_profile_only_mode() -> None:
     database = cast(Database, object())
     runtime = cast(_Runtime, object())
     with pytest.raises(ValueError, match="outside development and test"):
@@ -312,15 +450,16 @@ def test_controller_rejects_unsafe_fake_modes() -> None:
             image="mini-ai-cloud:test",
             fake_enabled=True,
         )
-    with pytest.raises(ValueError, match="explicit opt-in"):
-        KubernetesReplicaRuntimeController(
-            database,
-            runtime,
-            app_env="test",
-            cluster_id="kind-serving",
-            image="mini-ai-cloud:test",
-            fake_enabled=False,
-        )
+    controller = KubernetesReplicaRuntimeController(
+        database,
+        runtime,
+        app_env="production",
+        cluster_id="kind-serving",
+        image=None,
+        fake_enabled=False,
+    )
+
+    assert controller.fake_enabled is False
 
 
 def test_default_worker_id_is_stable_kubernetes_label_value() -> None:

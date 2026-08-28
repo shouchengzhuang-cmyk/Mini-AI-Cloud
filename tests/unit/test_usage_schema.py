@@ -21,6 +21,20 @@ def test_quota_schema_is_strict_and_preserves_decimal_cost_limits() -> None:
         ProjectQuotaUpdate(max_gpus=-1)
 
 
+def test_quota_schema_maps_legacy_gpu_limit_to_nvidia_only() -> None:
+    legacy = ProjectQuotaUpdate(max_gpus=4)
+    explicit = ProjectQuotaUpdate(
+        max_gpus=9,
+        max_nvidia_gpus=3,
+        max_ascend_npus=2,
+    )
+
+    assert legacy.max_nvidia_gpus == 4
+    assert legacy.max_ascend_npus == 0
+    assert explicit.max_nvidia_gpus == 3
+    assert explicit.max_ascend_npus == 2
+
+
 def test_usage_window_requires_timezone_order_and_bounded_range() -> None:
     now = datetime.now(UTC)
     assert UsageWindow(from_time=now, to_time=now + timedelta(hours=1))

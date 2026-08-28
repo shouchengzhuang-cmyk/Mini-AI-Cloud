@@ -12,7 +12,7 @@
         },
         "AcceleratorRequest": {
           "additionalProperties": false,
-          "description": "Vendor-neutral accelerator request contract.\n\nA1 validates the complete NVIDIA/Ascend vocabulary. Until the later M6\npersistence and scheduling PRs land, only requests that can be represented\nexactly by the v0.4 NVIDIA GPU fields may enter the existing execution path.",
+          "description": "Vendor-neutral accelerator request contract.\n\nThe normalized request remains authoritative even when legacy ``gpu_*``\ncolumns are populated for aggregate resource accounting compatibility.",
           "examples": [
             {
               "allowed_kinds": [
@@ -325,6 +325,14 @@
           ],
           "title": "AdminRepairResponse",
           "type": "object"
+        },
+        "AllocationAuthority": {
+          "enum": [
+            "control_plane_exact_device",
+            "kubernetes_device_plugin"
+          ],
+          "title": "AllocationAuthority",
+          "type": "string"
         },
         "ApiKeyCreate": {
           "additionalProperties": false,
@@ -3229,6 +3237,18 @@
               ],
               "title": "Max Artifact Bytes"
             },
+            "max_ascend_npus": {
+              "anyOf": [
+                {
+                  "minimum": 0.0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Max Ascend Npus"
+            },
             "max_cpu_millicores": {
               "anyOf": [
                 {
@@ -3264,6 +3284,18 @@
                 }
               ],
               "title": "Max Memory Mb"
+            },
+            "max_nvidia_gpus": {
+              "anyOf": [
+                {
+                  "minimum": 0.0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Max Nvidia Gpus"
             },
             "max_queued_tasks": {
               "anyOf": [
@@ -3330,6 +3362,8 @@
             "max_cpu_millicores",
             "max_memory_mb",
             "max_gpus",
+            "max_nvidia_gpus",
+            "max_ascend_npus",
             "max_services",
             "max_service_replicas",
             "max_artifact_bytes",
@@ -3391,6 +3425,11 @@
               "title": "Queued Tasks",
               "type": "integer"
             },
+            "reserved_ascend_npus": {
+              "minimum": 0.0,
+              "title": "Reserved Ascend Npus",
+              "type": "integer"
+            },
             "reserved_cpu_millicores": {
               "minimum": 0.0,
               "title": "Reserved Cpu Millicores",
@@ -3404,6 +3443,11 @@
             "reserved_memory_mb": {
               "minimum": 0.0,
               "title": "Reserved Memory Mb",
+              "type": "integer"
+            },
+            "reserved_nvidia_gpus": {
+              "minimum": 0.0,
+              "title": "Reserved Nvidia Gpus",
               "type": "integer"
             },
             "running_tasks": {
@@ -3421,6 +3465,11 @@
               "title": "Service Replicas",
               "type": "integer"
             },
+            "service_reserved_ascend_npus": {
+              "minimum": 0.0,
+              "title": "Service Reserved Ascend Npus",
+              "type": "integer"
+            },
             "service_reserved_cpu_millicores": {
               "minimum": 0.0,
               "title": "Service Reserved Cpu Millicores",
@@ -3434,6 +3483,11 @@
             "service_reserved_memory_mb": {
               "minimum": 0.0,
               "title": "Service Reserved Memory Mb",
+              "type": "integer"
+            },
+            "service_reserved_nvidia_gpus": {
+              "minimum": 0.0,
+              "title": "Service Reserved Nvidia Gpus",
               "type": "integer"
             },
             "updated_at": {
@@ -3453,11 +3507,15 @@
             "reserved_cpu_millicores",
             "reserved_memory_mb",
             "reserved_gpus",
+            "reserved_nvidia_gpus",
+            "reserved_ascend_npus",
             "service_count",
             "service_replicas",
             "service_reserved_cpu_millicores",
             "service_reserved_memory_mb",
             "service_reserved_gpus",
+            "service_reserved_nvidia_gpus",
+            "service_reserved_ascend_npus",
             "artifact_bytes",
             "accounting_date",
             "daily_reserved_cost",
@@ -3501,6 +3559,20 @@
               ],
               "title": "Max Artifact Bytes"
             },
+            "max_ascend_npus": {
+              "anyOf": [
+                {
+                  "maximum": 1000000.0,
+                  "minimum": 0.0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": 0,
+              "title": "Max Ascend Npus"
+            },
             "max_cpu_millicores": {
               "anyOf": [
                 {
@@ -3539,6 +3611,19 @@
                 }
               ],
               "title": "Max Memory Mb"
+            },
+            "max_nvidia_gpus": {
+              "anyOf": [
+                {
+                  "maximum": 1000000.0,
+                  "minimum": 0.0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Max Nvidia Gpus"
             },
             "max_queued_tasks": {
               "anyOf": [
@@ -4429,7 +4514,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Vendor-neutral accelerator request. A1 accepts the complete NVIDIA/Ascend schema while preserving the current execution boundary."
+              "description": "Vendor-neutral NVIDIA/Ascend accelerator request used by A9 admission."
             },
             "autoscaling": {
               "anyOf": [
@@ -4514,6 +4599,18 @@
               ],
               "title": "Image"
             },
+            "logical_model_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Logical Model Id"
+            },
             "max_model_len": {
               "anyOf": [
                 {
@@ -4559,6 +4656,18 @@
                 }
               ],
               "title": "Model Revision"
+            },
+            "model_variant_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Model Variant Id"
             },
             "name": {
               "maxLength": 128,
@@ -4660,10 +4769,31 @@
         "ServiceReplicaResponse": {
           "additionalProperties": false,
           "properties": {
+            "accelerator_resource_name": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Accelerator Resource Name"
+            },
             "active_requests": {
               "minimum": 0.0,
               "title": "Active Requests",
               "type": "integer"
+            },
+            "allocation_authority": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/AllocationAuthority"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "container_started_at": {
               "anyOf": [
@@ -4804,6 +4934,18 @@
               ],
               "title": "Lease Expires At"
             },
+            "logical_model_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Logical Model Id"
+            },
             "model_revision": {
               "anyOf": [
                 {
@@ -4814,6 +4956,18 @@
                 }
               ],
               "title": "Model Revision"
+            },
+            "model_variant_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Model Variant Id"
             },
             "ordinal": {
               "minimum": 0.0,
@@ -4834,6 +4988,80 @@
             },
             "runtime": {
               "$ref": "#/components/schemas/ServingRuntime"
+            },
+            "runtime_profile_digest": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Runtime Profile Digest"
+            },
+            "runtime_profile_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Runtime Profile Id"
+            },
+            "runtime_profile_version": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Runtime Profile Version"
+            },
+            "selected_kind": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/AcceleratorKind"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "selected_model": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Selected Model"
+            },
+            "selected_vendor": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/AcceleratorVendor"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "selection_policy": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/AcceleratorSelectionPolicy"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "service_id": {
               "format": "uuid",
@@ -4904,6 +5132,17 @@
             "last_health_at",
             "health_failure_count",
             "active_requests",
+            "logical_model_id",
+            "model_variant_id",
+            "selected_vendor",
+            "selected_kind",
+            "selected_model",
+            "runtime_profile_id",
+            "runtime_profile_version",
+            "runtime_profile_digest",
+            "allocation_authority",
+            "accelerator_resource_name",
+            "selection_policy",
             "model_revision",
             "image_digest",
             "error_code",
@@ -4924,10 +5163,31 @@
         "ServiceResponse": {
           "additionalProperties": false,
           "properties": {
+            "accelerator_resource_name": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Accelerator Resource Name"
+            },
             "actual_replicas": {
               "minimum": 0.0,
               "title": "Actual Replicas",
               "type": "integer"
+            },
+            "allocation_authority": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/AllocationAuthority"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "autoscaling": {
               "$ref": "#/components/schemas/AutoscalingConfig"
@@ -5035,6 +5295,18 @@
               ],
               "title": "Last Scaled At"
             },
+            "logical_model_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Logical Model Id"
+            },
             "max_model_len": {
               "anyOf": [
                 {
@@ -5067,6 +5339,18 @@
               ],
               "title": "Model Revision"
             },
+            "model_variant_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Model Variant Id"
+            },
             "name": {
               "title": "Name",
               "type": "string"
@@ -5091,6 +5375,39 @@
             "runtime": {
               "$ref": "#/components/schemas/ServingRuntime"
             },
+            "runtime_profile_digest": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Runtime Profile Digest"
+            },
+            "runtime_profile_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Runtime Profile Id"
+            },
+            "runtime_profile_version": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Runtime Profile Version"
+            },
             "runtime_type": {
               "$ref": "#/components/schemas/RuntimeType"
             },
@@ -5109,6 +5426,47 @@
                 }
               ],
               "title": "Scheduling Reason"
+            },
+            "selected_kind": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/AcceleratorKind"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "selected_model": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Selected Model"
+            },
+            "selected_vendor": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/AcceleratorVendor"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "selection_policy": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/AcceleratorSelectionPolicy"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "status": {
               "$ref": "#/components/schemas/ServiceStatus"
@@ -5156,6 +5514,17 @@
             "gpu_count",
             "gpu_memory_mb",
             "gpu_model",
+            "logical_model_id",
+            "model_variant_id",
+            "selected_vendor",
+            "selected_kind",
+            "selected_model",
+            "runtime_profile_id",
+            "runtime_profile_version",
+            "runtime_profile_digest",
+            "allocation_authority",
+            "accelerator_resource_name",
+            "selection_policy",
             "tensor_parallel_size",
             "dtype",
             "gpu_memory_utilization",
@@ -5404,7 +5773,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Vendor-neutral accelerator request. A1 accepts the complete NVIDIA/Ascend schema while preserving the current execution boundary."
+              "description": "Vendor-neutral NVIDIA/Ascend accelerator request used by A9 admission."
             },
             "artifacts": {
               "items": {
@@ -5885,6 +6254,28 @@
         "TaskResponse": {
           "additionalProperties": false,
           "properties": {
+            "accelerator_request_json": {
+              "anyOf": [
+                {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Accelerator Request Json"
+            },
+            "allocation_authority": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/AllocationAuthority"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "assigned_at": {
               "anyOf": [
                 {
@@ -6122,6 +6513,18 @@
               "title": "Memory Limit Mb",
               "type": "integer"
             },
+            "model_variant_id": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Model Variant Id"
+            },
             "network_enabled": {
               "title": "Network Enabled",
               "type": "boolean"
@@ -6186,8 +6589,72 @@
             "retry_policy": {
               "$ref": "#/components/schemas/RetryPolicy"
             },
+            "runtime_profile_digest": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Runtime Profile Digest"
+            },
+            "runtime_profile_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Runtime Profile Id"
+            },
+            "runtime_profile_version": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Runtime Profile Version"
+            },
             "runtime_type": {
               "$ref": "#/components/schemas/RuntimeType"
+            },
+            "selected_kind": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/AcceleratorKind"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "selected_model": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Selected Model"
+            },
+            "selected_vendor": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/AcceleratorVendor"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "started_at": {
               "anyOf": [
@@ -6291,6 +6758,15 @@
             "gpu_memory_mb",
             "gpu_model",
             "gpu_device_ids",
+            "accelerator_request_json",
+            "selected_vendor",
+            "selected_kind",
+            "selected_model",
+            "runtime_profile_id",
+            "runtime_profile_version",
+            "runtime_profile_digest",
+            "model_variant_id",
+            "allocation_authority",
             "network_enabled",
             "network_mode",
             "labels",

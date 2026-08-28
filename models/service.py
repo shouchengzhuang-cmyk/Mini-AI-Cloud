@@ -83,6 +83,55 @@ class ModelService(Base):
         CheckConstraint("memory_mb >= 16", name="memory_mb"),
         CheckConstraint("gpu_count >= 0", name="gpu_count"),
         CheckConstraint("gpu_memory_mb >= 0", name="gpu_memory_mb"),
+        CheckConstraint(
+            "(logical_model_id IS NULL AND model_variant_id IS NULL "
+            "AND selected_vendor IS NULL AND selected_kind IS NULL "
+            "AND selected_model IS NULL AND runtime_profile_id IS NULL "
+            "AND runtime_profile_version IS NULL AND runtime_profile_digest IS NULL "
+            "AND allocation_authority IS NULL AND accelerator_resource_name IS NULL "
+            "AND selection_policy IS NULL) OR "
+            "(logical_model_id IS NOT NULL AND model_variant_id IS NOT NULL "
+            "AND selected_vendor IS NOT NULL AND selected_kind IS NOT NULL "
+            "AND selected_model IS NOT NULL AND runtime_profile_id IS NOT NULL "
+            "AND runtime_profile_version IS NOT NULL AND runtime_profile_digest IS NOT NULL "
+            "AND allocation_authority IS NOT NULL AND selection_policy IS NOT NULL)",
+            name="admission_snapshot",
+        ),
+        CheckConstraint(
+            "selected_vendor IS NULL OR "
+            "(selected_vendor = 'nvidia' AND selected_kind = 'gpu') OR "
+            "(selected_vendor = 'huawei-ascend' AND selected_kind = 'npu')",
+            name="selected_vendor_kind",
+        ),
+        CheckConstraint(
+            "runtime_profile_digest IS NULL OR "
+            "(length(runtime_profile_digest) = 71 "
+            "AND runtime_profile_digest LIKE 'sha256:%')",
+            name="runtime_profile_digest",
+        ),
+        CheckConstraint(
+            "allocation_authority IS NULL OR allocation_authority IN "
+            "('control_plane_exact_device','kubernetes_device_plugin')",
+            name="allocation_authority",
+        ),
+        CheckConstraint(
+            "allocation_authority IS NULL "
+            "OR allocation_authority = 'control_plane_exact_device' "
+            "OR accelerator_resource_name IS NOT NULL",
+            name="resource_authority",
+        ),
+        CheckConstraint(
+            "selection_policy IS NULL OR selection_policy IN "
+            "('any','nvidia-only','ascend-only','prefer-nvidia','prefer-ascend')",
+            name="selection_policy",
+        ),
+        CheckConstraint(
+            "selected_vendor IS NULL OR selection_policy NOT IN ('nvidia-only','ascend-only') "
+            "OR (selection_policy = 'nvidia-only' AND selected_vendor = 'nvidia') "
+            "OR (selection_policy = 'ascend-only' "
+            "AND selected_vendor = 'huawei-ascend')",
+            name="policy_vendor",
+        ),
         CheckConstraint("tensor_parallel_size >= 1", name="tensor_parallel_size"),
         CheckConstraint(
             "gpu_memory_utilization > 0 AND gpu_memory_utilization <= 1",
@@ -111,6 +160,12 @@ class ModelService(Base):
             name="autoscaling_cooldown_seconds",
         ),
         Index("ix_model_services_project_status", "project_id", "status", "created_at"),
+        Index(
+            "ix_model_services_project_variant_status",
+            "project_id",
+            "model_variant_id",
+            "status",
+        ),
         Index("ix_model_services_reconcile", "status", "updated_at"),
     )
 
@@ -151,6 +206,21 @@ class ModelService(Base):
     gpu_count: Mapped[int] = mapped_column(Integer, default=0)
     gpu_memory_mb: Mapped[int] = mapped_column(Integer, default=0)
     gpu_model: Mapped[str | None] = mapped_column(String(255))
+    logical_model_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("logical_models.id", ondelete="RESTRICT")
+    )
+    model_variant_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("model_variants.id", ondelete="RESTRICT")
+    )
+    selected_vendor: Mapped[str | None] = mapped_column(String(64))
+    selected_kind: Mapped[str | None] = mapped_column(String(32))
+    selected_model: Mapped[str | None] = mapped_column(String(255))
+    runtime_profile_id: Mapped[str | None] = mapped_column(String(128))
+    runtime_profile_version: Mapped[str | None] = mapped_column(String(32))
+    runtime_profile_digest: Mapped[str | None] = mapped_column(String(71))
+    allocation_authority: Mapped[str | None] = mapped_column(String(64))
+    accelerator_resource_name: Mapped[str | None] = mapped_column(String(255))
+    selection_policy: Mapped[str | None] = mapped_column(String(32))
     tensor_parallel_size: Mapped[int] = mapped_column(Integer, default=1)
     dtype: Mapped[str] = mapped_column(String(32), default="auto")
     gpu_memory_utilization: Mapped[float] = mapped_column(Float, default=0.9)
@@ -216,6 +286,55 @@ class ServiceReplica(Base):
             name="health_failure_count",
         ),
         CheckConstraint("active_requests >= 0", name="active_requests"),
+        CheckConstraint(
+            "(logical_model_id IS NULL AND model_variant_id IS NULL "
+            "AND selected_vendor IS NULL AND selected_kind IS NULL "
+            "AND selected_model IS NULL AND runtime_profile_id IS NULL "
+            "AND runtime_profile_version IS NULL AND runtime_profile_digest IS NULL "
+            "AND allocation_authority IS NULL AND accelerator_resource_name IS NULL "
+            "AND selection_policy IS NULL) OR "
+            "(logical_model_id IS NOT NULL AND model_variant_id IS NOT NULL "
+            "AND selected_vendor IS NOT NULL AND selected_kind IS NOT NULL "
+            "AND selected_model IS NOT NULL AND runtime_profile_id IS NOT NULL "
+            "AND runtime_profile_version IS NOT NULL AND runtime_profile_digest IS NOT NULL "
+            "AND allocation_authority IS NOT NULL AND selection_policy IS NOT NULL)",
+            name="admission_snapshot",
+        ),
+        CheckConstraint(
+            "selected_vendor IS NULL OR "
+            "(selected_vendor = 'nvidia' AND selected_kind = 'gpu') OR "
+            "(selected_vendor = 'huawei-ascend' AND selected_kind = 'npu')",
+            name="selected_vendor_kind",
+        ),
+        CheckConstraint(
+            "runtime_profile_digest IS NULL OR "
+            "(length(runtime_profile_digest) = 71 "
+            "AND runtime_profile_digest LIKE 'sha256:%')",
+            name="runtime_profile_digest",
+        ),
+        CheckConstraint(
+            "allocation_authority IS NULL OR allocation_authority IN "
+            "('control_plane_exact_device','kubernetes_device_plugin')",
+            name="allocation_authority",
+        ),
+        CheckConstraint(
+            "allocation_authority IS NULL "
+            "OR allocation_authority = 'control_plane_exact_device' "
+            "OR accelerator_resource_name IS NOT NULL",
+            name="resource_authority",
+        ),
+        CheckConstraint(
+            "selection_policy IS NULL OR selection_policy IN "
+            "('any','nvidia-only','ascend-only','prefer-nvidia','prefer-ascend')",
+            name="selection_policy",
+        ),
+        CheckConstraint(
+            "selected_vendor IS NULL OR selection_policy NOT IN ('nvidia-only','ascend-only') "
+            "OR (selection_policy = 'nvidia-only' AND selected_vendor = 'nvidia') "
+            "OR (selection_policy = 'ascend-only' "
+            "AND selected_vendor = 'huawei-ascend')",
+            name="policy_vendor",
+        ),
         Index(
             "ix_service_replicas_service_generation_status",
             "service_id",
@@ -230,6 +349,7 @@ class ServiceReplica(Base):
             "health",
         ),
         Index("ix_service_replicas_worker_status", "worker_id", "status"),
+        Index("ix_service_replicas_variant_status", "model_variant_id", "status"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -285,6 +405,21 @@ class ServiceReplica(Base):
     )
     health_failure_count: Mapped[int] = mapped_column(Integer, default=0)
     active_requests: Mapped[int] = mapped_column(Integer, default=0)
+    logical_model_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("logical_models.id", ondelete="RESTRICT")
+    )
+    model_variant_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("model_variants.id", ondelete="RESTRICT")
+    )
+    selected_vendor: Mapped[str | None] = mapped_column(String(64))
+    selected_kind: Mapped[str | None] = mapped_column(String(32))
+    selected_model: Mapped[str | None] = mapped_column(String(255))
+    runtime_profile_id: Mapped[str | None] = mapped_column(String(128))
+    runtime_profile_version: Mapped[str | None] = mapped_column(String(32))
+    runtime_profile_digest: Mapped[str | None] = mapped_column(String(71))
+    allocation_authority: Mapped[str | None] = mapped_column(String(64))
+    accelerator_resource_name: Mapped[str | None] = mapped_column(String(255))
+    selection_policy: Mapped[str | None] = mapped_column(String(32))
     model_revision: Mapped[str | None] = mapped_column(String(255))
     image_digest: Mapped[str | None] = mapped_column(String(255))
     error_code: Mapped[str | None] = mapped_column(String(128))

@@ -189,6 +189,19 @@ def _prepare_for_assignment(task: Task) -> None:
     task.unschedulable_reason = None
 
 
+def _accelerator_request_vendors(
+    request: dict[str, object] | None,
+    *,
+    gpu_count: int,
+) -> tuple[AcceleratorVendor, ...] | None:
+    if gpu_count == 0 or request is None:
+        return None
+    raw_vendors = request.get("allowed_vendors")
+    if not isinstance(raw_vendors, list) or not raw_vendors:
+        return None
+    return tuple(AcceleratorVendor(str(value)) for value in raw_vendors)
+
+
 class TaskRepository:
     @staticmethod
     async def get(
@@ -240,6 +253,7 @@ class TaskRepository:
         labels: dict[str, str],
         network_enabled: bool,
         gpu_count: int,
+        accelerator_request_json: dict[str, object] | None = None,
         idempotency_key: str | None,
         request_hash: str | None,
         project_id: uuid.UUID = LEGACY_PROJECT_ID,
@@ -283,6 +297,10 @@ class TaskRepository:
             cpu_millicores=round(cpu_limit * 1000),
             memory_mb=memory_limit_mb,
             gpu_count=gpu_count,
+            accelerator_vendors=_accelerator_request_vendors(
+                accelerator_request_json,
+                gpu_count=gpu_count,
+            ),
         )
         await QuotaRepository.admit_queued(session, project_id=project_id)
         now = await database_utcnow(session)
@@ -308,6 +326,7 @@ class TaskRepository:
             labels=labels,
             network_enabled=network_enabled,
             gpu_count=gpu_count,
+            accelerator_request_json=accelerator_request_json,
             gpu_memory_mb=gpu_memory_mb,
             gpu_model=gpu_model,
             runtime_type=runtime_type,
@@ -854,6 +873,7 @@ class TaskRepository:
             cpu_millicores=task.cpu_millicores,
             memory_mb=task.memory_limit_mb,
             gpu_count=task.gpu_count,
+            accelerator_vendor=(AcceleratorVendor.NVIDIA if task.gpu_count else None),
         )
         OutboxRepository.add(
             session,

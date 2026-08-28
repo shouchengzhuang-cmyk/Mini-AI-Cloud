@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Literal, Self
 
+import yaml  # type: ignore[import-untyped]
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from core.accelerators import vendor_kind_is_compatible
@@ -433,15 +435,25 @@ class RuntimeProfileCompatibilityError(ValueError):
 
 
 class RuntimeProfileCatalog:
-    def __init__(self, manifest: RuntimeProfileManifest) -> None:
+    def __init__(
+        self,
+        manifest: RuntimeProfileManifest,
+        runtime_profiles: Mapping[tuple[str, str], RuntimeProfile] | None = None,
+    ) -> None:
         self._manifest = manifest
         self._profiles = {
             (profile.profile_id, profile.profile_version): profile for profile in manifest.profiles
         }
+        self._runtime_profiles = dict(runtime_profiles or {})
 
     @classmethod
     def from_path(cls, path: Path | str) -> RuntimeProfileCatalog:
-        manifest_path = Path(path)
+        try:
+            manifest_path = Path(path).resolve(strict=True)
+        except OSError as error:
+            raise RuntimeProfileCompatibilityError(
+                f"runtime profile manifest does not exist: {path}"
+            ) from error
         if not manifest_path.is_file():
             raise RuntimeProfileCompatibilityError(
                 f"runtime profile manifest does not exist: {manifest_path}"
@@ -455,11 +467,43 @@ class RuntimeProfileCatalog:
             raise RuntimeProfileCompatibilityError(
                 f"invalid runtime profile manifest: {manifest_path}"
             ) from error
-        return cls(manifest)
+        runtime_profiles = {
+            (entry.profile_id, entry.profile_version): _load_manifest_profile(
+                manifest_path,
+                entry,
+            )
+            for entry in manifest.profiles
+        }
+        return cls(manifest, runtime_profiles)
 
     @property
     def manifest(self) -> RuntimeProfileManifest:
         return self._manifest
+
+    def load_exact(
+        self,
+        *,
+        profile_id: str,
+        profile_version: str,
+        semantic_digest: str,
+    ) -> RuntimeProfile:
+        """Return the immutable YAML profile matching the exact manifest identity."""
+
+        entry = self._resolve_manifest_entry(
+            profile_id=profile_id,
+            profile_version=profile_version,
+            semantic_digest=semantic_digest,
+        )
+        profile = self._runtime_profiles.get((entry.profile_id, entry.profile_version))
+        if profile is None:
+            raise RuntimeProfileCompatibilityError(
+                f"runtime profile YAML is unavailable: {entry.identity}"
+            )
+        if profile.semantic_digest() != semantic_digest:
+            raise RuntimeProfileCompatibilityError(
+                "runtime profile YAML digest drifted from the immutable manifest"
+            )
+        return profile
 
     def resolve_compatible(
         self,
@@ -472,15 +516,11 @@ class RuntimeProfileCatalog:
         architecture: str,
         dtype: str,
     ) -> RuntimeProfileManifestEntry:
-        profile = self._profiles.get((profile_id, profile_version))
-        if profile is None:
-            raise RuntimeProfileCompatibilityError(
-                f"unknown runtime profile: {profile_id}@{profile_version}"
-            )
-        if profile.semantic_digest != semantic_digest:
-            raise RuntimeProfileCompatibilityError(
-                "runtime profile digest does not match the immutable manifest"
-            )
+        profile = self._resolve_manifest_entry(
+            profile_id=profile_id,
+            profile_version=profile_version,
+            semantic_digest=semantic_digest,
+        )
         if profile.vendor is not vendor or profile.kind is not kind:
             raise RuntimeProfileCompatibilityError(
                 "model variant vendor/kind does not match the runtime profile"
@@ -494,6 +534,73 @@ class RuntimeProfileCatalog:
                 f"architecture={architecture} is not declared by runtime profile {profile.identity}"
             )
         return profile
+
+    def _resolve_manifest_entry(
+        self,
+        *,
+        profile_id: str,
+        profile_version: str,
+        semantic_digest: str,
+    ) -> RuntimeProfileManifestEntry:
+        profile = self._profiles.get((profile_id, profile_version))
+        if profile is None:
+            raise RuntimeProfileCompatibilityError(
+                f"unknown runtime profile: {profile_id}@{profile_version}"
+            )
+        if profile.semantic_digest != semantic_digest:
+            raise RuntimeProfileCompatibilityError(
+                "runtime profile digest does not match the immutable manifest"
+            )
+        return profile
+
+
+def _load_manifest_profile(
+    manifest_path: Path,
+    entry: RuntimeProfileManifestEntry,
+) -> RuntimeProfile:
+    manifest_directory = manifest_path.parent.resolve()
+    repository_root = manifest_directory.parent
+    try:
+        profile_path = (repository_root / Path(*entry.path.split("/"))).resolve(strict=True)
+    except OSError as error:
+        raise RuntimeProfileCompatibilityError(
+            f"runtime profile YAML does not exist: {entry.path}"
+        ) from error
+    if profile_path.parent != manifest_directory or not profile_path.is_file():
+        raise RuntimeProfileCompatibilityError(
+            f"runtime profile YAML escapes the manifest directory: {entry.path}"
+        )
+    if profile_path.stat().st_size > 1_048_576:
+        raise RuntimeProfileCompatibilityError("runtime profile YAML exceeds 1 MiB")
+    try:
+        payload = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+        profile = RuntimeProfile.model_validate(payload)
+    except (OSError, UnicodeError, yaml.YAMLError, ValueError) as error:
+        raise RuntimeProfileCompatibilityError(
+            f"invalid runtime profile YAML: {entry.path}"
+        ) from error
+    if profile.identity != entry.identity:
+        raise RuntimeProfileCompatibilityError(
+            "runtime profile YAML identity does not match the manifest"
+        )
+    if profile.semantic_digest() != entry.semantic_digest:
+        raise RuntimeProfileCompatibilityError(
+            "runtime profile YAML digest does not match the immutable manifest"
+        )
+    if (
+        profile.vendor is not entry.vendor
+        or profile.kind is not entry.kind
+        or profile.engine != entry.engine
+        or profile.evidence_status is not entry.evidence_status
+        or profile.compatibility.hardware_families != entry.hardware_families
+        or profile.capabilities.model_architectures != entry.model_architectures
+        or profile.capabilities.dtypes != entry.dtypes
+        or profile.capabilities.features != entry.features
+    ):
+        raise RuntimeProfileCompatibilityError(
+            "runtime profile YAML metadata does not match the manifest"
+        )
+    return profile
 
 
 def generated_runtime_profile_schema() -> dict[str, object]:

@@ -21,6 +21,9 @@ from api.schemas.accelerators import (
 from api.schemas.common import PaginationMeta, PaginationQuery, RequestModel, ResponseModel
 from api.schemas.task_artifacts import TaskInputArtifact, TaskOutputArtifact
 from core.enums import (
+    AcceleratorKind,
+    AcceleratorVendor,
+    AllocationAuthority,
     ErrorCategory,
     ErrorCode,
     LogStream,
@@ -103,11 +106,7 @@ class TaskCreate(RequestModel):
     network_enabled: StrictBool = False
     accelerator: AcceleratorRequest | None = Field(
         default=None,
-        exclude=True,
-        description=(
-            "Vendor-neutral accelerator request. A1 accepts the complete NVIDIA/Ascend "
-            "schema while preserving the current execution boundary."
-        ),
+        description=("Vendor-neutral NVIDIA/Ascend accelerator request used by A9 admission."),
     )
     gpu_count: StrictInt = Field(
         default=0,
@@ -309,6 +308,15 @@ class TaskResponse(ResponseModel):
     gpu_memory_mb: int
     gpu_model: str | None
     gpu_device_ids: list[str]
+    accelerator_request_json: dict[str, object] | None
+    selected_vendor: AcceleratorVendor | None
+    selected_kind: AcceleratorKind | None
+    selected_model: str | None
+    runtime_profile_id: str | None
+    runtime_profile_version: str | None
+    runtime_profile_digest: str | None
+    model_variant_id: uuid.UUID | None
+    allocation_authority: AllocationAuthority | None
     network_enabled: bool
     network_mode: str
     labels: dict[str, str]
