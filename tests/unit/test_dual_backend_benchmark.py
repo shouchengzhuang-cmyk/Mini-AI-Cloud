@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 
 from benchmarks.dual_backend import load_config, run_benchmark, run_fallback_drill
 
@@ -428,7 +429,8 @@ async def test_dual_backend_ttft_records_first_non_empty_content_delta(
     events = [
         {"choices": [{"delta": {"role": "assistant"}}]},
         {"choices": [{"delta": {"content": ""}}]},
-        {"choices": [{"delta": {"content": "hello"}}]},
+        {"choices": [{"delta": {"content": " "}}]},
+        {"choices": [{"delta": {"content": "dual-stack-ok"}}]},
     ]
     clock = ManualClock(10.0)
 
@@ -441,7 +443,7 @@ async def test_dual_backend_ttft_records_first_non_empty_content_delta(
                 stream=TimedSSEStream(
                     events,
                     clock=clock,
-                    delays=[0.125, 0.125, 0.25, 0.0, 0.0],
+                    delays=[0.125, 0.125, 0.25, 0.5, 0.0, 0.0],
                 ),
             )
         return httpx.Response(
@@ -462,6 +464,20 @@ async def test_dual_backend_ttft_records_first_non_empty_content_delta(
     stream_observations = [item for item in report["observations"] if item["mode"] == "stream"]
     assert stream_observations
     assert all(item["time_to_first_token_seconds"] == 0.5 for item in stream_observations)
+
+
+def test_prompt_matching_rejects_normalized_empty_expected_values(tmp_path: Path) -> None:
+    prompts = [
+        {
+            "id": "empty-sentinel",
+            "messages": [{"role": "user", "content": "Reply with anything."}],
+            "expected_any": [" \n "],
+            "max_tokens": 8,
+        }
+    ]
+
+    with pytest.raises(ValueError, match="expected_any must be a non-empty string list"):
+        load_config(_write_config(tmp_path, prompts=prompts))
 
 
 async def test_invalid_usage_fails_run_without_upgrading_evidence(tmp_path: Path) -> None:

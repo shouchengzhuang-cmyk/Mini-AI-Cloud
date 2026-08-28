@@ -350,7 +350,7 @@ async def _read_sse(
             if isinstance(choice, dict):
                 delta = choice.get("delta")
                 if isinstance(delta, dict) and isinstance(delta.get("content"), str):
-                    if ttft is None and delta["content"].strip():
+                    if ttft is None and delta["content"]:
                         ttft = max(0.0, time.monotonic() - started)
                     content_parts.append(delta["content"])
         if isinstance(event.get("usage"), dict):
@@ -520,7 +520,7 @@ def _prompt(value: object) -> PromptCase:
     if (
         not isinstance(expected, list)
         or not expected
-        or not all(isinstance(x, str) and x for x in expected)
+        or not all(isinstance(x, str) and _normalize_response(x) for x in expected)
     ):
         raise ValueError("expected_any must be a non-empty string list")
     return PromptCase(
