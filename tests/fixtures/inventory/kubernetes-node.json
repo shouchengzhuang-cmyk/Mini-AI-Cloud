@@ -9,7 +9,16 @@
       "mind-cluster/npu-chip-memory": "64G"
     }
   },
+  "spec": {
+    "unschedulable": false
+  },
   "status": {
+    "conditions": [
+      {
+        "type": "Ready",
+        "status": "True"
+      }
+    ],
     "allocatable": {
       "cpu": "64",
       "memory": "512Gi",

@@ -476,8 +476,24 @@ def _kubernetes_resource_contract(
 
 def parse_kubernetes_node(node: Mapping[str, object]) -> _ParseResult:
     metadata = node.get("metadata")
+    spec = node.get("spec")
     status = node.get("status")
-    if not isinstance(metadata, Mapping) or not isinstance(status, Mapping):
+    if (
+        not isinstance(metadata, Mapping)
+        or not isinstance(spec, Mapping)
+        or not isinstance(status, Mapping)
+    ):
+        return _ParseResult((), 1)
+    unschedulable = spec.get("unschedulable")
+    if unschedulable is not None and unschedulable is not False:
+        return _ParseResult((), 1)
+    conditions = status.get("conditions")
+    if not isinstance(conditions, list) or not any(
+        isinstance(condition, Mapping)
+        and condition.get("type") == "Ready"
+        and condition.get("status") == "True"
+        for condition in conditions
+    ):
         return _ParseResult((), 1)
     node_uid = str(metadata.get("uid") or "").strip()
     labels = metadata.get("labels")

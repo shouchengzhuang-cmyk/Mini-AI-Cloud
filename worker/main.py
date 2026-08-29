@@ -2,11 +2,13 @@ import asyncio
 import signal
 import time
 import uuid
+from collections.abc import Iterable
 from dataclasses import replace
 from pathlib import Path
 
 from redis.exceptions import RedisError
 
+from core.accelerators import AcceleratorDevice
 from core.artifacts import build_artifact_store
 from core.config import Settings, get_settings
 from core.database import Database
@@ -23,6 +25,8 @@ from worker.docker_runtime import DockerRuntime
 from worker.executor import TaskExecutor
 from worker.fake_runtime import FakeComputeRuntime
 from worker.gpu_inventory import (
+    InventoryProviderResult,
+    InventorySnapshot,
     InventoryStatus,
     NoGPUInventoryProvider,
     bind_kubernetes_runtime_profiles,
@@ -32,6 +36,28 @@ from worker.heartbeat import ActiveExecution, Heartbeat
 from worker.kubernetes_runtime import KubernetesRuntime
 from worker.runtime import ComputeRuntime
 from worker.runtime_registry import RuntimeRegistry
+
+
+def _inventory_payload(devices: Iterable[AcceleratorDevice]) -> list[dict[str, object]]:
+    return [
+        {
+            "uuid": item.uuid,
+            "index": item.index,
+            "vendor": item.vendor.value,
+            "accelerator_kind": item.kind.value,
+            "model": item.model,
+            "memory_total_mb": item.memory_total_mb,
+            "memory_free_mb": item.memory_free_mb,
+            "compute_capability": item.compute_capability,
+            "compute_arch": item.compute_arch,
+            "runtime_profile_ids": list(item.runtime_profile_ids),
+            "capabilities": list(item.capabilities),
+            "kubernetes_resource_name": item.kubernetes_resource_name,
+            "health": item.health,
+            "fake": item.fake,
+        }
+        for item in devices
+    ]
 
 
 class WorkerService:
@@ -59,10 +85,14 @@ class WorkerService:
             if "kubernetes" in runtime_types
             else None
         )
-        inventory_registry = build_accelerator_inventory_registry(
+        self.inventory_registry = build_accelerator_inventory_registry(
             settings, worker_id=self.worker_id
         )
-        inventory_snapshot = inventory_registry.snapshot()
+        self.runtime_profile_catalog = runtime_profile_catalog
+        self.inventory_refresh_enabled = any(
+            provider.name == "kubernetes-node" for provider in self.inventory_registry.providers
+        )
+        inventory_snapshot = self.inventory_registry.snapshot()
         self.inventory_provider_results = inventory_snapshot.provider_results
         self.gpu_devices = (
             bind_kubernetes_runtime_profiles(
@@ -169,6 +199,9 @@ class WorkerService:
             active=self.active,
             settings=self.settings,
             worker_session_id=self.worker_session_id,
+            refresh_inventory=(
+                self._refresh_accelerator_inventory if self.inventory_refresh_enabled else None
+            ),
         )
         heartbeat_task = asyncio.create_task(heartbeat.run(self.heartbeat_stop))
         self.logger.info(
@@ -330,26 +363,60 @@ class WorkerService:
                 session,
                 worker_id=self.worker_id,
                 worker_session_id=worker.worker_session_id,
-                devices=[
-                    {
-                        "uuid": item.uuid,
-                        "index": item.index,
-                        "vendor": item.vendor.value,
-                        "accelerator_kind": item.kind.value,
-                        "model": item.model,
-                        "memory_total_mb": item.memory_total_mb,
-                        "memory_free_mb": item.memory_free_mb,
-                        "compute_capability": item.compute_capability,
-                        "compute_arch": item.compute_arch,
-                        "runtime_profile_ids": list(item.runtime_profile_ids),
-                        "capabilities": list(item.capabilities),
-                        "kubernetes_resource_name": item.kubernetes_resource_name,
-                        "health": item.health,
-                        "fake": item.fake,
-                    }
-                    for item in self.gpu_devices
-                ],
+                devices=_inventory_payload(self.gpu_devices),
             )
+
+    async def _refresh_accelerator_inventory(self) -> None:
+        try:
+            snapshot = await asyncio.to_thread(self.inventory_registry.snapshot)
+            devices = (
+                bind_kubernetes_runtime_profiles(snapshot.devices, self.runtime_profile_catalog)
+                if self.runtime_profile_catalog is not None
+                else snapshot.devices
+            )
+        except Exception as exc:
+            self.logger.exception(
+                "accelerator inventory refresh failed; stale capacity is invalidated",
+                worker_id=self.worker_id,
+                error=str(exc),
+            )
+            snapshot = InventorySnapshot(
+                devices=(),
+                provider_results=(
+                    InventoryProviderResult(
+                        provider="inventory-refresh",
+                        status=InventoryStatus.UNAVAILABLE,
+                        message="refresh_failed",
+                    ),
+                ),
+            )
+            devices = ()
+
+        async with self.database.session() as session, session.begin():
+            await WorkerRepository.replace_gpu_inventory(
+                session,
+                worker_id=self.worker_id,
+                worker_session_id=self.worker_session_id,
+                devices=_inventory_payload(devices),
+            )
+        self.inventory_provider_results = snapshot.provider_results
+        self.gpu_devices = devices
+        self.capabilities = replace(
+            self.capabilities,
+            gpu_count=len(devices),
+            gpu_model=", ".join(dict.fromkeys(item.model for item in devices)) or None,
+            gpu_memory_mb=sum(item.memory_total_mb for item in devices),
+        )
+        for result in snapshot.provider_results:
+            if result.status != InventoryStatus.AVAILABLE:
+                self.logger.warning(
+                    "accelerator inventory refresh degraded",
+                    worker_id=self.worker_id,
+                    provider=result.provider,
+                    status=result.status.value,
+                    rejected_rows=result.rejected_rows,
+                    reason=result.message,
+                )
 
     async def _maybe_reconcile_orphans(self) -> None:
         if self.docker_runtime is None:

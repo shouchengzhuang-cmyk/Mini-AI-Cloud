@@ -1700,6 +1700,47 @@ async def test_ready_logical_model_public_name_routes_to_physical_variant(
     assert route.upstream_model == "physical/nvidia"
 
 
+async def test_logical_model_remains_routable_during_scale_reconciliation(
+    gateway_database: Database,
+) -> None:
+    logical_model_id, nvidia_variant_id, _ascend_variant_id = await _ready_dual_vendor_services(
+        gateway_database,
+        routing_policy=GatewayRoutingPolicy.STRICT_NVIDIA,
+    )
+    async with gateway_database.session() as session, session.begin():
+        service = await session.scalar(
+            select(ModelService).where(
+                ModelService.logical_model_id == logical_model_id,
+                ModelService.model_variant_id == nvidia_variant_id,
+            )
+        )
+        assert service is not None
+        scaled = await ServiceRepository.set_desired_replicas(
+            session,
+            service_id=service.id,
+            project_id=PROJECT_ID,
+            desired_replicas=3,
+            eligible_node_names=["worker-a.test", "worker-b.test"],
+        )
+        assert scaled is not None and scaled.status == ServiceStatus.PENDING
+
+    async with gateway_database.session() as session, session.begin():
+        catalog = await GatewayRoutingRepository.list_available_models(
+            session,
+            project_id=PROJECT_ID,
+        )
+        _anchor, route = await GatewayRoutingRepository.choose_route(
+            session,
+            project_id=PROJECT_ID,
+            public_model="logical-chat",
+        )
+
+    assert [entry.model_id for entry in catalog] == ["logical-chat"]
+    assert route is not None
+    assert route.model_variant_id == nvidia_variant_id
+    assert route.selected_vendor == "nvidia"
+
+
 @pytest.mark.parametrize("public_name", ["Public Logical Chat", "m" * 255])
 async def test_listed_logical_model_id_is_accepted_by_http_gateway(
     gateway_database: Database,

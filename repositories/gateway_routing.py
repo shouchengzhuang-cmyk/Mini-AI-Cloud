@@ -19,7 +19,6 @@ from models.service import (
     ReplicaHealth,
     ReplicaStatus,
     ServiceReplica,
-    ServiceStatus,
 )
 from models.usage import AuditEvent
 from repositories.clock import database_utcnow
@@ -160,7 +159,6 @@ class GatewayRoutingRepository:
                 or logical_model.public_name in ambiguous_names
                 or logical_model.status != ModelAvailabilityStatus.READY
                 or service.desired_replicas <= 0
-                or service.status not in {ServiceStatus.RUNNING, ServiceStatus.DEGRADED}
                 or service.id not in routable_service_ids
             ):
                 continue
@@ -301,7 +299,6 @@ class GatewayRoutingRepository:
                         ModelService.project_id == project_id,
                         ModelService.logical_model_id == anchor.logical_model_id,
                         ModelService.desired_replicas > 0,
-                        ModelService.status.in_({ServiceStatus.RUNNING, ServiceStatus.DEGRADED}),
                     )
                     .order_by(
                         case(

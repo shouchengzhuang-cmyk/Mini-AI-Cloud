@@ -1,10 +1,14 @@
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy import func, select
 
+from core.accelerators import AcceleratorDevice
+from core.config import Settings
 from core.database import Database
 from core.enums import (
     AcceleratorKind,
@@ -13,15 +17,25 @@ from core.enums import (
     RuntimeType,
     TaskStatus,
 )
-from models.scheduling import ReservationGPUDevice, ResourceReservation
+from models.scheduling import GPUDevice, ReservationGPUDevice, ResourceReservation
 from models.task import Task
 from models.usage import TaskExecution
+from models.worker import Worker
 from repositories.diagnostics import DiagnosticsRepository
 from repositories.reservations import (
     AllocationObservationConflict,
     ReservationRepository,
 )
 from repositories.workers import WorkerRepository
+from worker.capabilities import detect_capabilities
+from worker.gpu_inventory import (
+    InventoryProviderResult,
+    InventorySnapshot,
+    InventoryStatus,
+    NoGPUInventoryProvider,
+)
+from worker.heartbeat import Heartbeat
+from worker.main import WorkerService
 
 pytestmark = pytest.mark.integration
 
@@ -236,6 +250,150 @@ async def test_inventory_persists_ascend_profile_and_resource_metadata(
     assert device.runtime_profile_ids == ["ascend-vllm-k8s-a2"]
     assert device.capabilities_json == ["bf16", "tensor-parallel"]
     assert device.kubernetes_resource_name == "huawei.com/Ascend910"
+
+
+async def test_heartbeat_refreshes_dynamic_inventory_after_worker_liveness(
+    database: Database,
+) -> None:
+    worker_session_id = uuid.uuid4()
+    async with database.session() as session, session.begin():
+        await WorkerRepository.register(
+            session,
+            worker_id="heartbeat-inventory-worker",
+            hostname="heartbeat-inventory-worker.test",
+            concurrency=1,
+            cpu_count=4,
+            memory_total_mb=8192,
+            docker_version=None,
+            labels={},
+            gpu_count=0,
+            gpu_model=None,
+            gpu_memory_mb=0,
+            worker_session_id=worker_session_id,
+        )
+    refresh_inventory = AsyncMock()
+    heartbeat = Heartbeat(
+        database,
+        worker_id="heartbeat-inventory-worker",
+        active={},
+        settings=Settings(_env_file=None),
+        worker_session_id=worker_session_id,
+        refresh_inventory=refresh_inventory,
+    )
+
+    await heartbeat.beat_once()
+
+    refresh_inventory.assert_awaited_once_with()
+
+
+async def test_dynamic_inventory_refresh_replaces_changed_capacity_and_invalidates_failures(
+    database: Database,
+) -> None:
+    worker_id = "dynamic-inventory-worker"
+    worker_session_id = uuid.uuid4()
+    initial_devices = tuple(
+        AcceleratorDevice(
+            device_id=f"k8s-capacity:node-1:nvidia.com/gpu:{index}",
+            device_index=index,
+            vendor=AcceleratorVendor.NVIDIA,
+            kind=AcceleratorKind.GPU,
+            model="NVIDIA A100",
+            memory_total_mb=40_960,
+            memory_free_mb=40_960,
+            health="inventory-only",
+            kubernetes_resource_name="nvidia.com/gpu",
+        )
+        for index in range(2)
+    )
+    async with database.session() as session, session.begin():
+        worker = await WorkerRepository.register(
+            session,
+            worker_id=worker_id,
+            hostname="dynamic-inventory-worker.test",
+            concurrency=1,
+            cpu_count=4,
+            memory_total_mb=8192,
+            docker_version=None,
+            labels={},
+            gpu_count=2,
+            gpu_model="NVIDIA A100",
+            gpu_memory_mb=81_920,
+            worker_session_id=worker_session_id,
+        )
+        await WorkerRepository.replace_gpu_inventory(
+            session,
+            worker_id=worker_id,
+            worker_session_id=worker.worker_session_id,
+            devices=[
+                {
+                    "uuid": device.uuid,
+                    "index": device.index,
+                    "vendor": device.vendor.value,
+                    "accelerator_kind": device.kind.value,
+                    "model": device.model,
+                    "memory_total_mb": device.memory_total_mb,
+                    "memory_free_mb": device.memory_free_mb,
+                    "kubernetes_resource_name": device.kubernetes_resource_name,
+                    "health": device.health,
+                }
+                for device in initial_devices
+            ],
+        )
+
+    available = InventoryProviderResult(
+        provider="kubernetes-node",
+        status=InventoryStatus.AVAILABLE,
+        devices=(initial_devices[0],),
+    )
+    service = object.__new__(WorkerService)
+    service.database = database
+    service.worker_id = worker_id
+    service.worker_session_id = worker_session_id
+    service.inventory_registry = Mock()
+    service.inventory_registry.snapshot.side_effect = [
+        InventorySnapshot(devices=(initial_devices[0],), provider_results=(available,)),
+        RuntimeError("kubectl response changed unexpectedly"),
+    ]
+    service.runtime_profile_catalog = None
+    service.inventory_provider_results = (available,)
+    service.gpu_devices = initial_devices
+    service.capabilities = replace(
+        detect_capabilities(NoGPUInventoryProvider()),
+        gpu_count=2,
+        gpu_model="NVIDIA A100",
+        gpu_memory_mb=81_920,
+    )
+    service.logger = Mock()
+
+    await service._refresh_accelerator_inventory()
+
+    async with database.session() as session:
+        persisted_worker = await session.get(Worker, worker_id)
+        devices = list(
+            await session.scalars(
+                select(GPUDevice)
+                .where(GPUDevice.worker_id == worker_id)
+                .order_by(GPUDevice.device_uuid)
+            )
+        )
+    assert persisted_worker is not None and persisted_worker.gpu_count == 1
+    assert [device.health for device in devices] == ["inventory-only", "missing"]
+
+    await service._refresh_accelerator_inventory()
+
+    async with database.session() as session:
+        persisted_worker = await session.get(Worker, worker_id)
+        devices = list(
+            await session.scalars(
+                select(GPUDevice)
+                .where(GPUDevice.worker_id == worker_id)
+                .order_by(GPUDevice.device_uuid)
+            )
+        )
+    assert persisted_worker is not None and persisted_worker.gpu_count == 0
+    assert [device.health for device in devices] == ["missing", "missing"]
+    assert service.gpu_devices == ()
+    assert service.inventory_provider_results[0].status == InventoryStatus.UNAVAILABLE
 
 
 async def test_diagnostics_report_orphan_exact_device_allocation(database: Database) -> None:

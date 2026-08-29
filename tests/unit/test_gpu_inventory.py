@@ -190,6 +190,29 @@ def test_kubernetes_provider_reads_allocatable_labels_and_plugin_resources() -> 
     assert all(device.device_id.startswith("k8s-capacity:node-uid-1:") for device in result.devices)
 
 
+@pytest.mark.parametrize(
+    ("unschedulable", "conditions"),
+    [
+        (True, [{"type": "Ready", "status": "True"}]),
+        (False, [{"type": "Ready", "status": "False"}]),
+        (False, [{"type": "Ready", "status": "Unknown"}]),
+        (False, []),
+    ],
+)
+def test_kubernetes_capacity_rejects_unschedulable_or_unready_nodes(
+    unschedulable: bool,
+    conditions: list[dict[str, str]],
+) -> None:
+    node = json.loads(_fixture("kubernetes-node.json"))
+    node["spec"]["unschedulable"] = unschedulable
+    node["status"]["conditions"] = conditions
+
+    parsed = parse_kubernetes_node(node)
+
+    assert parsed.devices == ()
+    assert parsed.rejected_rows == 1
+
+
 def test_kubernetes_capacity_binds_only_exact_catalog_resource_contracts() -> None:
     node_json = _fixture("kubernetes-node.json")
     provider = KubernetesNodeAcceleratorProvider(
