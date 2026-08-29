@@ -504,6 +504,42 @@ def _kubernetes_resource_contract(
     return None
 
 
+def _parse_kubernetes_node_taints(
+    value: object,
+) -> tuple[tuple[str, str | None, str], ...] | None:
+    if value is None:
+        return ()
+    if not isinstance(value, list) or len(value) > 64:
+        return None
+    taints: list[tuple[str, str | None, str]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            return None
+        key = item.get("key")
+        effect = item.get("effect")
+        raw_value = item.get("value")
+        if (
+            not isinstance(key, str)
+            or not key
+            or key != key.strip()
+            or len(key) > 253
+            or any(character.isspace() or ord(character) < 32 for character in key)
+            or not isinstance(effect, str)
+            or effect not in {"NoSchedule", "PreferNoSchedule", "NoExecute"}
+            or (raw_value is not None and not isinstance(raw_value, str))
+        ):
+            return None
+        taint_value = raw_value if isinstance(raw_value, str) else None
+        if taint_value is not None and (
+            taint_value != taint_value.strip()
+            or len(taint_value) > 63
+            or any(character.isspace() or ord(character) < 32 for character in taint_value)
+        ):
+            return None
+        taints.append((key, taint_value, str(effect)))
+    return tuple(sorted(taints, key=lambda item: (item[0], item[2], item[1] or "")))
+
+
 def parse_kubernetes_node(node: Mapping[str, object]) -> _ParseResult:
     metadata = node.get("metadata")
     spec = node.get("spec")
@@ -513,6 +549,9 @@ def parse_kubernetes_node(node: Mapping[str, object]) -> _ParseResult:
         or not isinstance(spec, Mapping)
         or not isinstance(status, Mapping)
     ):
+        return _ParseResult((), 1)
+    node_taints = _parse_kubernetes_node_taints(spec.get("taints"))
+    if node_taints is None:
         return _ParseResult((), 1)
     unschedulable = spec.get("unschedulable")
     if unschedulable is not None and unschedulable is not False:
@@ -589,6 +628,7 @@ def parse_kubernetes_node(node: Mapping[str, object]) -> _ParseResult:
                     capabilities=("kubernetes-capacity-slot",),
                     kubernetes_resource_name=resource_name,
                     kubernetes_node_labels=node_labels,
+                    kubernetes_node_taints=node_taints,
                 )
             )
             next_index += 1
@@ -625,6 +665,30 @@ def _resource_quantity(resources: Mapping[object, object], resource_name: str) -
     return value
 
 
+def _container_accelerator_requests(container: object) -> dict[str, int]:
+    if not isinstance(container, Mapping):
+        raise ValueError("invalid Kubernetes Pod container")
+    resources = container.get("resources")
+    if resources is None:
+        return {}
+    if not isinstance(resources, Mapping):
+        raise ValueError("invalid Kubernetes Pod resources")
+    raw_requests = resources.get("requests")
+    raw_limits = resources.get("limits")
+    requests = raw_requests if isinstance(raw_requests, Mapping) else {}
+    limits = raw_limits if isinstance(raw_limits, Mapping) else {}
+    resource_names = {
+        name
+        for name in (*requests.keys(), *limits.keys())
+        if isinstance(name, str) and _kubernetes_resource_contract(name) is not None
+    }
+    result: dict[str, int] = {}
+    for resource_name in resource_names:
+        source = requests if resource_name in requests else limits
+        result[resource_name] = _resource_quantity(source, resource_name)
+    return result
+
+
 def _external_pod_accelerator_requests(
     pods: Iterable[Mapping[str, object]],
     *,
@@ -652,32 +716,57 @@ def _external_pod_accelerator_requests(
         ):
             continue
 
-        for containers_key in ("containers", "initContainers"):
-            containers = spec.get(containers_key, [])
-            if not isinstance(containers, list):
-                raise ValueError("invalid Kubernetes Pod container list")
-            for container in containers:
-                if not isinstance(container, Mapping):
-                    raise ValueError("invalid Kubernetes Pod container")
-                resources = container.get("resources")
-                if resources is None:
-                    continue
-                if not isinstance(resources, Mapping):
-                    raise ValueError("invalid Kubernetes Pod resources")
-                raw_requests = resources.get("requests")
-                raw_limits = resources.get("limits")
-                requests = raw_requests if isinstance(raw_requests, Mapping) else {}
-                limits = raw_limits if isinstance(raw_limits, Mapping) else {}
-                resource_names = {
-                    name
-                    for name in (*requests.keys(), *limits.keys())
-                    if isinstance(name, str) and _kubernetes_resource_contract(name) is not None
-                }
-                for resource_name in resource_names:
-                    source = requests if resource_name in requests else limits
-                    requested[resource_name] = requested.get(resource_name, 0) + (
-                        _resource_quantity(source, resource_name)
+        application_requests: dict[str, int] = {}
+        containers = spec.get("containers", [])
+        if not isinstance(containers, list):
+            raise ValueError("invalid Kubernetes Pod container list")
+        for container in containers:
+            for resource_name, quantity in _container_accelerator_requests(container).items():
+                application_requests[resource_name] = (
+                    application_requests.get(resource_name, 0) + quantity
+                )
+
+        restartable_init_requests: dict[str, int] = {}
+        init_stage_requests: dict[str, int] = {}
+        init_containers = spec.get("initContainers", [])
+        if not isinstance(init_containers, list):
+            raise ValueError("invalid Kubernetes Pod init container list")
+        for container in init_containers:
+            container_requests = _container_accelerator_requests(container)
+            restart_policy = (
+                container.get("restartPolicy") if isinstance(container, Mapping) else None
+            )
+            if restart_policy == "Always":
+                for resource_name, quantity in container_requests.items():
+                    restartable_init_requests[resource_name] = (
+                        restartable_init_requests.get(resource_name, 0) + quantity
                     )
+                stage_resources = restartable_init_requests
+            else:
+                stage_resources = {
+                    resource_name: restartable_init_requests.get(resource_name, 0)
+                    + container_requests.get(resource_name, 0)
+                    for resource_name in (
+                        restartable_init_requests.keys() | container_requests.keys()
+                    )
+                }
+            for resource_name, quantity in stage_resources.items():
+                init_stage_requests[resource_name] = max(
+                    init_stage_requests.get(resource_name, 0),
+                    quantity,
+                )
+
+        steady_state_requests = {
+            resource_name: application_requests.get(resource_name, 0)
+            + restartable_init_requests.get(resource_name, 0)
+            for resource_name in (application_requests.keys() | restartable_init_requests.keys())
+        }
+        for resource_name in steady_state_requests.keys() | init_stage_requests.keys():
+            quantity = max(
+                steady_state_requests.get(resource_name, 0),
+                init_stage_requests.get(resource_name, 0),
+            )
+            requested[resource_name] = requested.get(resource_name, 0) + quantity
 
         overhead = spec.get("overhead")
         if overhead is not None:
@@ -1049,9 +1138,9 @@ def bind_kubernetes_runtime_profiles(
     A3 intentionally discovers Device Plugin resources and Node labels without
     importing runtime policy. The worker performs this later join only when it
     owns a validated Runtime Profile catalog and the Node satisfies the exact
-    resource, nodeSelector, and required node-affinity contract. Host CLI
-    inventory without a Device Plugin resource remains unbound and cannot
-    become Kubernetes capacity by inference.
+    resource, nodeSelector, required node-affinity, and blocking-taint
+    toleration contract. Host CLI inventory without a Device Plugin resource
+    remains unbound and cannot become Kubernetes capacity by inference.
     """
 
     contracts: dict[
@@ -1083,7 +1172,11 @@ def bind_kubernetes_runtime_profiles(
             for profile, binding_id in contracts.get(
                 (device.vendor, device.kind, resource_name), []
             )
-            if _kubernetes_node_matches_profile(device.kubernetes_node_labels, profile)
+            if _kubernetes_node_matches_profile(
+                device.kubernetes_node_labels,
+                device.kubernetes_node_taints,
+                profile,
+            )
         ]
         if not matches:
             bound.append(device)
@@ -1100,6 +1193,7 @@ def bind_kubernetes_runtime_profiles(
 
 def _kubernetes_node_matches_profile(
     node_label_items: tuple[tuple[str, str], ...],
+    node_taints: tuple[tuple[str, str | None, str], ...],
     profile: RuntimeProfile,
 ) -> bool:
     node_labels = dict(node_label_items)
@@ -1107,9 +1201,23 @@ def _kubernetes_node_matches_profile(
         node_labels.get(key) != value for key, value in profile.kubernetes.node_selector.items()
     ):
         return False
-    return all(
+    if not all(
         _kubernetes_node_matches_requirement(node_labels, requirement)
         for requirement in profile.kubernetes.node_affinity
+    ):
+        return False
+    return all(
+        effect == "PreferNoSchedule"
+        or any(
+            toleration.key == key
+            and toleration.effect == effect
+            and (
+                toleration.operator == "Exists"
+                or (toleration.operator == "Equal" and toleration.value == value)
+            )
+            for toleration in profile.kubernetes.tolerations
+        )
+        for key, value, effect in node_taints
     )
 
 

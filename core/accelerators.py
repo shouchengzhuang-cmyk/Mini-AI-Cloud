@@ -66,6 +66,7 @@ class AcceleratorDevice:
     device_index: int = 0
     kubernetes_resource_name: str | None = None
     kubernetes_node_labels: tuple[tuple[str, str], ...] = ()
+    kubernetes_node_taints: tuple[tuple[str, str | None, str], ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.vendor, AcceleratorVendor):
@@ -111,18 +112,36 @@ class AcceleratorDevice:
         label_keys = [key for key, _ in self.kubernetes_node_labels]
         if len(label_keys) != len(set(label_keys)):
             raise ValueError("kubernetes_node_labels keys must be unique")
-        for key, value in self.kubernetes_node_labels:
-            _validate_inventory_text("kubernetes_node_label key", key, maximum=253)
-            if any(character.isspace() for character in key):
+        for label_key, label_value in self.kubernetes_node_labels:
+            _validate_inventory_text("kubernetes_node_label key", label_key, maximum=253)
+            if any(character.isspace() for character in label_key):
                 raise ValueError("kubernetes_node_label keys must not contain whitespace")
-            if value != value.strip() or len(value) > 63:
+            if label_value != label_value.strip() or len(label_value) > 63:
                 raise ValueError(
                     "kubernetes_node_label values must be canonical and at most 63 characters"
                 )
-            if any(character.isspace() or ord(character) < 32 for character in value):
+            if any(character.isspace() or ord(character) < 32 for character in label_value):
                 raise ValueError(
                     "kubernetes_node_label values must not contain whitespace or controls"
                 )
+        if len(self.kubernetes_node_taints) > 64:
+            raise ValueError("kubernetes_node_taints must not contain more than 64 values")
+        for taint_key, taint_value, effect in self.kubernetes_node_taints:
+            _validate_inventory_text("kubernetes_node_taint key", taint_key, maximum=253)
+            if any(character.isspace() for character in taint_key):
+                raise ValueError("kubernetes_node_taint keys must not contain whitespace")
+            if taint_value is not None and (
+                taint_value != taint_value.strip()
+                or len(taint_value) > 63
+                or any(character.isspace() or ord(character) < 32 for character in taint_value)
+            ):
+                raise ValueError("kubernetes_node_taint values must be canonical labels or absent")
+            if not isinstance(effect, str) or effect not in {
+                "NoSchedule",
+                "PreferNoSchedule",
+                "NoExecute",
+            }:
+                raise ValueError("kubernetes_node_taint effect is unsupported")
 
     @property
     def uuid(self) -> str:

@@ -409,6 +409,16 @@ def test_kubernetes_capacity_rejects_unschedulable_or_unready_nodes(
     assert parsed.rejected_rows == 1
 
 
+def test_kubernetes_capacity_rejects_malformed_node_taints() -> None:
+    node = json.loads(_fixture("kubernetes-node.json"))
+    node["spec"]["taints"] = [{"key": "dedicated", "effect": "Unexpected"}]
+
+    parsed = parse_kubernetes_node(node)
+
+    assert parsed.devices == ()
+    assert parsed.rejected_rows == 1
+
+
 async def test_kubernetes_capacity_binds_only_schedulable_catalog_contracts() -> None:
     node_reader = AsyncMock(return_value=json.loads(_fixture("kubernetes-node.json")))
     provider = KubernetesNodeAcceleratorProvider(
@@ -483,6 +493,19 @@ async def test_kubernetes_provider_deducts_external_pod_accelerator_requests() -
                             }
                         }
                     ],
+                    "initContainers": [
+                        {
+                            "resources": {
+                                "requests": {"nvidia.com/gpu": "1"},
+                                "limits": {"huawei.com/Ascend910": "2"},
+                            }
+                        },
+                        {
+                            "resources": {
+                                "requests": {"nvidia.com/gpu": "1"},
+                            }
+                        },
+                    ],
                 },
                 "status": {"phase": "Running"},
             },
@@ -537,6 +560,76 @@ async def test_kubernetes_provider_deducts_external_pod_accelerator_requests() -
         in_cluster=False,
         request_timeout=5.0,
     )
+
+
+def test_external_pod_requests_follow_init_sidecar_and_overhead_semantics() -> None:
+    pods = (
+        {
+            "metadata": {"labels": {"app": "external"}},
+            "spec": {
+                "nodeName": "gpu-node-a",
+                "containers": [
+                    {"resources": {"requests": {"nvidia.com/gpu": "1"}}},
+                    {"resources": {"requests": {"nvidia.com/gpu": "1"}}},
+                ],
+                "initContainers": [
+                    {
+                        "restartPolicy": "Always",
+                        "resources": {"requests": {"nvidia.com/gpu": "1"}},
+                    },
+                    {"resources": {"requests": {"nvidia.com/gpu": "2"}}},
+                    {"resources": {"requests": {"nvidia.com/gpu": "1"}}},
+                ],
+                "overhead": {"nvidia.com/gpu": "1"},
+            },
+            "status": {"phase": "Running"},
+        },
+    )
+
+    requested = gpu_inventory._external_pod_accelerator_requests(
+        pods,
+        node_name="gpu-node-a",
+        cluster_id="serving-cluster",
+        worker_id="worker-a",
+    )
+
+    assert requested == {"nvidia.com/gpu": 4}
+
+
+@pytest.mark.parametrize("effect", ["NoSchedule", "NoExecute"])
+def test_kubernetes_profile_binding_rejects_untolerated_blocking_taints(
+    effect: str,
+) -> None:
+    node = json.loads(_fixture("kubernetes-node.json"))
+    node["spec"]["taints"] = [
+        {"key": "nvidia.com/gpu", "effect": "NoSchedule"},
+        {"key": "dedicated", "value": "external", "effect": effect},
+    ]
+    catalog = RuntimeProfileCatalog.from_path(REPOSITORY_ROOT / "runtime_profiles/manifest.json")
+
+    bound = bind_kubernetes_runtime_profiles(parse_kubernetes_node(node).devices, catalog)
+
+    nvidia = [device for device in bound if device.vendor == AcceleratorVendor.NVIDIA]
+    assert nvidia
+    assert {device.runtime_profile_ids for device in nvidia} == {()}
+    assert all(
+        ("dedicated", "external", effect) in device.kubernetes_node_taints for device in nvidia
+    )
+
+
+def test_kubernetes_profile_binding_accepts_declared_and_soft_taints() -> None:
+    node = json.loads(_fixture("kubernetes-node.json"))
+    node["spec"]["taints"] = [
+        {"key": "nvidia.com/gpu", "effect": "NoSchedule"},
+        {"key": "dedicated", "value": "external", "effect": "PreferNoSchedule"},
+    ]
+    catalog = RuntimeProfileCatalog.from_path(REPOSITORY_ROOT / "runtime_profiles/manifest.json")
+
+    bound = bind_kubernetes_runtime_profiles(parse_kubernetes_node(node).devices, catalog)
+
+    nvidia = [device for device in bound if device.vendor == AcceleratorVendor.NVIDIA]
+    assert nvidia
+    assert all(device.runtime_profile_ids for device in nvidia)
 
 
 @pytest.mark.parametrize(

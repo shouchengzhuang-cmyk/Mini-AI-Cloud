@@ -54,10 +54,14 @@ Node allocatable 不提供物理 device ID，因此 provider 生成
 `k8s-capacity:<node-uid>:<resource>:<slot>` 的稳定容量槽 ID，并将 health 标记为
 `inventory-only`。这些 ID 不参与现有 exact-device 调度，也不得写成 execution 的
 observed device IDs；后者仍只能由 Pod/Device Plugin 运行态观测写回。
+绑定 Runtime Profile 前还会检查 Node taints：每个 `NoSchedule`/`NoExecute` taint
+都必须被 profile 的 toleration 精确覆盖；`PreferNoSchedule` 仅作为软约束保留。
 
 Node allocatable 是静态可分配上限，不会随 Pod 绑定自动递减。provider 会同时列出目标
-节点上的非终态 Pod，并扣除外部 Pod 的 accelerator requests（未显式 request 时使用
-对应 limit）。具有匹配 cluster/worker 所有权标签的 Mini AI Cloud Pod 由数据库中的
+节点上的非终态 Pod，并按 Kubernetes scheduler 语义扣除外部 Pod 的 accelerator
+requests：应用容器与 restartable init sidecar 求稳态总和，并与各 init 阶段峰值取较大值，
+最后加 Pod overhead；未显式 request 时使用对应 limit。具有匹配 cluster/worker 所有权
+标签的 Mini AI Cloud Pod 由数据库中的
 service/reservation commitment 统一计费，避免重复扣减。Pod 列表不可读、资源数量畸形
 或请求超过 allocatable 时，provider 会 fail closed，不发布可调度容量。外部占用的容量槽
 保留节点/profile 兼容性元数据，但 health 标记为 `externally-allocated`，不会作为空闲容量
