@@ -1,0 +1,2 @@
+storage:
+  hostPath: /var/lib/mini-ai-cloud

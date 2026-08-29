@@ -1,0 +1,96 @@
+nameOverride: ""
+fullnameOverride: ""
+
+global:
+  # NodePort is rejected unless this flag is explicitly enabled by an isolated test harness.
+  testMode: false
+
+namespaces:
+  # Keep empty to use the namespace passed to Helm with --namespace.
+  system: ""
+  # This pre-existing namespace is the only namespace where managed workloads are allowed.
+  workload: mini-ai-cloud-workloads
+
+image:
+  repository: ghcr.io/shouchengzhuang-cmyk/mini-ai-cloud
+  tag: "0.5.0"
+  # When set, digest takes precedence over tag, for example sha256:<64 lowercase hex chars>.
+  digest: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+existingSecret:
+  # The Chart never creates or owns this Secret.
+  name: mini-ai-cloud
+  keys:
+    databaseUrl: database-url
+    redisUrl: redis-url
+    apiKeyPepper: api-key-pepper
+    workerAuthToken: worker-auth-token
+    secretMasterKey: secret-master-key
+    bootstrapToken: bootstrap-token
+
+config:
+  appEnvironment: production
+  clusterId: mini-ai-cloud-kubernetes
+  servingClusterId: mini-ai-cloud-kubernetes
+  logLevel: INFO
+  bootstrapEnabled: false
+  artifactBackend: local
+  artifactS3Bucket: mini-ai-cloud
+  artifactS3EndpointUrl: ""
+  servingEnabled: false
+  servingFakeEnabled: false
+  servingImage: ""
+
+workload:
+  # Optional identity for application-managed task/serving Pods in the workload namespace.
+  serviceAccountName: ""
+  # Names only; the referenced pull Secrets remain administrator-owned.
+  imagePullSecrets: []
+
+controlPlane:
+  # Only one replica is supported. values.schema.json rejects every other value.
+  replicas: 1
+  terminationGracePeriodSeconds: 30
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+worker:
+  replicas: 1
+  concurrency: 4
+  terminationGracePeriodSeconds: 40
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+service:
+  type: ClusterIP
+  port: 8000
+  # Used only when type=NodePort and global.testMode=true.
+  nodePort: null
+
+storage:
+  # P1 deliberately renders bounded emptyDir volumes, never hostPath or a bundled object store.
+  tmpSizeLimit: 128Mi
+  localDataSizeLimit: 2Gi
+
+migration:
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 600
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi

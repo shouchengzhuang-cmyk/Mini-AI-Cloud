@@ -1,0 +1,6 @@
+global:
+  testMode: false
+
+service:
+  type: NodePort
+  nodePort: 30080

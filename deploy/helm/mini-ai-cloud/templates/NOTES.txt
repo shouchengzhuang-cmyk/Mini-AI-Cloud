@@ -1,0 +1,15 @@
+Mini AI Cloud was installed with release {{ .Release.Name | quote }}.
+
+System namespace:   {{ include "mini-ai-cloud.systemNamespace" . }}
+Workload namespace: {{ include "mini-ai-cloud.workloadNamespace" . }}
+External Secret:    {{ .Values.existingSecret.name }} (not owned by this release)
+
+The Chart does not create namespaces, PostgreSQL, Redis, object storage, Device Plugins,
+schedulers, Ingress resources, or third-party CRDs. Verify the external Secret and both
+external data stores before waiting for the Deployments.
+
+Control plane Service:
+  kubectl --namespace {{ include "mini-ai-cloud.systemNamespace" . }} get service {{ include "mini-ai-cloud.fullname" . }}
+
+Security boundary: the single control-plane Pod contains both the API and Kubernetes
+controller and therefore has namespaced write access in the configured workload namespace.

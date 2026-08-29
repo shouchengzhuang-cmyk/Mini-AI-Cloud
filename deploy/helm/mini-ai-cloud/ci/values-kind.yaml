@@ -1,0 +1,26 @@
+global:
+  testMode: true
+
+namespaces:
+  workload: mini-ai-cloud-workloads
+
+image:
+  repository: mini-ai-cloud
+  tag: kind-m7-p1
+  digest: ""
+  pullPolicy: Never
+
+existingSecret:
+  name: mini-ai-cloud-kind
+
+config:
+  appEnvironment: test
+  clusterId: mini-ai-cloud-kind
+  bootstrapEnabled: false
+  servingEnabled: true
+  servingFakeEnabled: true
+  servingImage: mini-ai-cloud:kind-m7-p1
+
+service:
+  type: NodePort
+  nodePort: 30080

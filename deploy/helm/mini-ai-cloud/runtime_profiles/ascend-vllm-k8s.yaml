@@ -1,0 +1,93 @@
+schema_version: 1.0.0
+id: ascend-vllm-k8s-a2
+version: 2.0.0
+vendor: huawei-ascend
+kind: npu
+execution_mode: kubernetes
+engine: vllm-ascend
+
+image:
+  reference: quay.io/ascend/vllm-ascend@sha256:471744200c5d0c768c1f6c6a6816dcae0fd551de2487d4d129b6fb750024ce6a
+  digest_required: true
+
+kubernetes:
+  runtime_class_name: ascend
+  scheduler_name: volcano
+  resource_name: huawei.com/Ascend910
+  node_selector:
+    accelerator.mini-ai-cloud/vendor: huawei-ascend
+  tolerations:
+    - key: huawei.com/Ascend910
+      operator: Exists
+      effect: NoSchedule
+  device_visibility:
+    environment_name: ASCEND_VISIBLE_DEVICES
+    source: pod-annotation
+    annotation_key: huawei.com/Ascend910
+    scheduling_mode: mindcluster-volcano-full-card
+  requests_equal_limits: true
+  security:
+    privileged: false
+    hostPID: false
+    hostNetwork: false
+    hostPath: []
+    allow_privilege_escalation: false
+
+process:
+  command: [vllm, serve]
+  command_allowlist:
+    - [vllm, serve]
+  env_allowlist:
+    - VLLM_LOGGING_LEVEL
+  api_protocol: openai
+  visible_devices_source: device-plugin
+
+probes:
+  health:
+    path: /health
+    port: 8000
+    initial_delay_seconds: 180
+    period_seconds: 10
+    timeout_seconds: 5
+    failure_threshold: 18
+  readiness:
+    path: /health
+    port: 8000
+    initial_delay_seconds: 180
+    period_seconds: 5
+    timeout_seconds: 3
+    failure_threshold: 36
+
+compatibility:
+  hardware_families:
+    - Atlas A2 (Ascend 910B)
+  python: profile-owned
+  vllm_version: pinned
+  vendor_plugin_version: pinned
+  driver_version: recorded-at-runtime
+  toolkit_version: recorded-at-runtime
+
+capabilities:
+  model_architectures: []
+  dtypes: [bfloat16]
+  features: [streaming]
+  tensor_parallel:
+    supported: true
+    scope: single-node
+    minimum_size: 1
+    maximum_size: null
+    maximum_size_source: runtime-observation
+
+allocation_authority: kubernetes_device_plugin
+evidence_status: REAL_HW_NOT_RUN
+evidence_references:
+  - runtime_profiles/ascend-vllm-k8s.acceptance.json
+  - https://github.com/vllm-project/vllm-ascend/releases/tag/v0.23.0
+  - https://github.com/Ascend/mind-cluster/tree/v26.1.0
+limitations:
+  - No physical Ascend accelerator has run this profile in Mini AI Cloud.
+  - The image manifest and release compatibility matrix were inspected without running image layers.
+  - Atlas A3 uses a different official image and requires a separate immutable profile.
+  - MindCluster v26.1.0, Volcano full-card scheduling, Ascend Device Plugin, and RuntimeClass ascend are prerequisites.
+  - vNPU, static virtual devices, multi-node HCCL, MindIE, training, and arbitrary host mounts are unsupported.
+  - Model architecture, memory fit, driver compatibility, and non-root image execution require hardware validation.

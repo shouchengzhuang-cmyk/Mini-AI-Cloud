@@ -1,0 +1,12 @@
+apiVersion: v2
+name: mini-ai-cloud
+description: Single-cluster Kubernetes installation for the Mini AI Cloud control plane
+type: application
+version: 0.1.0
+appVersion: "0.5.0"
+kubeVersion: ">=1.27.0-0"
+home: https://github.com/shouchengzhuang-cmyk/Mini-AI-Cloud
+sources:
+  - https://github.com/shouchengzhuang-cmyk/Mini-AI-Cloud
+annotations:
+  artifacthub.io/license: MIT

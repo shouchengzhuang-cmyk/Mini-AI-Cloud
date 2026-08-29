@@ -6,6 +6,10 @@ COMPOSE ?= docker compose
 PYTEST ?= $(UV) run pytest
 POWERSHELL ?= pwsh
 KIND ?= kind
+HELM ?= helm
+KUBECTL ?= kubectl
+DOCKER ?= docker
+KIND_HELM_IMAGE ?= mini-ai-cloud:kind-m7-p1
 KIND_CLUSTER_NAME ?= mini-ai-cloud-test
 LOCAL_STACK_PROJECT ?= mini-ai-cloud
 SIMULATION_OUTPUT_DIR ?= build/scheduler-simulation
@@ -19,7 +23,8 @@ DUAL_BACKEND_OUTPUT ?= build/dual-backend-report.json
 	load-test dev observability test-chaos test-k8s kind-up kind-down kind-serving-up \
 	test-kind-serving kind-serving-down demo-fencing demo-adoption demo-sse-drain demo-all \
 	test-nvidia-fake-device-plugin validate-ascend-runtime \
-	test-dr test-soak test-release release-validate benchmark benchmark-dual-backend backup restore
+	test-dr test-soak test-release release-validate benchmark benchmark-dual-backend backup restore \
+	test-helm-render test-kind-helm
 
 help: ## Show available targets.
 	@awk 'BEGIN {FS = ":.*## "; printf "Usage: make <target>\n\n"} \
@@ -121,6 +126,16 @@ test-chaos: ## Run destructive fault injection; requires CONFIRM_CHAOS=YES.
 
 test-k8s: ## Run Kubernetes runtime and GPU inventory unit tests.
 	$(PYTEST) tests/unit/test_kubernetes_runtime.py tests/unit/test_gpu_inventory.py
+
+test-helm-render: ## Lint and validate the production Helm Chart and negative fixtures.
+	$(UV) run python scripts/validate_helm_render.py --helm "$(HELM)"
+
+test-kind-helm: ## Build and run the isolated Helm install/uninstall smoke; requires RUN_ID.
+	@test -n "$(RUN_ID)" || { echo "RUN_ID=<unique-id> is required" >&2; exit 2; }
+	$(DOCKER) build --file docker/Dockerfile --tag $(KIND_HELM_IMAGE) .
+	RUN_ID="$(RUN_ID)" HELM_BIN="$(HELM)" KIND_BIN="$(KIND)" \
+		KUBECTL_BIN="$(KUBECTL)" DOCKER_BIN="$(DOCKER)" \
+		KIND_HELM_IMAGE="$(KIND_HELM_IMAGE)" bash scripts/helm_kind_smoke.sh
 
 kind-up: ## Create the isolated Kind cluster used for local runtime testing.
 	$(KIND) create cluster --name $(KIND_CLUSTER_NAME)
