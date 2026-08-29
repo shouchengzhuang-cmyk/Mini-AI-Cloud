@@ -17,7 +17,7 @@
 
 ## Verified surface
 
-- 当前源码树由 pytest 收集 `930` 个测试；最终 PASS 状态以同一 release SHA 的 `make test-release` 输出和 `build/evidence/<git-sha>/manifest.json` 为准。
+- 当前源码树由 pytest 收集 `935` 个测试；最终 PASS 状态以同一 release SHA 的 `make test-release` 输出和 `build/evidence/<git-sha>/manifest.json` 为准。
 - `make test-release` 串联 lock、Ruff、mypy、evidence schema、Compose config、完整 pytest、wheel 独立安装、非 root container smoke、真实隔离 Kind serving E2E、commit-bound evidence 和 release-preparation bundle。
 - Kind 默认强制刷新远端镜像；显式 `KIND_SERVING_PULL=false` 只允许复用已经存在的固定本地镜像，用于代理抖动后的可审计离线重跑。
 - OpenAPI 与 CLI v1 完整快照、锁定依赖清单、GitHub Action SHA pin、secret pattern scan、CycloneDX SBOM 和容器基线均由 release gate 检查。

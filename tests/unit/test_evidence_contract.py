@@ -71,3 +71,22 @@ def test_missing_stacked_pr_classification_is_rejected() -> None:
 
     with pytest.raises(ContractValidationError, match="missing stacked PR coverage"):
         validate_m6_release_coverage(coverage, REPOSITORY_ROOT)
+
+
+def test_m6_commit_relationships_are_resolved_and_verified() -> None:
+    coverage = load_m6_release_coverage(REPOSITORY_ROOT)
+    coverage.canonical_m6_head = "0" * 40
+
+    with pytest.raises(ContractValidationError, match="canonical M6 head cannot be resolved"):
+        validate_m6_release_coverage(coverage, REPOSITORY_ROOT)
+
+    coverage = load_m6_release_coverage(REPOSITORY_ROOT)
+    semantic_integration = next(
+        item
+        for item in coverage.stacked_pull_requests
+        if item.integration == "semantic-integration"
+    )
+    semantic_integration.integration = "literal-ancestor"
+
+    with pytest.raises(ContractValidationError, match="source head is not an ancestor"):
+        validate_m6_release_coverage(coverage, REPOSITORY_ROOT)

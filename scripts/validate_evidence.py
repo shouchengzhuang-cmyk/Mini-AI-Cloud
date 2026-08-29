@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal
@@ -250,6 +251,42 @@ def validate_m6_release_coverage(
     repository_root: Path,
 ) -> None:
     errors: list[str] = []
+    resolved_commits: set[str] = set()
+    commit_labels = {
+        coverage.main_baseline: "main baseline",
+        coverage.canonical_m6_head: "canonical M6 head",
+        **{
+            pull_request.source_head: f"PR #{pull_request.number} source head"
+            for pull_request in coverage.stacked_pull_requests
+        },
+    }
+    for commit, label in commit_labels.items():
+        if _git_succeeds(repository_root, "cat-file", "-e", f"{commit}^{{commit}}"):
+            resolved_commits.add(commit)
+        else:
+            errors.append(f"{label} cannot be resolved as a commit: {commit}")
+
+    if (
+        coverage.main_baseline in resolved_commits
+        and coverage.canonical_m6_head in resolved_commits
+        and not _git_succeeds(
+            repository_root,
+            "merge-base",
+            "--is-ancestor",
+            coverage.main_baseline,
+            coverage.canonical_m6_head,
+        )
+    ):
+        errors.append("main baseline is not an ancestor of the canonical M6 head")
+    if coverage.canonical_m6_head in resolved_commits and not _git_succeeds(
+        repository_root,
+        "merge-base",
+        "--is-ancestor",
+        coverage.canonical_m6_head,
+        "HEAD",
+    ):
+        errors.append("canonical M6 head is not an ancestor of release HEAD")
+
     area_ids = [area.id for area in coverage.areas]
     if duplicates := _duplicates(area_ids):
         errors.append(f"duplicate M6 coverage area ids: {', '.join(duplicates)}")
@@ -302,9 +339,39 @@ def validate_m6_release_coverage(
         unknown_areas = sorted(set(pull_request.area_ids) - known_areas)
         if unknown_areas:
             errors.append(f"PR #{pull_request.number}: unknown areas: {', '.join(unknown_areas)}")
+        if (
+            pull_request.integration == "literal-ancestor"
+            and pull_request.source_head in resolved_commits
+            and coverage.canonical_m6_head in resolved_commits
+            and not _git_succeeds(
+                repository_root,
+                "merge-base",
+                "--is-ancestor",
+                pull_request.source_head,
+                coverage.canonical_m6_head,
+            )
+        ):
+            errors.append(
+                f"PR #{pull_request.number} source head is not an ancestor of the canonical M6 head"
+            )
 
     if errors:
         raise ContractValidationError("\n".join(errors))
+
+
+def _git_succeeds(repository_root: Path, *arguments: str) -> bool:
+    try:
+        result = subprocess.run(
+            ("git", *arguments),
+            cwd=repository_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
 
 
 def generated_schema() -> dict[str, object]:
