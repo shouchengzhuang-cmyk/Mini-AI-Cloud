@@ -445,6 +445,52 @@ async def test_services_api_deploys_a_registered_model_snapshot_with_explicit_ov
     assert body["max_model_len"] == 16_384
 
 
+async def test_registered_model_gpu_model_override_uses_registry_default_count(
+    services_client: AsyncClient,
+    database: Database,
+) -> None:
+    registered_model_id = await _create_registered_model(database)
+
+    response = await services_client.post(
+        "/api/v1/services",
+        json={
+            "name": "registry-gpu-model-override",
+            "registered_model_id": str(registered_model_id),
+            "gpu_model": "NVIDIA H100",
+            "replicas": 0,
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["gpu_count"] == 4
+    assert body["gpu_memory_mb"] == 40_960
+    assert body["gpu_model"] == "NVIDIA H100"
+
+
+async def test_registered_model_gpu_memory_override_uses_registry_default_count(
+    services_client: AsyncClient,
+    database: Database,
+) -> None:
+    registered_model_id = await _create_registered_model(database)
+
+    response = await services_client.post(
+        "/api/v1/services",
+        json={
+            "name": "registry-gpu-memory-override",
+            "registered_model_id": str(registered_model_id),
+            "gpu_memory_mb": 81_920,
+            "replicas": 0,
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["gpu_count"] == 4
+    assert body["gpu_memory_mb"] == 81_920
+    assert body["gpu_model"] == "NVIDIA A100"
+
+
 async def test_services_api_derives_fake_runtime_from_registered_model(
     services_client: AsyncClient,
     database: Database,
