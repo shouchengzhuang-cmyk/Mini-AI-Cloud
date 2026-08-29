@@ -54,6 +54,10 @@ class TaskService:
         principal: Principal | None = None,
     ) -> CreateResult:
         resolved_principal = principal or _legacy_principal(self.settings)
+        try:
+            payload.require_current_accelerator_execution_support()
+        except ValueError as exc:
+            raise ConflictError("ACCELERATOR_EXECUTION_NOT_READY", str(exc)) from exc
         if resolved_principal.project_id is None:
             raise RuntimeError("task principal has no project")
         if resolved_principal.kind == PrincipalKind.LEGACY and (
@@ -130,6 +134,7 @@ class TaskService:
                     labels=dict(payload.labels),
                     network_enabled=payload.network_enabled,
                     gpu_count=payload.gpu_count,
+                    accelerator_request_json=payload.effective_accelerator.model_dump(mode="json"),
                     idempotency_key=key,
                     request_hash=request_hash if key is not None else None,
                     project_id=resolved_principal.project_id,

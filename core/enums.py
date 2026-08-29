@@ -1,6 +1,43 @@
 from enum import StrEnum
 
 
+class AcceleratorVendor(StrEnum):
+    NVIDIA = "nvidia"
+    HUAWEI_ASCEND = "huawei-ascend"
+
+
+class AcceleratorKind(StrEnum):
+    GPU = "gpu"
+    NPU = "npu"
+
+
+class AcceleratorSelectionPolicy(StrEnum):
+    ANY = "any"
+    NVIDIA_ONLY = "nvidia-only"
+    ASCEND_ONLY = "ascend-only"
+    PREFER_NVIDIA = "prefer-nvidia"
+    PREFER_ASCEND = "prefer-ascend"
+
+
+class GatewayRoutingPolicy(StrEnum):
+    STRICT_NVIDIA = "strict-nvidia"
+    STRICT_ASCEND = "strict-ascend"
+    PREFER_NVIDIA = "prefer-nvidia"
+    PREFER_ASCEND = "prefer-ascend"
+    BALANCED = "balanced"
+
+
+class AllocationAuthority(StrEnum):
+    CONTROL_PLANE_EXACT_DEVICE = "control_plane_exact_device"
+    KUBERNETES_DEVICE_PLUGIN = "kubernetes_device_plugin"
+
+
+class ModelAvailabilityStatus(StrEnum):
+    READY = "ready"
+    DEGRADED = "degraded"
+    DISABLED = "disabled"
+
+
 class TaskStatus(StrEnum):
     PENDING = "pending"
     QUEUED = "queued"

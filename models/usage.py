@@ -33,6 +33,14 @@ class ProjectQuota(Base):
         CheckConstraint("max_cpu_millicores IS NULL OR max_cpu_millicores >= 0", name="quota_cpu"),
         CheckConstraint("max_memory_mb IS NULL OR max_memory_mb >= 0", name="quota_memory"),
         CheckConstraint("max_gpus IS NULL OR max_gpus >= 0", name="quota_gpus"),
+        CheckConstraint(
+            "max_nvidia_gpus IS NULL OR max_nvidia_gpus >= 0",
+            name="quota_nvidia_gpus",
+        ),
+        CheckConstraint(
+            "max_ascend_npus IS NULL OR max_ascend_npus >= 0",
+            name="quota_ascend_npus",
+        ),
         CheckConstraint("max_services IS NULL OR max_services >= 0", name="quota_services"),
         CheckConstraint(
             "max_service_replicas IS NULL OR max_service_replicas >= 0",
@@ -53,6 +61,8 @@ class ProjectQuota(Base):
     max_cpu_millicores: Mapped[int | None] = mapped_column(Integer)
     max_memory_mb: Mapped[int | None] = mapped_column(Integer)
     max_gpus: Mapped[int | None] = mapped_column(Integer)
+    max_nvidia_gpus: Mapped[int | None] = mapped_column(Integer)
+    max_ascend_npus: Mapped[int | None] = mapped_column(Integer, default=0)
     max_services: Mapped[int | None] = mapped_column(Integer)
     max_service_replicas: Mapped[int | None] = mapped_column(Integer)
     max_artifact_bytes: Mapped[int | None] = mapped_column(BigInteger)
@@ -70,11 +80,22 @@ class ProjectQuotaState(Base):
             "queued_tasks >= 0 AND running_tasks >= 0 "
             "AND reserved_cpu_millicores >= 0 AND reserved_memory_mb >= 0 "
             "AND reserved_gpus >= 0 AND service_count >= 0 "
+            "AND reserved_nvidia_gpus >= 0 AND reserved_ascend_npus >= 0 "
             "AND service_replicas >= 0 AND service_reserved_cpu_millicores >= 0 "
             "AND service_reserved_memory_mb >= 0 AND service_reserved_gpus >= 0 "
+            "AND service_reserved_nvidia_gpus >= 0 "
+            "AND service_reserved_ascend_npus >= 0 "
             "AND artifact_bytes >= 0 "
             "AND daily_reserved_cost >= 0 AND daily_settled_cost >= 0",
             name="nonnegative",
+        ),
+        CheckConstraint(
+            "reserved_gpus = reserved_nvidia_gpus + reserved_ascend_npus",
+            name="task_accelerator_totals",
+        ),
+        CheckConstraint(
+            "service_reserved_gpus = service_reserved_nvidia_gpus + service_reserved_ascend_npus",
+            name="service_accelerator_totals",
         ),
     )
 
@@ -86,11 +107,15 @@ class ProjectQuotaState(Base):
     reserved_cpu_millicores: Mapped[int] = mapped_column(Integer, default=0)
     reserved_memory_mb: Mapped[int] = mapped_column(Integer, default=0)
     reserved_gpus: Mapped[int] = mapped_column(Integer, default=0)
+    reserved_nvidia_gpus: Mapped[int] = mapped_column(Integer, default=0)
+    reserved_ascend_npus: Mapped[int] = mapped_column(Integer, default=0)
     service_count: Mapped[int] = mapped_column(Integer, default=0)
     service_replicas: Mapped[int] = mapped_column(Integer, default=0)
     service_reserved_cpu_millicores: Mapped[int] = mapped_column(BigInteger, default=0)
     service_reserved_memory_mb: Mapped[int] = mapped_column(BigInteger, default=0)
     service_reserved_gpus: Mapped[int] = mapped_column(BigInteger, default=0)
+    service_reserved_nvidia_gpus: Mapped[int] = mapped_column(BigInteger, default=0)
+    service_reserved_ascend_npus: Mapped[int] = mapped_column(BigInteger, default=0)
     artifact_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     accounting_date: Mapped[date] = mapped_column(Date, default=date.today)
     daily_reserved_cost: Mapped[Decimal] = mapped_column(Numeric(20, 8), default=Decimal("0"))
@@ -104,8 +129,59 @@ class ProjectQuotaState(Base):
 class TaskExecution(Base):
     __tablename__ = "task_executions"
     __table_args__ = (
+        CheckConstraint(
+            "allocation_authority IN ('control_plane_exact_device','kubernetes_device_plugin')",
+            name="allocation_authority",
+        ),
+        CheckConstraint(
+            "(gpu_count = 0 AND requested_vendor IS NULL AND requested_kind IS NULL "
+            "AND requested_profile_id IS NULL AND requested_profile_version IS NULL "
+            "AND requested_profile_digest IS NULL AND model_variant_id IS NULL) OR "
+            "(gpu_count > 0 AND requested_vendor IS NOT NULL AND requested_kind IS NOT NULL)",
+            name="accelerator_request",
+        ),
+        CheckConstraint(
+            "(requested_profile_id IS NULL AND requested_profile_version IS NULL "
+            "AND requested_profile_digest IS NULL) OR "
+            "(requested_profile_id IS NOT NULL AND requested_profile_version IS NOT NULL "
+            "AND requested_profile_digest IS NOT NULL)",
+            name="requested_profile_snapshot",
+        ),
+        CheckConstraint(
+            "requested_profile_digest IS NULL OR "
+            "(length(requested_profile_digest) = 71 "
+            "AND requested_profile_digest LIKE 'sha256:%')",
+            name="requested_profile_digest",
+        ),
+        CheckConstraint(
+            "model_variant_id IS NULL OR requested_profile_id IS NOT NULL",
+            name="model_variant_profile",
+        ),
+        CheckConstraint(
+            "gpu_count = 0 OR allocation_authority != 'kubernetes_device_plugin' "
+            "OR requested_profile_id IS NOT NULL",
+            name="requested_profile_authority",
+        ),
+        CheckConstraint(
+            "requested_vendor IS NULL OR "
+            "(requested_vendor = 'nvidia' AND requested_kind = 'gpu') OR "
+            "(requested_vendor = 'huawei-ascend' AND requested_kind = 'npu')",
+            name="requested_vendor_kind",
+        ),
+        CheckConstraint(
+            "(observed_at IS NULL AND observed_vendor IS NULL "
+            "AND observed_device_ids_json IS NULL) OR "
+            "(observed_at IS NOT NULL AND observed_vendor IS NOT NULL "
+            "AND observed_device_ids_json IS NOT NULL)",
+            name="observed_allocation",
+        ),
+        CheckConstraint(
+            "observed_vendor IS NULL OR observed_vendor = requested_vendor",
+            name="observed_vendor",
+        ),
         UniqueConstraint("task_id", "attempt", name="uq_task_executions_task_attempt"),
         Index("ix_task_executions_project_started", "project_id", "started_at"),
+        Index("ix_task_executions_variant_status", "model_variant_id", "status"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
@@ -125,6 +201,20 @@ class TaskExecution(Base):
     memory_mb: Mapped[int] = mapped_column(Integer)
     gpu_count: Mapped[int] = mapped_column(Integer)
     gpu_model: Mapped[str | None] = mapped_column(String(255))
+    allocation_authority: Mapped[str] = mapped_column(
+        String(64), default="control_plane_exact_device"
+    )
+    requested_vendor: Mapped[str | None] = mapped_column(String(64))
+    requested_kind: Mapped[str | None] = mapped_column(String(32))
+    requested_profile_id: Mapped[str | None] = mapped_column(String(128))
+    requested_profile_version: Mapped[str | None] = mapped_column(String(32))
+    requested_profile_digest: Mapped[str | None] = mapped_column(String(71))
+    model_variant_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("model_variants.id", ondelete="RESTRICT")
+    )
+    observed_device_ids_json: Mapped[list[str] | None] = mapped_column(JSON(none_as_null=True))
+    observed_vendor: Mapped[str | None] = mapped_column(String(64))
+    observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     cpu_price_per_hour: Mapped[Decimal] = mapped_column(Numeric(20, 8))
     memory_price_per_gb_hour: Mapped[Decimal] = mapped_column(Numeric(20, 8))
     gpu_price_per_hour: Mapped[Decimal] = mapped_column(Numeric(20, 8))
@@ -220,6 +310,9 @@ class ServingRequestUsage(Base):
     # Replica rows are operational and may eventually have a shorter retention
     # period than usage. Preserve the UUID as provenance without a live FK.
     replica_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    logical_model_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    model_variant_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    selected_vendor: Mapped[str | None] = mapped_column(String(64))
     path: Mapped[str] = mapped_column(String(64))
     outcome: Mapped[str] = mapped_column(String(64))
     error_code: Mapped[str | None] = mapped_column(String(64))

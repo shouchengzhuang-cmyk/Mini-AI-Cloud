@@ -1,0 +1,79 @@
+# CI-only Device Plugin registration requires root, privileged mode, and the pinned host
+# paths below. These exceptions do not apply to the allocation or Runtime Profile workloads.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: mini-ai-cloud-sample-device-plugin
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: mini-ai-cloud-sample-device-plugin
+    app.kubernetes.io/part-of: mini-ai-cloud-nvidia-ci
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mini-ai-cloud-sample-device-plugin
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mini-ai-cloud-sample-device-plugin
+      annotations:
+        mini-ai-cloud/test-scope: fake-device-plugin-only
+    spec:
+      automountServiceAccountToken: false
+      priorityClassName: system-node-critical
+      tolerations:
+        - operator: Exists
+          effect: NoExecute
+        - operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: sample-device-plugin
+          image: registry.k8s.io/e2e-test-images/sample-device-plugin@sha256:2227c6949af186356919c2e63c35d68f07f4722d810e55cd97c7850e368d080d
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PLUGIN_SOCK_DIR
+              value: /var/lib/kubelet/device-plugins
+          securityContext:
+            privileged: true
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: device-plugin
+              mountPath: /var/lib/kubelet/device-plugins
+            - name: plugins-registry
+              mountPath: /var/lib/kubelet/plugins_registry
+            - name: dev
+              mountPath: /dev
+            - name: cdi-dir
+              mountPath: /var/run/cdi
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 250m
+              memory: 64Mi
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
+        - name: device-plugin
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+            type: Directory
+        - name: plugins-registry
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: DirectoryOrCreate
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: cdi-dir
+          hostPath:
+            path: /var/run/cdi
+            type: DirectoryOrCreate
+  updateStrategy:
+    type: RollingUpdate

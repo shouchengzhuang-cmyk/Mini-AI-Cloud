@@ -12,12 +12,14 @@ SIMULATION_OUTPUT_DIR ?= build/scheduler-simulation
 BACKUP_OUTPUT_DIR ?= build/backups
 RELEASE_IMAGE ?= mini-ai-cloud:release-gate
 RELEASE_WHEEL_DIR ?= build/release-wheel
+DUAL_BACKEND_OUTPUT ?= build/dual-backend-report.json
 
 .PHONY: help install format lint typecheck validate-evidence evidence test test-unit test-integration test-docker \
 	test-e2e test-serving check config build up down ps logs migrate migrate-local run-api run-worker \
 	load-test dev observability test-chaos test-k8s kind-up kind-down kind-serving-up \
 	test-kind-serving kind-serving-down demo-fencing demo-adoption demo-sse-drain demo-all \
-	test-dr test-soak test-release release-validate benchmark backup restore
+	test-nvidia-fake-device-plugin validate-ascend-runtime \
+	test-dr test-soak test-release release-validate benchmark benchmark-dual-backend backup restore
 
 help: ## Show available targets.
 	@awk 'BEGIN {FS = ":.*## "; printf "Usage: make <target>\n\n"} \
@@ -39,6 +41,9 @@ typecheck: ## Run strict static type checking.
 
 validate-evidence: ## Validate claims, invariants, environments, schema, and matrix.
 	$(UV) run python scripts/validate_evidence.py
+
+validate-ascend-runtime: ## Validate the pinned Ascend A2 runtime contract.
+	$(UV) run python scripts/validate_ascend_runtime.py
 
 evidence: ## Collect a credential-safe evidence bundle bound to the current commit.
 	$(UV) run mini-cloud evidence collect
@@ -129,6 +134,9 @@ kind-serving-up: ## Build and deploy the isolated Phase IV-A Kind serving stack.
 test-kind-serving: ## Run the mandatory real Kubernetes serving E2E against Kind.
 	bash scripts/kind_serving.sh test
 
+test-nvidia-fake-device-plugin: ## Run the fake extended-resource allocation test in Kind.
+	bash scripts/nvidia_fake_device_plugin.sh test
+
 kind-serving-down: ## Delete only the Phase IV-A Kind cluster and local credentials.
 	bash scripts/kind_serving.sh down
 
@@ -153,6 +161,11 @@ benchmark: ## Compare binpack/spread on 100 workers, 4 GPUs each, and 10000 jobs
 		--workers 100 --gpus-per-worker 4 --jobs 10000 \
 		--output-dir $(SIMULATION_OUTPUT_DIR)
 
+benchmark-dual-backend: ## Run the configured NVIDIA + Ascend serving benchmark.
+	@test -n "$(DUAL_BACKEND_CONFIG)" || { echo "DUAL_BACKEND_CONFIG=/path/to/config.json is required" >&2; exit 2; }
+	$(UV) run python -m benchmarks.dual_backend \
+		--config "$(DUAL_BACKEND_CONFIG)" --output "$(DUAL_BACKEND_OUTPUT)"
+
 backup: ## Back up local PostgreSQL plus local/MinIO artifact volumes.
 	bash scripts/backup.sh --local-stack --project-name $(LOCAL_STACK_PROJECT) \
 		--output-dir $(BACKUP_OUTPUT_DIR)
@@ -167,12 +180,12 @@ test-dr: ## Run isolated destructive DR rehearsal; requires CONFIRM_DR=YES.
 	@test "$(CONFIRM_DR)" = "YES" || { echo "CONFIRM_DR=YES is required" >&2; exit 2; }
 	$(UV) run python scripts/dr_rehearsal.py
 
-test-release: release-validate lint typecheck validate-evidence config ## Run the v0.4.0 release gate.
+test-release: release-validate lint typecheck validate-evidence config ## Run the v0.5.0 release gate.
 	$(UV) run pytest
 	$(UV) build --wheel --out-dir $(RELEASE_WHEEL_DIR)
 	$(UV) run python scripts/release_gate.py wheel-smoke --dist-dir $(RELEASE_WHEEL_DIR)
 	docker build --file docker/Dockerfile --tag $(RELEASE_IMAGE) .
-	docker run --rm $(RELEASE_IMAGE) python -c "import importlib.metadata; assert importlib.metadata.version('mini-ai-cloud') == '0.4.0'"
+	docker run --rm $(RELEASE_IMAGE) python -c "import importlib.metadata; assert importlib.metadata.version('mini-ai-cloud') == '0.5.0'"
 	bash -ec 'trap "bash scripts/kind_serving.sh down" EXIT; bash scripts/kind_serving.sh up; bash scripts/kind_serving.sh test'
 	$(UV) run mini-cloud evidence collect
 	$(UV) run python scripts/release_gate.py prepare

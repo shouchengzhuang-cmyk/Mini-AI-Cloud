@@ -93,7 +93,7 @@ def test_scheduler_never_places_beyond_cpu_or_memory_capacity(
         }
 
 
-@given(values=st.lists(st.integers(min_value=-3, max_value=20), min_size=12, max_size=12))
+@given(values=st.lists(st.integers(min_value=-3, max_value=20), min_size=14, max_size=14))
 def test_quota_state_rejects_every_negative_resource_counter(values: list[int]) -> None:
     state = ProjectQuotaState(
         project_id=uuid.uuid4(),
@@ -101,14 +101,18 @@ def test_quota_state_rejects_every_negative_resource_counter(values: list[int]) 
         running_tasks=values[1],
         reserved_cpu_millicores=values[2],
         reserved_memory_mb=values[3],
-        reserved_gpus=values[4],
-        service_count=values[5],
-        service_replicas=values[6],
-        service_reserved_cpu_millicores=values[7],
-        service_reserved_memory_mb=values[8],
-        service_reserved_gpus=values[9],
-        artifact_bytes=values[10],
-        daily_reserved_cost=Decimal(values[11]),
+        reserved_gpus=values[4] + values[5],
+        reserved_nvidia_gpus=values[4],
+        reserved_ascend_npus=values[5],
+        service_count=values[6],
+        service_replicas=values[7],
+        service_reserved_cpu_millicores=values[8],
+        service_reserved_memory_mb=values[9],
+        service_reserved_gpus=values[10] + values[11],
+        service_reserved_nvidia_gpus=values[10],
+        service_reserved_ascend_npus=values[11],
+        artifact_bytes=values[12],
+        daily_reserved_cost=Decimal(values[13]),
         daily_settled_cost=Decimal("0"),
     )
     if any(value < 0 for value in values):

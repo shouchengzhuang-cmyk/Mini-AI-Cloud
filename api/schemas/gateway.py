@@ -10,15 +10,15 @@ class OpenAIProxyRequest(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    model: StrictStr = Field(min_length=1, max_length=128)
+    model: StrictStr = Field(min_length=1, max_length=255)
     stream: StrictBool = False
 
     @field_validator("model")
     @classmethod
     def validate_model(cls, value: str) -> str:
         model = value.strip()
-        if not model or any(character.isspace() for character in model):
-            raise ValueError("model must be a service name without whitespace")
+        if not model or any(ord(character) < 32 for character in model):
+            raise ValueError("model must not be blank or contain control characters")
         return model
 
     def upstream_payload(self, *, upstream_model: str) -> dict[str, Any]:

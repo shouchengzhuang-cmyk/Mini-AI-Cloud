@@ -1,0 +1,23 @@
+{
+  "schema_version": "1.0.0",
+  "evidence_status": "REAL_HW_NOT_RUN",
+  "verified_commit": null,
+  "run_id": null,
+  "started_at": null,
+  "finished_at": null,
+  "environment": {
+    "nvidia": null,
+    "huawei_ascend": null
+  },
+  "results": [],
+  "fallback_drill": {
+    "status": "NOT_RUN",
+    "reason": "No real NVIDIA and Huawei Ascend endpoints were available in this environment."
+  },
+  "limitations": [
+    "No real NVIDIA hardware was exercised.",
+    "No real Huawei Ascend hardware was exercised.",
+    "No throughput, latency, stability, semantic parity, or fallback claim is established."
+  ],
+  "next_command": "uv run python -m benchmarks.dual_backend --config benchmarks/config.example.json --output <evidence-path>"
+}

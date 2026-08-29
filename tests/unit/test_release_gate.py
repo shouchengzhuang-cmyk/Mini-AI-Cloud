@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from scripts.release_gate import (
+    PREVIOUS_RELEASE_TAG,
     RELEASE_VERSION,
     ReleaseGateError,
     _release_notes,
@@ -19,6 +20,11 @@ from scripts.release_gate import (
 )
 
 ROOT = Path(__file__).parents[2]
+
+
+def test_release_version_has_pinned_predecessor() -> None:
+    assert RELEASE_VERSION == "0.5.0"
+    assert PREVIOUS_RELEASE_TAG == "v0.4.0"
 
 
 def test_release_notes_use_pinned_previous_tag(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -39,6 +45,26 @@ def test_release_notes_use_pinned_previous_tag(monkeypatch: pytest.MonkeyPatch) 
 
     assert "- Previous tag: `v0.3.0`" in notes
     assert recorded == [("git", "log", "--format=- `%h` %s", "--no-merges", "v0.3.0..HEAD")]
+
+
+def test_release_notes_keep_dual_vendor_hardware_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "scripts.release_gate._run",
+        lambda _command, _root: type("Result", (), {"stdout": ""})(),
+    )
+
+    notes = _release_notes(
+        ROOT,
+        "a" * 40,
+        {"action_dependencies": 1, "locked_packages": 2, "secret_scanned_files": 3},
+    )
+
+    assert "NVIDIA and Huawei Ascend runtime profiles" in notes
+    assert "Real NVIDIA GPU/vLLM acceptance: **REAL_HW_NOT_RUN**" in notes
+    assert "Real Huawei Ascend/vLLM-Ascend acceptance: **REAL_HW_NOT_RUN**" in notes
+    assert "complete Kubernetes-native platform remain outside" in notes
 
 
 def test_release_identity_actions_dependencies_container_and_contracts_are_locked() -> None:

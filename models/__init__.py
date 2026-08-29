@@ -1,3 +1,4 @@
+from models.admission import AdmissionEvent
 from models.artifact import (
     Artifact,
     Dataset,
@@ -8,6 +9,7 @@ from models.artifact import (
 )
 from models.base import Base
 from models.identity import ApiKey, Project, ProjectMembership, User
+from models.model_variant import LogicalModel, LogicalModelStatusEvent, ModelVariant
 from models.outbox import OutboxEvent
 from models.registry import (
     ImagePolicy,
@@ -17,6 +19,7 @@ from models.registry import (
     SecretVersion,
     TaskSecretBinding,
 )
+from models.routing import VendorCircuitState
 from models.scheduling import (
     GPUDevice,
     PlacementAttempt,
@@ -38,6 +41,7 @@ from models.usage import (
 from models.worker import Worker
 
 __all__ = [
+    "AdmissionEvent",
     "ApiKey",
     "Artifact",
     "AuditEvent",
@@ -49,7 +53,10 @@ __all__ = [
     "ImagePolicy",
     "ImagePolicyRule",
     "JobGroup",
+    "LogicalModel",
+    "LogicalModelStatusEvent",
     "ModelService",
+    "ModelVariant",
     "OutboxEvent",
     "PlacementAttempt",
     "PreemptionPlan",
@@ -73,5 +80,6 @@ __all__ = [
     "TaskSecretBinding",
     "UsageLedger",
     "User",
+    "VendorCircuitState",
     "Worker",
 ]

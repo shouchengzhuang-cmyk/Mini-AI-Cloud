@@ -1,14 +1,24 @@
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.enums import (
+    AcceleratorKind,
+    AcceleratorSelectionPolicy,
+    AcceleratorVendor,
+    RuntimeType,
+)
 from core.logging import get_logger
 from core.metrics import SCHEDULER_ATTEMPTS, SCHEDULING_ATTEMPTS
+from core.runtime_profiles import RuntimeProfileCatalog
+from repositories.admission import AdmissionRepository, BatchAdmissionSnapshot
 from repositories.quotas import QuotaExceededError
 from repositories.scheduling import PlacementConflict, SchedulingRepository
-from scheduler.policies import choose_placement
+from scheduler.admission import AdmissionRequest
+from scheduler.policies import Placement, choose_placement, evaluate_snapshot
 
 SessionFactory = Callable[[], AsyncSession]
 
@@ -41,6 +51,7 @@ class GlobalScheduler:
         preemption_min_delta: int = 10,
         batch_size: int = 16,
         candidate_scan_limit: int = 128,
+        runtime_profile_catalog: RuntimeProfileCatalog | None = None,
     ) -> None:
         if batch_size < 1:
             raise ValueError("batch_size must be at least one")
@@ -58,6 +69,7 @@ class GlobalScheduler:
         self._preemption_min_delta = preemption_min_delta
         self._batch_size = batch_size
         self._candidate_scan_limit = candidate_scan_limit
+        self._runtime_profile_catalog = runtime_profile_catalog
         self._logger = get_logger("global_scheduler")
 
     async def run_once(self) -> GlobalSchedulerResult:
@@ -82,9 +94,54 @@ class GlobalScheduler:
                 task_id = candidate.task.id
                 excluded_task_ids.add(task_id)
                 effective_priority_value = candidate.effective_priority
-                placement, rejected = choose_placement(
-                    candidate.snapshot, workers, policy=self._policy
-                )
+                admission: BatchAdmissionSnapshot | None = None
+                rejected: Mapping[str, object]
+                if (
+                    candidate.task.runtime_type == RuntimeType.KUBERNETES
+                    and candidate.task.gpu_count > 0
+                ):
+                    if self._runtime_profile_catalog is None:
+                        placement = None
+                        rejected = {"runtime-profile-catalog": "runtime_profile_unavailable"}
+                    else:
+                        cpu_only = dataclass_replace(
+                            candidate.snapshot,
+                            gpu_count=0,
+                            gpu_memory_mb=0,
+                            gpu_model=None,
+                        )
+                        allowed_worker_ids = frozenset(
+                            worker.id
+                            for worker in workers
+                            if evaluate_snapshot(worker, cpu_only)[0] is None
+                        )
+                        result = await AdmissionRepository.admit_batch_task(
+                            session,
+                            catalog=self._runtime_profile_catalog,
+                            task=candidate.task,
+                            request=_task_admission_request(candidate.task),
+                            allowed_worker_ids=allowed_worker_ids,
+                        )
+                        admission = result.snapshot
+                        placement = (
+                            Placement(
+                                worker_id=admission.worker_id,
+                                gpu_device_ids=(),
+                                score=(),
+                            )
+                            if admission is not None
+                            else None
+                        )
+                        rejected = {
+                            str(item.get("candidate_id", "vendor-admission")): item.get(
+                                "reason", result.reason.value if result.reason else "rejected"
+                            )
+                            for item in result.summary
+                        }
+                else:
+                    placement, rejected = choose_placement(
+                        candidate.snapshot, workers, policy=self._policy
+                    )
                 if placement is None:
                     reason = _admission_reason(rejected)
                     worker_id: str | None = None
@@ -136,6 +193,8 @@ class GlobalScheduler:
                             cpu_price_per_hour=self._cpu_price_per_hour,
                             memory_price_per_gb_hour=self._memory_price_per_gb_hour,
                             gpu_price_per_hour=self._gpu_price_per_hour,
+                            admission=admission,
+                            runtime_profile_catalog=self._runtime_profile_catalog,
                         )
                 except QuotaExceededError as exc:
                     reason = "project_quota_exceeded"
@@ -226,6 +285,25 @@ def _admission_reason(rejected: Mapping[str, object]) -> str:
         reason = str(value)
         counts[reason] = counts.get(reason, 0) + 1
     return max(counts, key=lambda item: (counts[item], item))
+
+
+def _task_admission_request(task: object) -> AdmissionRequest:
+    raw = getattr(task, "accelerator_request_json", None)
+    if not isinstance(raw, dict):
+        raise ValueError("Kubernetes accelerator task has no normalized request")
+    return AdmissionRequest(
+        count=int(raw["count"]),
+        allowed_vendors=frozenset(
+            AcceleratorVendor(value) for value in raw.get("allowed_vendors", [])
+        ),
+        allowed_kinds=frozenset(AcceleratorKind(value) for value in raw.get("allowed_kinds", [])),
+        allowed_models=frozenset(str(value) for value in raw.get("allowed_models", [])),
+        required_capabilities=frozenset(
+            str(value) for value in raw.get("required_capabilities", [])
+        ),
+        runtime_profile_id=raw.get("runtime_profile"),
+        selection_policy=AcceleratorSelectionPolicy(raw.get("selection_policy", "any")),
+    )
 
 
 def _record_scheduler_metric(outcome: str, reason: str | None) -> None:

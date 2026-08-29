@@ -21,6 +21,7 @@ def test_openapi_generation_covers_phase_i_and_phase_ii_resources() -> None:
         "/api/v1/projects/{project_id}/quota",
         "/api/v1/projects/{project_id}/secrets",
         "/api/v1/projects/{project_id}/datasets",
+        "/api/v1/projects/{project_id}/logical-models",
         "/api/v1/artifacts",
         "/api/v1/services",
         "/api/v1/projects/{project_id}/job-groups",
@@ -42,15 +43,26 @@ def test_openapi_generation_covers_phase_i_and_phase_ii_resources() -> None:
 
     schemas = schema["components"]["schemas"]
     assert {
+        "AcceleratorRequest",
         "TaskCreate",
         "RetryPolicy",
         "TaskInputArtifact",
         "TaskOutputArtifact",
         "ArtifactCreate",
         "DatasetCreate",
+        "LogicalModelCreate",
+        "ModelVariantCreate",
         "ServiceCreate",
         "BootstrapRequest",
     } <= schemas.keys()
+    task_properties = schemas["TaskCreate"]["properties"]
+    service_properties = schemas["ServiceCreate"]["properties"]
+    assert task_properties["accelerator"]["anyOf"][0]["$ref"].endswith("/AcceleratorRequest")
+    assert service_properties["accelerator"]["anyOf"][0]["$ref"].endswith("/AcceleratorRequest")
+    for properties in (task_properties, service_properties):
+        assert properties["gpu_count"]["deprecated"] is True
+        assert properties["gpu_memory_mb"]["deprecated"] is True
+        assert properties["gpu_model"]["deprecated"] is True
 
 
 def test_package_name_and_version_match_runtime_identity() -> None:
@@ -58,4 +70,4 @@ def test_package_name_and_version_match_runtime_identity() -> None:
     metadata = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]
 
     assert metadata["name"] == PROJECT_NAME == "mini-ai-cloud"
-    assert metadata["version"] == PROJECT_VERSION == DEVELOPMENT_VERSION == "0.4.0"
+    assert metadata["version"] == PROJECT_VERSION == DEVELOPMENT_VERSION == "0.5.0"

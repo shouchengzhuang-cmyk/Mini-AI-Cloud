@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
@@ -17,13 +18,23 @@ from api.services.kubernetes_replica_runtime import (
     KubernetesReplicaRuntimeController,
     StaleKubernetesServingController,
     _as_utc,
+    _claim_from_models,
     _pod_metric_state,
 )
 from core.database import Database
-from core.enums import RuntimeType
+from core.enums import (
+    AcceleratorKind,
+    AcceleratorSelectionPolicy,
+    AcceleratorVendor,
+    AllocationAuthority,
+    ModelAvailabilityStatus,
+    RuntimeType,
+)
 from core.metrics import K8S_SERVING_LAUNCH_FAILURES, K8S_SERVING_REPLACEMENTS
+from core.runtime_profiles import RuntimeProfileCatalog, RuntimeProfileCompatibilityError
 from models.base import Base
 from models.identity import Project, User
+from models.model_variant import LogicalModel, ModelVariant
 from models.outbox import OutboxEvent
 from models.registry import RegisteredModel
 from models.scheduling import GPUDevice as PersistedGPUDevice
@@ -36,6 +47,7 @@ from models.service import (
 )
 from models.usage import ProjectQuota, ProjectQuotaState
 from models.worker import Worker
+from repositories.admission import _active_service_accelerators
 from repositories.services import ServiceRepository
 from repositories.workers import WorkerRepository
 from worker.kubernetes_serving_runtime import (
@@ -52,12 +64,14 @@ from worker.kubernetes_serving_runtime import (
     WORKER_SESSION_ID_LABEL,
     KubernetesServingHandle,
     KubernetesServingLaunchSpec,
+    KubernetesServingOwnershipError,
     KubernetesServingOwnershipIdentity,
     KubernetesServingRecoveryConflict,
     KubernetesServingState,
 )
 
 PROJECT_ID = uuid.UUID("d1000000-0000-0000-0000-000000000001")
+REPOSITORY_ROOT = Path(__file__).parents[2]
 pytestmark = pytest.mark.integration
 
 
@@ -85,6 +99,8 @@ async def kubernetes_controller_database(tmp_path: Path) -> AsyncIterator[Databa
                 cast(Table, Worker.__table__),
                 cast(Table, PersistedGPUDevice.__table__),
                 cast(Table, RegisteredModel.__table__),
+                cast(Table, LogicalModel.__table__),
+                cast(Table, ModelVariant.__table__),
                 cast(Table, ModelService.__table__),
                 cast(Table, ServiceReplica.__table__),
                 cast(Table, OutboxEvent.__table__),
@@ -151,13 +167,18 @@ class _Runtime:
             uid=f"uid-{object_id}",
             service_name=f"service-{object_id}",
             service_uid=f"service-uid-{object_id}",
+            node_name=(spec.eligible_node_names[0] if spec.eligible_node_names else None),
         )
         self.handles[object_id] = handle
         self.states[object_id] = _state(phase="Pending")
         return handle
 
     async def start(self, handle: KubernetesServingHandle) -> KubernetesServingHandle:
-        self.states[handle.object_id] = _state(phase="Running", running=True)
+        self.states[handle.object_id] = _state(
+            phase="Running",
+            running=True,
+            node_name=handle.node_name,
+        )
         return handle
 
     async def inspect(self, handle: KubernetesServingHandle) -> KubernetesServingState:
@@ -205,6 +226,7 @@ def _state(
     reason: str | None = None,
     endpoint_url: str | None = None,
     image_digest: str | None = None,
+    node_name: str | None = None,
 ) -> KubernetesServingState:
     return KubernetesServingState(
         phase=phase,
@@ -218,6 +240,7 @@ def _state(
         message=None,
         endpoint_url=endpoint_url,
         image_digest=image_digest,
+        node_name=node_name,
     )
 
 
@@ -283,9 +306,254 @@ async def _create_service(
         return service.id
 
 
+async def _create_profile_service(
+    database: Database,
+    *,
+    desired_replicas: int = 1,
+) -> tuple[uuid.UUID, RuntimeProfileCatalog]:
+    catalog = RuntimeProfileCatalog.from_path(REPOSITORY_ROOT / "runtime_profiles/manifest.json")
+    entry = next(
+        item for item in catalog.manifest.profiles if item.identity == "nvidia-vllm-k8s@2.0.0"
+    )
+    profile = catalog.load_exact(
+        profile_id=entry.profile_id,
+        profile_version=entry.profile_version,
+        semantic_digest=entry.semantic_digest,
+    )
+    logical_model_id = uuid.uuid4()
+    variant_id = uuid.uuid4()
+    async with database.session() as session, session.begin():
+        session.add(
+            LogicalModel(
+                id=logical_model_id,
+                project_id=PROJECT_ID,
+                name=f"controller-logical-{uuid.uuid4().hex[:8]}",
+                public_name=f"controller-public-{uuid.uuid4().hex[:8]}",
+                status=ModelAvailabilityStatus.READY,
+            )
+        )
+        session.add(
+            ModelVariant(
+                id=variant_id,
+                logical_model_id=logical_model_id,
+                name="controller-nvidia-a100",
+                vendor=AcceleratorVendor.NVIDIA,
+                kind=AcceleratorKind.GPU,
+                runtime_profile_id=profile.id,
+                runtime_profile_version=profile.version,
+                runtime_profile_digest=profile.semantic_digest(),
+                artifact_source="org/controller-model",
+                artifact_revision="revision-1",
+                artifact_digest="sha256:" + "b" * 64,
+                architecture="test-architecture",
+                dtype="float16",
+                status=ModelAvailabilityStatus.READY,
+            )
+        )
+        await session.flush()
+        service = await ServiceRepository.create(
+            session,
+            project_id=PROJECT_ID,
+            name=f"k8s-profile-{uuid.uuid4().hex[:8]}",
+            model="org/controller-model",
+            runtime=ServingRuntime.VLLM,
+            runtime_type=RuntimeType.KUBERNETES,
+            image=profile.image.reference,
+            cpu_millicores=1_000,
+            memory_mb=4_096,
+            gpu_count=2,
+            gpu_memory_mb=40_960,
+            tensor_parallel_size=2,
+            dtype="float16",
+            desired_replicas=desired_replicas,
+            logical_model_id=logical_model_id,
+            model_variant_id=variant_id,
+            selected_vendor=AcceleratorVendor.NVIDIA,
+            selected_kind=AcceleratorKind.GPU.value,
+            selected_model="NVIDIA A100",
+            runtime_profile_id=profile.id,
+            runtime_profile_version=profile.version,
+            runtime_profile_digest=profile.semantic_digest(),
+            allocation_authority=AllocationAuthority.KUBERNETES_DEVICE_PLUGIN.value,
+            accelerator_resource_name=profile.kubernetes.resource_name,
+            selection_policy=AcceleratorSelectionPolicy.NVIDIA_ONLY.value,
+            eligible_node_names=("gpu-node-a", "gpu-node-b"),
+        )
+        await ServiceRepository.reconcile_locked(session, service)
+        return service.id, catalog
+
+
 async def _replicas(database: Database, service_id: uuid.UUID) -> list[ServiceReplica]:
     async with database.session() as session:
         return await ServiceRepository.list_replicas(session, service_id)
+
+
+def _profile_backed_models() -> tuple[ModelService, ServiceReplica, RuntimeProfileCatalog]:
+    catalog = RuntimeProfileCatalog.from_path(REPOSITORY_ROOT / "runtime_profiles/manifest.json")
+    entry = next(
+        item for item in catalog.manifest.profiles if item.identity == "nvidia-vllm-k8s@2.0.0"
+    )
+    profile = catalog.load_exact(
+        profile_id=entry.profile_id,
+        profile_version=entry.profile_version,
+        semantic_digest=entry.semantic_digest,
+    )
+    service_id = uuid.uuid4()
+    service = ModelService(
+        id=service_id,
+        project_id=PROJECT_ID,
+        name="profile-backed-service",
+        model="org/model",
+        runtime=ServingRuntime.VLLM,
+        runtime_type=RuntimeType.KUBERNETES,
+        image="service-image-is-not-authoritative",
+        cpu_millicores=1_000,
+        memory_mb=4_096,
+        gpu_count=0,
+        tensor_parallel_size=2,
+        desired_replicas=1,
+        generation=1,
+        # These mutable service fields deliberately disagree with the replica.
+        selected_vendor="huawei-ascend",
+        selected_kind="npu",
+        runtime_profile_id="service-profile-must-not-be-used",
+        runtime_profile_version="1.0.0",
+        runtime_profile_digest="sha256:" + "0" * 64,
+        allocation_authority=AllocationAuthority.CONTROL_PLANE_EXACT_DEVICE.value,
+    )
+    replica = ServiceReplica(
+        id=uuid.uuid4(),
+        service_id=service_id,
+        runtime=ServingRuntime.VLLM,
+        generation=1,
+        ordinal=0,
+        status=ReplicaStatus.STARTING,
+        execution_id=uuid.uuid4(),
+        model_variant_id=uuid.uuid4(),
+        selected_vendor=profile.vendor.value,
+        selected_kind=profile.kind.value,
+        selected_model="NVIDIA A100",
+        runtime_profile_id=profile.id,
+        runtime_profile_version=profile.version,
+        runtime_profile_digest=profile.semantic_digest(),
+        allocation_authority=AllocationAuthority.KUBERNETES_DEVICE_PLUGIN.value,
+        accelerator_resource_name=profile.kubernetes.resource_name,
+        selection_policy=AcceleratorSelectionPolicy.NVIDIA_ONLY.value,
+        eligible_node_names=["gpu-node-a", "gpu-node-b"],
+        started_at=datetime.now(UTC),
+    )
+    return service, replica, catalog
+
+
+def test_profile_backed_claim_uses_only_the_replica_admission_snapshot() -> None:
+    service, replica, catalog = _profile_backed_models()
+
+    claim = _claim_from_models(replica, service, None, catalog)
+
+    assert claim is not None
+    assert claim.runtime_profile is not None
+    assert claim.runtime_profile.id == replica.runtime_profile_id
+    assert claim.runtime_profile.semantic_digest() == replica.runtime_profile_digest
+    assert claim.image == claim.runtime_profile.image.reference
+    assert claim.accelerator_count == 2
+    assert claim.tensor_parallel_size == 2
+    assert claim.eligible_node_names == ("gpu-node-a", "gpu-node-b")
+    assert not hasattr(claim, "concrete_device_ids")
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("runtime_profile_version", None, "incomplete replica accelerator snapshot"),
+        (
+            "allocation_authority",
+            AllocationAuthority.CONTROL_PLANE_EXACT_DEVICE.value,
+            "requires kubernetes_device_plugin authority",
+        ),
+        ("runtime_profile_digest", "sha256:" + "0" * 64, "immutable manifest"),
+        ("accelerator_resource_name", "nvidia.com/mig", "resource does not match"),
+        ("eligible_node_names", [], "eligible-node snapshot is empty"),
+    ],
+)
+def test_profile_backed_claim_fails_closed_on_snapshot_drift(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    service, replica, catalog = _profile_backed_models()
+    setattr(replica, field, value)
+
+    with pytest.raises(RuntimeProfileCompatibilityError, match=message):
+        _claim_from_models(replica, service, None, catalog)
+
+
+def test_fake_cpu_claim_remains_profile_free() -> None:
+    service_id = uuid.uuid4()
+    service = ModelService(
+        id=service_id,
+        project_id=PROJECT_ID,
+        name="fake-cpu-service",
+        model="fake-model",
+        runtime=ServingRuntime.FAKE,
+        runtime_type=RuntimeType.KUBERNETES,
+        image="mini-ai-cloud:kind-serving",
+        cpu_millicores=250,
+        memory_mb=128,
+        gpu_count=0,
+        tensor_parallel_size=1,
+        desired_replicas=1,
+        generation=1,
+    )
+    replica = ServiceReplica(
+        id=uuid.uuid4(),
+        service_id=service_id,
+        runtime=ServingRuntime.FAKE,
+        generation=1,
+        ordinal=0,
+        status=ReplicaStatus.STARTING,
+        execution_id=uuid.uuid4(),
+        started_at=datetime.now(UTC),
+    )
+
+    claim = _claim_from_models(replica, service, None, None)
+
+    assert claim is not None
+    assert claim.runtime_profile is None
+    assert claim.accelerator_count == 0
+    assert claim.tensor_parallel_size == 1
+
+
+async def test_legacy_pending_replica_fails_without_blocking_valid_sibling(
+    kubernetes_controller_database: Database,
+) -> None:
+    service_id, catalog = await _create_profile_service(
+        kubernetes_controller_database,
+        desired_replicas=2,
+    )
+    async with kubernetes_controller_database.session() as session, session.begin():
+        replicas = await ServiceRepository.list_replicas(
+            session,
+            service_id,
+            for_update=True,
+        )
+        replicas[0].eligible_node_names = []
+
+    runtime = _Runtime()
+    controller = _controller(
+        kubernetes_controller_database,
+        runtime,
+        runtime_profile_catalog=catalog,
+    )
+    await controller.startup()
+    result = await controller.run_once()
+
+    replicas = await _replicas(kubernetes_controller_database, service_id)
+    assert result.claimed == 1
+    assert replicas[0].status == ReplicaStatus.FAILED
+    assert replicas[0].error_code == "KUBERNETES_RUNTIME_PROFILE_INVALID"
+    assert replicas[1].status == ReplicaStatus.LOADING
+    assert replicas[1].assigned_node_name == "gpu-node-a"
+    await controller.close()
 
 
 def test_claim_query_is_exact_and_skip_locked() -> None:
@@ -300,7 +568,7 @@ def test_claim_query_is_exact_and_skip_locked() -> None:
     assert "model_services.runtime_type" in compiled
 
 
-def test_controller_rejects_unsafe_fake_modes() -> None:
+def test_controller_rejects_unsafe_fake_mode_but_allows_profile_only_mode() -> None:
     database = cast(Database, object())
     runtime = cast(_Runtime, object())
     with pytest.raises(ValueError, match="outside development and test"):
@@ -312,15 +580,16 @@ def test_controller_rejects_unsafe_fake_modes() -> None:
             image="mini-ai-cloud:test",
             fake_enabled=True,
         )
-    with pytest.raises(ValueError, match="explicit opt-in"):
-        KubernetesReplicaRuntimeController(
-            database,
-            runtime,
-            app_env="test",
-            cluster_id="kind-serving",
-            image="mini-ai-cloud:test",
-            fake_enabled=False,
-        )
+    controller = KubernetesReplicaRuntimeController(
+        database,
+        runtime,
+        app_env="production",
+        cluster_id="kind-serving",
+        image=None,
+        fake_enabled=False,
+    )
+
+    assert controller.fake_enabled is False
 
 
 def test_default_worker_id_is_stable_kubernetes_label_value() -> None:
@@ -699,6 +968,387 @@ async def test_startup_adopts_existing_execution_and_close_preserves_it(
     assert runtime.force_cleaned == []
 
 
+async def test_recovery_isolates_legacy_replica_and_adopts_valid_sibling(
+    kubernetes_controller_database: Database,
+) -> None:
+    service_id, catalog = await _create_profile_service(
+        kubernetes_controller_database,
+        desired_replicas=2,
+    )
+    runtime = _Runtime()
+    first = _controller(
+        kubernetes_controller_database,
+        runtime,
+        runtime_profile_catalog=catalog,
+    )
+    await first.startup()
+    launched = await first.run_once()
+    assert launched.claimed == 2
+    replicas = await _replicas(kubernetes_controller_database, service_id)
+    legacy_id = replicas[0].id
+    valid_id = replicas[1].id
+    legacy_handle_id = next(
+        object_id
+        for object_id, handle in runtime.handles.items()
+        if handle.labels[REPLICA_ID_LABEL] == str(legacy_id)
+    )
+    await first.close()
+
+    async with kubernetes_controller_database.session() as session, session.begin():
+        legacy = await session.get(ServiceReplica, legacy_id, with_for_update=True)
+        assert legacy is not None
+        legacy.eligible_node_names = []
+
+    runtime.closed = False
+    replacement = _controller(
+        kubernetes_controller_database,
+        runtime,
+        worker_id=first.worker_id,
+        runtime_profile_catalog=catalog,
+    )
+    startup = await replacement.startup()
+
+    replicas = await _replicas(kubernetes_controller_database, service_id)
+    by_id = {replica.id: replica for replica in replicas}
+    assert startup.recovered == 1
+    assert startup.orphans_cleaned == 1
+    assert by_id[legacy_id].status == ReplicaStatus.FAILED
+    assert by_id[legacy_id].health == ReplicaHealth.UNHEALTHY
+    assert by_id[legacy_id].endpoint_url is None
+    assert by_id[valid_id].status == ReplicaStatus.LOADING
+    assert legacy_handle_id in runtime.force_cleaned
+    await replacement.close()
+
+
+async def test_recovery_rejects_active_pre_0016_placement_without_full_snapshot(
+    kubernetes_controller_database: Database,
+) -> None:
+    service_id, catalog = await _create_profile_service(
+        kubernetes_controller_database,
+        desired_replicas=2,
+    )
+    runtime = _Runtime()
+    first = _controller(
+        kubernetes_controller_database,
+        runtime,
+        runtime_profile_catalog=catalog,
+    )
+    await first.startup()
+    launched = await first.run_once()
+    assert launched.claimed == 2
+    await first.close()
+
+    async with kubernetes_controller_database.session() as session, session.begin():
+        service = await session.get(ModelService, service_id, with_for_update=True)
+        assert service is not None
+        service.eligible_node_names = []
+        replicas = await ServiceRepository.list_replicas(
+            session,
+            service_id,
+            for_update=True,
+        )
+        for replica in replicas:
+            replica.eligible_node_names = []
+            replica.assigned_node_name = None
+
+    runtime.closed = False
+    replacement = _controller(
+        kubernetes_controller_database,
+        runtime,
+        worker_id=first.worker_id,
+        runtime_profile_catalog=catalog,
+    )
+    startup = await replacement.startup()
+
+    async with kubernetes_controller_database.session() as session:
+        service = await session.get(ModelService, service_id)
+        assert service is not None
+        replicas = await ServiceRepository.list_replicas(session, service_id)
+    assert startup.recovered == 0
+    assert startup.orphans_cleaned == 2
+    assert service.eligible_node_names == []
+    assert all(replica.eligible_node_names == [] for replica in replicas)
+    assert all(replica.assigned_node_name is None for replica in replicas)
+    assert all(replica.status == ReplicaStatus.FAILED for replica in replicas)
+    assert len(runtime.force_cleaned) == 2
+    await replacement.close()
+
+
+async def test_contract_drift_cleanup_refusal_quarantines_without_releasing_capacity(
+    kubernetes_controller_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service_id, catalog = await _create_profile_service(kubernetes_controller_database)
+    runtime = _Runtime()
+    controller = _controller(
+        kubernetes_controller_database,
+        runtime,
+        runtime_profile_catalog=catalog,
+    )
+    await controller.startup()
+    await controller.run_once()
+    handle = next(iter(runtime.handles.values()))
+    runtime.states[handle.object_id] = _state(
+        phase="Running",
+        running=True,
+        ready=True,
+        endpoint_url=handle.endpoint_url,
+        node_name=handle.node_name,
+    )
+    await controller.run_once()
+    before = (await _replicas(kubernetes_controller_database, service_id))[0]
+    assert before.lease_expires_at is not None
+
+    async def reject_drifted_inspect(
+        _handle: KubernetesServingHandle,
+    ) -> KubernetesServingState:
+        raise KubernetesServingOwnershipError("immutable Pod contract drift")
+
+    async def reject_drifted_cleanup(_handle: KubernetesServingHandle) -> None:
+        raise KubernetesServingOwnershipError("cleanup contract fence mismatch")
+
+    monkeypatch.setattr(runtime, "inspect", reject_drifted_inspect)
+    monkeypatch.setattr(runtime, "force_cleanup", reject_drifted_cleanup)
+    await controller.run_once()
+
+    quarantined = (await _replicas(kubernetes_controller_database, service_id))[0]
+    assert quarantined.status == ReplicaStatus.RUNNING
+    assert quarantined.health == ReplicaHealth.UNHEALTHY
+    assert quarantined.endpoint_url is None
+    assert quarantined.lease_expires_at is None
+    assert controller._handles[quarantined.id].quarantined is True
+    async with kubernetes_controller_database.session() as session:
+        usage = await _active_service_accelerators(session)
+    assert len(usage.commitments) == 1
+    assert usage.commitments[0].assigned_node_name == handle.node_name
+    async with kubernetes_controller_database.session() as session, session.begin():
+        recovery = await ServiceRepository.recover_expired_leases(session, limit=10)
+    assert recovery.replicas_lost == 0
+    after_reaper = (await _replicas(kubernetes_controller_database, service_id))[0]
+    assert after_reaper.status == ReplicaStatus.RUNNING
+
+    async with kubernetes_controller_database.session() as session, session.begin():
+        service = await ServiceRepository.set_desired_replicas(
+            session,
+            service_id=service_id,
+            project_id=PROJECT_ID,
+            desired_replicas=0,
+        )
+        assert service is not None
+        await ServiceRepository.reconcile_locked(session, service)
+    await controller.run_once()
+    assert runtime.stop_requested == []
+    still_reserved = (await _replicas(kubernetes_controller_database, service_id))[0]
+    assert still_reserved.status in {
+        ReplicaStatus.RUNNING,
+        ReplicaStatus.DRAINING,
+        ReplicaStatus.STOPPING,
+    }
+    assert still_reserved.endpoint_url is None
+    await controller.close()
+
+
+async def test_contract_drift_cleanup_success_marks_replica_terminal(
+    kubernetes_controller_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service_id, catalog = await _create_profile_service(kubernetes_controller_database)
+    runtime = _Runtime()
+    controller = _controller(
+        kubernetes_controller_database,
+        runtime,
+        runtime_profile_catalog=catalog,
+    )
+    await controller.startup()
+    await controller.run_once()
+    handle = next(iter(runtime.handles.values()))
+
+    async def reject_drifted_inspect(
+        _handle: KubernetesServingHandle,
+    ) -> KubernetesServingState:
+        raise KubernetesServingOwnershipError("immutable Pod contract drift")
+
+    monkeypatch.setattr(runtime, "inspect", reject_drifted_inspect)
+    result = await controller.run_once()
+
+    replica = (await _replicas(kubernetes_controller_database, service_id))[0]
+    assert result.failed == 1
+    assert replica.status == ReplicaStatus.FAILED
+    assert replica.health == ReplicaHealth.UNHEALTHY
+    assert replica.endpoint_url is None
+    assert handle.object_id in runtime.force_cleaned
+    assert replica.id not in controller._handles
+    await controller.close()
+
+
+async def test_restart_retries_persistent_quarantine_before_adopting_or_renewing(
+    kubernetes_controller_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service_id, catalog = await _create_profile_service(kubernetes_controller_database)
+    runtime = _Runtime()
+    first = _controller(
+        kubernetes_controller_database,
+        runtime,
+        runtime_profile_catalog=catalog,
+    )
+    await first.startup()
+    await first.run_once()
+    handle = next(iter(runtime.handles.values()))
+    runtime.states[handle.object_id] = _state(
+        phase="Running",
+        running=True,
+        ready=True,
+        endpoint_url=handle.endpoint_url,
+        node_name=handle.node_name,
+    )
+    await first.run_once()
+
+    original_cleanup = runtime.force_cleanup
+
+    async def reject_drifted_inspect(
+        _handle: KubernetesServingHandle,
+    ) -> KubernetesServingState:
+        raise KubernetesServingOwnershipError("immutable Pod contract drift")
+
+    async def reject_drifted_cleanup(_handle: KubernetesServingHandle) -> None:
+        raise KubernetesServingOwnershipError("cleanup contract fence mismatch")
+
+    monkeypatch.setattr(runtime, "inspect", reject_drifted_inspect)
+    monkeypatch.setattr(runtime, "force_cleanup", reject_drifted_cleanup)
+    await first.run_once()
+    quarantined = (await _replicas(kubernetes_controller_database, service_id))[0]
+    assert quarantined.status == ReplicaStatus.RUNNING
+    assert quarantined.lease_expires_at is None
+    await first.close()
+
+    runtime.closed = False
+    replacement = _controller(
+        kubernetes_controller_database,
+        runtime,
+        worker_id=first.worker_id,
+        runtime_profile_catalog=catalog,
+    )
+    prepared_before = len(runtime.prepared)
+    startup = await replacement.startup()
+
+    persisted = (await _replicas(kubernetes_controller_database, service_id))[0]
+    assert startup.recovered == 0
+    assert startup.orphans_cleaned == 0
+    assert persisted.status == ReplicaStatus.RUNNING
+    assert persisted.health == ReplicaHealth.UNHEALTHY
+    assert persisted.endpoint_url is None
+    assert persisted.lease_expires_at is None
+    assert replacement._handles[persisted.id].quarantined is True
+    assert len(runtime.prepared) == prepared_before
+
+    monkeypatch.setattr(runtime, "force_cleanup", original_cleanup)
+    result = await replacement.run_once()
+
+    cleaned = (await _replicas(kubernetes_controller_database, service_id))[0]
+    assert result.failed == 1
+    assert cleaned.status == ReplicaStatus.FAILED
+    assert cleaned.endpoint_url is None
+    assert cleaned.id not in replacement._handles
+    assert handle.object_id in runtime.force_cleaned
+    await replacement.close()
+
+
+async def test_stop_before_inspect_ownership_drift_is_persistently_quarantined(
+    kubernetes_controller_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service_id, catalog = await _create_profile_service(kubernetes_controller_database)
+    runtime = _Runtime()
+    controller = _controller(
+        kubernetes_controller_database,
+        runtime,
+        runtime_profile_catalog=catalog,
+    )
+    await controller.startup()
+    await controller.run_once()
+    handle = next(iter(runtime.handles.values()))
+    runtime.states[handle.object_id] = _state(
+        phase="Running",
+        running=True,
+        ready=True,
+        endpoint_url=handle.endpoint_url,
+        node_name=handle.node_name,
+    )
+    await controller.run_once()
+    before = (await _replicas(kubernetes_controller_database, service_id))[0]
+    assert before.lease_expires_at is not None
+    async with kubernetes_controller_database.session() as session, session.begin():
+        service = await ServiceRepository.set_desired_replicas(
+            session,
+            service_id=service_id,
+            project_id=PROJECT_ID,
+            desired_replicas=0,
+        )
+        assert service is not None
+        await ServiceRepository.reconcile_locked(session, service)
+
+    async def reject_stop(_handle: KubernetesServingHandle) -> None:
+        raise KubernetesServingOwnershipError("replacement Pod UID differs")
+
+    monkeypatch.setattr(runtime, "request_stop", reject_stop)
+    monkeypatch.setattr(runtime, "force_cleanup", reject_stop)
+    before_prepared = len(runtime.prepared)
+
+    result = await controller.run_once()
+
+    replica = (await _replicas(kubernetes_controller_database, service_id))[0]
+    assert result.failed == 0
+    assert replica.status in {ReplicaStatus.DRAINING, ReplicaStatus.STOPPING}
+    assert replica.health == ReplicaHealth.UNHEALTHY
+    assert replica.endpoint_url is None
+    assert replica.lease_expires_at is None
+    assert controller._handles[replica.id].quarantined is True
+    assert len(runtime.prepared) == before_prepared
+    await controller.close()
+
+
+async def test_advance_cleanup_ownership_drift_is_quarantined_without_aborting_cycle(
+    kubernetes_controller_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service_id, catalog = await _create_profile_service(kubernetes_controller_database)
+    runtime = _Runtime()
+    controller = _controller(
+        kubernetes_controller_database,
+        runtime,
+        runtime_profile_catalog=catalog,
+    )
+    await controller.startup()
+    await controller.run_once()
+
+    async def reject_advance(
+        _item: object,
+        _state: KubernetesServingState,
+    ) -> str:
+        raise KubernetesServingOwnershipError("cleanup raced a replacement Pod")
+
+    async def reject_cleanup(_handle: KubernetesServingHandle) -> None:
+        raise KubernetesServingOwnershipError("replacement Pod UID differs")
+
+    monkeypatch.setattr(controller, "_advance_item", reject_advance)
+    monkeypatch.setattr(runtime, "force_cleanup", reject_cleanup)
+
+    await controller.run_once()
+
+    replica = (await _replicas(kubernetes_controller_database, service_id))[0]
+    assert replica.status in {
+        ReplicaStatus.STARTING,
+        ReplicaStatus.LOADING,
+        ReplicaStatus.RUNNING,
+    }
+    assert replica.health == ReplicaHealth.UNHEALTHY
+    assert replica.endpoint_url is None
+    assert replica.lease_expires_at is None
+    assert controller._handles[replica.id].quarantined is True
+    await controller.close()
+
+
 async def test_restart_rebuilds_startup_deadline_from_execution_claim_time(
     kubernetes_controller_database: Database,
     monkeypatch: pytest.MonkeyPatch,
@@ -829,6 +1479,83 @@ async def test_recovery_quarantines_identity_proven_drift_without_loss_or_replac
     assert len(runtime.prepared) == 3
     assert runtime.force_cleaned == []
     assert runtime.stop_requested == []
+    drifted_replica_id = uuid.UUID(drifted.labels[REPLICA_ID_LABEL])
+    drifted_replica = next(item for item in replicas_after if item.id == drifted_replica_id)
+    assert drifted_replica.health == ReplicaHealth.UNHEALTHY
+    assert drifted_replica.endpoint_url is None
+    assert drifted_replica.lease_expires_at is None
+    assert drifted_replica_id in replacement._quarantined_claims
+    await replacement.close()
+
+
+async def test_unknown_recovery_conflict_blocks_admission_until_discovery_clears(
+    kubernetes_controller_database: Database,
+) -> None:
+    runtime = _Runtime()
+    runtime.recovery_conflicts = (
+        KubernetesServingRecoveryConflict(
+            resource_kind="pod",
+            resource_name="untrusted-pod",
+            reason="ownership_conflict",
+            message="managed labels are incomplete",
+        ),
+    )
+    controller = _controller(kubernetes_controller_database, runtime)
+
+    startup = await controller.startup()
+
+    assert startup.recovery_conflicts == 1
+    assert controller.admission_ready is False
+    runtime.recovery_conflicts = ()
+    await controller.run_once()
+    assert controller.admission_ready is True
+    await controller.close()
+
+
+async def test_recovery_quarantines_running_profile_replica_without_observed_node(
+    kubernetes_controller_database: Database,
+) -> None:
+    service_id, catalog = await _create_profile_service(kubernetes_controller_database)
+    runtime = _Runtime()
+    first = _controller(
+        kubernetes_controller_database,
+        runtime,
+        runtime_profile_catalog=catalog,
+    )
+    await first.startup()
+    await first.run_once()
+    handle = next(iter(runtime.handles.values()))
+    runtime.states[handle.object_id] = _state(
+        phase="Running",
+        running=True,
+        ready=True,
+        endpoint_url=handle.endpoint_url,
+        node_name=handle.node_name,
+    )
+    await first.run_once()
+    running = (await _replicas(kubernetes_controller_database, service_id))[0]
+    assert running.status == ReplicaStatus.RUNNING
+    assert running.assigned_node_name == handle.node_name
+    await first.close()
+
+    runtime.closed = False
+    runtime.handles[handle.object_id] = replace(handle, node_name=None)
+    runtime.states[handle.object_id] = _state(phase="Pending", node_name=None)
+    replacement = _controller(
+        kubernetes_controller_database,
+        runtime,
+        worker_id=first.worker_id,
+        runtime_profile_catalog=catalog,
+    )
+
+    startup = await replacement.startup()
+
+    assert startup.orphans_cleaned == 1
+    replica = (await _replicas(kubernetes_controller_database, service_id))[0]
+    assert replica.status == ReplicaStatus.FAILED
+    assert replica.health == ReplicaHealth.UNHEALTHY
+    assert replica.endpoint_url is None
+    assert handle.object_id in runtime.force_cleaned
     await replacement.close()
 
 

@@ -1,0 +1,504 @@
+{
+  "schema_version": "1.0.0",
+  "canonical_m6_head": "93ef809088935be04300d6bcd3619e8a050f736d",
+  "main_baseline": "155f1360274d2d08353742dd080e9b822adc1e8e",
+  "real_hardware_status": "REAL_HW_NOT_RUN",
+  "areas": [
+    {
+      "id": "A1",
+      "title": "vendor-neutral accelerator domain and request contract",
+      "status": "fully-represented",
+      "proofs": [
+        {
+          "kind": "code",
+          "path": "core/accelerators.py",
+          "note": "Defines normalized vendor, kind, device, request, and selection-policy contracts."
+        },
+        {
+          "kind": "code",
+          "path": "api/schemas/accelerators.py",
+          "note": "Exposes the vendor-neutral request and response schema at the API boundary."
+        },
+        {
+          "kind": "test",
+          "path": "tests/unit/test_accelerator_schema.py",
+          "note": "Covers normalization, compatibility aliases, validation, and invalid combinations."
+        },
+        {
+          "kind": "document",
+          "path": "docs/api-cli.md",
+          "note": "Documents the compatibility and deprecation boundary for public accelerator fields."
+        }
+      ],
+      "limitations": [
+        "A vendor-neutral contract does not itself prove that any physical accelerator is available."
+      ]
+    },
+    {
+      "id": "A2",
+      "title": "accelerator persistence and allocation authority",
+      "status": "fully-represented",
+      "proofs": [
+        {
+          "kind": "code",
+          "path": "models/scheduling.py",
+          "note": "Persists accelerator profiles, allocation authority, and reservation identity."
+        },
+        {
+          "kind": "code",
+          "path": "repositories/reservations.py",
+          "note": "Enforces concrete allocation ownership and release semantics."
+        },
+        {
+          "kind": "migration",
+          "path": "migrations/versions/0011_accelerator_persistence.py",
+          "note": "Introduces the durable A2 schema and upgrade contract."
+        },
+        {
+          "kind": "test",
+          "path": "tests/integration/test_accelerator_persistence.py",
+          "note": "Exercises the PostgreSQL persistence path and authority fields."
+        },
+        {
+          "kind": "test",
+          "path": "tests/unit/test_accelerator_migration.py",
+          "note": "Checks migration structure and compatibility invariants."
+        }
+      ],
+      "limitations": [
+        "Persistence proves database ownership semantics, not device-plugin enforcement on real hardware."
+      ]
+    },
+    {
+      "id": "A3",
+      "title": "pluggable accelerator inventory providers",
+      "status": "fully-represented",
+      "proofs": [
+        {
+          "kind": "code",
+          "path": "worker/gpu_inventory.py",
+          "note": "Implements bounded NVIDIA, Ascend, Kubernetes, fake, and disabled providers plus registry composition."
+        },
+        {
+          "kind": "code",
+          "path": "core/config.py",
+          "note": "Validates provider selection, exclusivity, duplicates, and production fake-device restrictions."
+        },
+        {
+          "kind": "test",
+          "path": "tests/unit/test_gpu_inventory.py",
+          "note": "Covers fixtures, failure modes, Kubernetes capacity accounting, taints, hardware families, and composition."
+        },
+        {
+          "kind": "document",
+          "path": "docs/accelerator-inventory.md",
+          "note": "Records provider semantics, external Pod accounting, security requirements, and simulated evidence boundaries."
+        }
+      ],
+      "limitations": [
+        "NVIDIA, Ascend, and Kubernetes discovery fixtures are simulated; real commands and devices remain REAL_HW_NOT_RUN."
+      ]
+    },
+    {
+      "id": "A4",
+      "title": "immutable Runtime Profile contracts",
+      "status": "fully-represented",
+      "proofs": [
+        {
+          "kind": "code",
+          "path": "core/runtime_profiles.py",
+          "note": "Loads immutable profile identity, version, semantic digest, resources, selectors, and tolerations."
+        },
+        {
+          "kind": "code",
+          "path": "scripts/validate_runtime_profiles.py",
+          "note": "Validates profiles and generated manifest drift."
+        },
+        {
+          "kind": "profile",
+          "path": "runtime_profiles/manifest.json",
+          "note": "Pins generated identities and semantic digests for committed profiles."
+        },
+        {
+          "kind": "profile",
+          "path": "runtime_profiles/schema.json",
+          "note": "Defines the machine-readable Runtime Profile schema."
+        },
+        {
+          "kind": "test",
+          "path": "tests/unit/test_runtime_profiles.py",
+          "note": "Covers validation, digest stability, generated output, selectors, and security constraints."
+        }
+      ],
+      "limitations": [
+        "Schema and digest validation do not prove that a profile image runs on declared hardware."
+      ]
+    },
+    {
+      "id": "A5",
+      "title": "logical models and physical vendor variants",
+      "status": "fully-represented",
+      "proofs": [
+        {
+          "kind": "code",
+          "path": "models/model_variant.py",
+          "note": "Persists logical identity, vendor variants, immutable artifact/profile binding, and audit status."
+        },
+        {
+          "kind": "code",
+          "path": "repositories/model_variants.py",
+          "note": "Enforces ready-variant, last-ready, digest, and status-transition invariants."
+        },
+        {
+          "kind": "migration",
+          "path": "migrations/versions/0012_model_variants.py",
+          "note": "Adds the A5 logical-model and physical-variant schema."
+        },
+        {
+          "kind": "test",
+          "path": "tests/unit/test_model_variant_repository.py",
+          "note": "Covers repository state transitions and immutable binding rules."
+        },
+        {
+          "kind": "document",
+          "path": "docs/model-variants.md",
+          "note": "Documents artifact/profile identity and the no-cross-vendor-inference boundary."
+        }
+      ],
+      "limitations": [
+        "A ready database variant is a control-plane state, not proof of real backend health."
+      ]
+    },
+    {
+      "id": "A6",
+      "title": "accelerator-aware Kubernetes serving renderer",
+      "status": "fully-represented",
+      "proofs": [
+        {
+          "kind": "code",
+          "path": "worker/kubernetes_serving_runtime.py",
+          "note": "Renders profile-bound resources, selectors, tolerations, security context, and immutable image contracts."
+        },
+        {
+          "kind": "test",
+          "path": "tests/unit/test_kubernetes_serving_runtime.py",
+          "note": "Covers NVIDIA/Ascend resources, security constraints, rendering drift, and invalid profiles."
+        },
+        {
+          "kind": "document",
+          "path": "docs/phase4-kubernetes-serving.md",
+          "note": "Defines the serving lifecycle, controller responsibilities, and Kubernetes evidence boundary."
+        }
+      ],
+      "limitations": [
+        "Renderer and Kind evidence do not establish a production-grade Kubernetes operator or multi-node service."
+      ]
+    },
+    {
+      "id": "A7",
+      "title": "NVIDIA vLLM Kubernetes runtime profile and acceptance contract",
+      "status": "fully-represented",
+      "proofs": [
+        {
+          "kind": "code",
+          "path": "core/nvidia_runtime.py",
+          "note": "Validates NVIDIA runtime diagnostics and acceptance payload semantics."
+        },
+        {
+          "kind": "profile",
+          "path": "runtime_profiles/nvidia-vllm-k8s.yaml",
+          "note": "Pins the NVIDIA vLLM Kubernetes profile and REAL_HW_NOT_RUN status."
+        },
+        {
+          "kind": "test",
+          "path": "tests/unit/test_nvidia_runtime.py",
+          "note": "Covers validation, diagnostic redaction, and acceptance state transitions."
+        },
+        {
+          "kind": "evidence",
+          "path": "runtime_profiles/nvidia-vllm-k8s.acceptance.json",
+          "note": "Records the unexecuted real-hardware acceptance boundary explicitly."
+        },
+        {
+          "kind": "document",
+          "path": "docs/nvidia-runtime.md",
+          "note": "Documents fake-device Kind evidence separately from optional real NVIDIA acceptance."
+        }
+      ],
+      "limitations": [
+        "Real NVIDIA GPU and vLLM acceptance is REAL_HW_NOT_RUN."
+      ]
+    },
+    {
+      "id": "A8",
+      "title": "Huawei Ascend A2 runtime profile and acceptance contract",
+      "status": "fully-represented",
+      "proofs": [
+        {
+          "kind": "code",
+          "path": "core/ascend_runtime.py",
+          "note": "Validates Ascend runtime diagnostics and acceptance payload semantics."
+        },
+        {
+          "kind": "profile",
+          "path": "runtime_profiles/ascend-vllm-k8s.yaml",
+          "note": "Pins the Ascend 910B/A2 profile and REAL_HW_NOT_RUN status."
+        },
+        {
+          "kind": "test",
+          "path": "tests/unit/test_ascend_runtime.py",
+          "note": "Covers profile validation, diagnostic parsing/redaction, and acceptance contracts."
+        },
+        {
+          "kind": "evidence",
+          "path": "runtime_profiles/ascend-vllm-k8s.acceptance.json",
+          "note": "Records the unexecuted real Ascend acceptance boundary explicitly."
+        },
+        {
+          "kind": "document",
+          "path": "runtime_profiles/README.md",
+          "note": "Separates schema-ready, simulated, and real-hardware evidence states."
+        }
+      ],
+      "limitations": [
+        "Real Huawei Ascend 910B hardware and vLLM-Ascend acceptance is REAL_HW_NOT_RUN."
+      ]
+    },
+    {
+      "id": "A9",
+      "title": "vendor-aware admission, quota, and fencing",
+      "status": "fully-represented",
+      "proofs": [
+        {
+          "kind": "code",
+          "path": "repositories/admission.py",
+          "note": "Computes vendor/profile-compatible capacity and fail-closed scale revalidation."
+        },
+        {
+          "kind": "code",
+          "path": "api/routes/services.py",
+          "note": "Applies admission decisions, immutable selection snapshots, and quota semantics."
+        },
+        {
+          "kind": "migration",
+          "path": "migrations/versions/0013_vendor_aware_admission.py",
+          "note": "Adds durable selection, admission, and allocation-authority fields."
+        },
+        {
+          "kind": "test",
+          "path": "tests/unit/test_vendor_admission.py",
+          "note": "Covers mixed vendors, homogeneous gangs, fallback policy, quotas, and rejection reasons."
+        },
+        {
+          "kind": "test",
+          "path": "tests/integration/test_kubernetes_serving_postgresql.py",
+          "note": "Exercises PostgreSQL admission and serving concurrency semantics."
+        }
+      ],
+      "limitations": [
+        "Admission uses observed/configured capacity and cannot prove future physical availability or production scale."
+      ]
+    },
+    {
+      "id": "A10",
+      "title": "dual-vendor routing, fallback, circuits, and physical usage",
+      "status": "fully-represented",
+      "proofs": [
+        {
+          "kind": "code",
+          "path": "api/services/gateway.py",
+          "note": "Implements strict/preferred/balanced routing, safe pre-dispatch fallback, SSE pinning, and usage attribution."
+        },
+        {
+          "kind": "migration",
+          "path": "migrations/versions/0014_vendor_routing.py",
+          "note": "Persists vendor circuits and physical serving provenance."
+        },
+        {
+          "kind": "migration",
+          "path": "migrations/versions/0015_gateway_routing_policy.py",
+          "note": "Adds explicit logical-model routing policy and concurrency-safe cursor state."
+        },
+        {
+          "kind": "test",
+          "path": "tests/integration/test_gateway_routing_concurrency.py",
+          "note": "Exercises PostgreSQL routing cursor and circuit concurrency."
+        },
+        {
+          "kind": "test",
+          "path": "tests/unit/test_gateway.py",
+          "note": "Covers fallback boundaries, SSE behavior, routing policies, circuits, and no-duplicate usage."
+        }
+      ],
+      "limitations": [
+        "Routing correctness is not a latency SLA and does not establish cross-region or production HA behavior."
+      ]
+    },
+    {
+      "id": "A11",
+      "title": "NVIDIA and Huawei Ascend dual-backend benchmark harness",
+      "status": "fully-represented",
+      "proofs": [
+        {
+          "kind": "code",
+          "path": "benchmarks/dual_backend.py",
+          "note": "Runs frozen prompts, warmup/measured phases, buffered/SSE validation, and independent fallback drills."
+        },
+        {
+          "kind": "test",
+          "path": "tests/unit/test_dual_backend_benchmark.py",
+          "note": "Covers protocol, semantics, TTFT, aggregation, fallback mode, and failure paths."
+        },
+        {
+          "kind": "evidence",
+          "path": "evidence/m6-a11-dual-backend.json",
+          "note": "Keeps real dual-hardware results explicitly REAL_HW_NOT_RUN."
+        },
+        {
+          "kind": "document",
+          "path": "docs/dual-backend-benchmark.md",
+          "note": "Documents the operator checkpoint, separate fallback phase, and evidence boundary."
+        }
+      ],
+      "limitations": [
+        "No real dual-backend throughput, latency, parity, stability, or fallback claim is established."
+      ]
+    },
+    {
+      "id": "post-a11-hardening",
+      "title": "post-A11 serving correctness hardening",
+      "status": "fully-represented",
+      "proofs": [
+        {
+          "kind": "code",
+          "path": "api/services/autoscaler.py",
+          "note": "Uses dialect-safe bounded candidate snapshots and preserves logical-model/service/quota lock order."
+        },
+        {
+          "kind": "code",
+          "path": "worker/heartbeat.py",
+          "note": "Separates execution ownership from best-effort inventory refresh persistence."
+        },
+        {
+          "kind": "migration",
+          "path": "migrations/versions/0016_service_node_placement.py",
+          "note": "Adds fail-closed service compatibility snapshots and safe upgrade preconditions."
+        },
+        {
+          "kind": "test",
+          "path": "tests/integration/test_service_reconcile_concurrency.py",
+          "note": "Covers concurrent reconciliation plus autoscaler lock skipping and cursor movement."
+        },
+        {
+          "kind": "test",
+          "path": "tests/unit/test_service_node_placement_migration.py",
+          "note": "Covers migration fail-closed behavior and placement snapshot semantics."
+        },
+        {
+          "kind": "document",
+          "path": "docs/operations.md",
+          "note": "Records upgrade preconditions, quarantine behavior, and operational limits."
+        }
+      ],
+      "limitations": [
+        "The hardening was validated on SQLite, PostgreSQL, and Kind but not on production HA infrastructure."
+      ]
+    },
+    {
+      "id": "benchmark-review-fixes",
+      "title": "A11 benchmark correctness review fixes",
+      "status": "fully-represented",
+      "proofs": [
+        {
+          "kind": "code",
+          "path": "benchmarks/dual_backend.py",
+          "note": "Starts TTFT at first non-empty content, separates fallback-only execution, and supports exact complete-response matching."
+        },
+        {
+          "kind": "test",
+          "path": "tests/unit/test_dual_backend_benchmark.py",
+          "note": "Regresses role-only SSE events, 42 versus 142, Paris versus Parisian, and fallback phase separation."
+        },
+        {
+          "kind": "evidence",
+          "path": "evidence/m6-a11-dual-backend.json",
+          "note": "Prevents corrected harness behavior from being promoted to unrun hardware evidence."
+        },
+        {
+          "kind": "document",
+          "path": "docs/dual-backend-benchmark.md",
+          "note": "Documents exact/contains matching and the independent operator-driven fallback phase."
+        }
+      ],
+      "limitations": [
+        "These fixes validate harness correctness only; real NVIDIA and Ascend execution remains REAL_HW_NOT_RUN."
+      ]
+    }
+  ],
+  "stacked_pull_requests": [
+    {
+      "number": 20,
+      "area_ids": ["A1"],
+      "source_head": "aea6dc3942c6ec672d80c81ed21a369e262791dd",
+      "integration": "literal-ancestor",
+      "classification": "fully-represented",
+      "rationale": "The final tree retains the A1 domain and public request contract and extends its tests and compatibility snapshots."
+    },
+    {
+      "number": 21,
+      "area_ids": ["A2"],
+      "source_head": "67ad9f8f840b6021df3a07e603e0f4a03b708bad",
+      "integration": "literal-ancestor",
+      "classification": "fully-represented",
+      "rationale": "Migration 0011, persistence models, repositories, and allocation-authority tests are present in the final tree."
+    },
+    {
+      "number": 22,
+      "area_ids": ["A3"],
+      "source_head": "aa0dadf31b6f86bf9f8b4859b29b8a0053a9610c",
+      "integration": "semantic-integration",
+      "classification": "fully-represented",
+      "rationale": "A3 was reintegrated rather than preserved as a literal ancestor; the final providers, fixtures, configuration, documentation, and expanded inventory tests cover and harden its semantics."
+    },
+    {
+      "number": 23,
+      "area_ids": ["A4"],
+      "source_head": "e7724b10d037af09c91658a0713391909508878d",
+      "integration": "literal-ancestor",
+      "classification": "fully-represented",
+      "rationale": "Runtime Profile schemas, semantic digests, manifest generation, validation, and tests remain present and are extended by A7/A8."
+    },
+    {
+      "number": 24,
+      "area_ids": ["A5"],
+      "source_head": "cd6bc2e93af0d4b61f399043b9566e31414fc152",
+      "integration": "literal-ancestor",
+      "classification": "fully-represented",
+      "rationale": "Migration 0012 and the logical-model/variant API, persistence, audit, and immutable binding semantics are present."
+    },
+    {
+      "number": 25,
+      "area_ids": ["A6"],
+      "source_head": "f27a166e932cf8fc5607cd8ca53839c2d2f14463",
+      "integration": "literal-ancestor",
+      "classification": "fully-represented",
+      "rationale": "The accelerator-aware Kubernetes renderer and its profile-bound security/resource tests are present and hardened."
+    },
+    {
+      "number": 26,
+      "area_ids": ["A7"],
+      "source_head": "c1ec17a18b726a8bcee3563b4c0984731a81d5aa",
+      "integration": "literal-ancestor",
+      "classification": "fully-represented",
+      "rationale": "The NVIDIA profile, validators, fake-device Kind contract, acceptance record, and tests remain present with REAL_HW_NOT_RUN."
+    },
+    {
+      "number": 27,
+      "area_ids": ["A8"],
+      "source_head": "69e18e48cdd099079ea029a47e45cebf7936dcd4",
+      "integration": "literal-ancestor",
+      "classification": "fully-represented",
+      "rationale": "The Ascend A2 profile, validators, acceptance record, renderer integration, and tests remain present with REAL_HW_NOT_RUN."
+    }
+  ]
+}

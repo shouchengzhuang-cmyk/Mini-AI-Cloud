@@ -2,6 +2,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 import structlog.contextvars
@@ -21,6 +22,7 @@ from api.routes import (
     gateway,
     identity,
     job_groups,
+    model_variants,
     registry,
     services,
     system,
@@ -47,6 +49,7 @@ from core.logging import configure_logging, get_logger
 from core.metrics import API_REQUEST_DURATION, API_REQUESTS
 from core.project_identity import PROJECT_VERSION
 from core.redis import RedisQueue
+from core.runtime_profiles import RuntimeProfileCatalog
 from scheduler.global_scheduler import GlobalScheduler
 from worker.kubernetes_serving_runtime import KubernetesServingRuntimeAdapter
 from worker.vllm_runtime import DockerVLLMRuntimeAdapter
@@ -69,6 +72,9 @@ def create_app(
         log_stream_ttl_seconds=resolved_settings.log_stream_ttl_seconds,
         ready_stream_maxlen=resolved_settings.ready_stream_maxlen,
         socket_timeout=resolved_settings.redis_socket_timeout,
+    )
+    runtime_profile_catalog = RuntimeProfileCatalog.from_path(
+        Path(resolved_settings.runtime_profile_manifest_path)
     )
     should_start_control = (
         resolved_settings.control_plane_enabled
@@ -96,6 +102,9 @@ def create_app(
         first_token_timeout=resolved_settings.service_proxy_first_token_timeout,
         max_response_bytes=resolved_settings.service_proxy_max_response_bytes,
         endpoint_host_allowlist=resolved_settings.service_endpoint_host_allowlist,
+        fallback_attempts=resolved_settings.service_proxy_fallback_attempts,
+        circuit_failure_threshold=(resolved_settings.service_vendor_circuit_failure_threshold),
+        circuit_cooldown_seconds=(resolved_settings.service_vendor_circuit_cooldown_seconds),
     )
     service_health = ServiceHealthController(
         resolved_database,
@@ -170,7 +179,6 @@ def create_app(
         should_start_control
         and resolved_settings.control_plane_enabled
         and resolved_settings.kubernetes_serving_enabled
-        and resolved_settings.kubernetes_serving_fake_enabled
     ):
         kubernetes_replica_runtime = KubernetesReplicaRuntimeController(
             resolved_database,
@@ -190,6 +198,7 @@ def create_app(
             app_env=resolved_settings.app_env,
             cluster_id=resolved_settings.kubernetes_serving_cluster_id,
             image=resolved_settings.kubernetes_serving_image,
+            runtime_profile_catalog=runtime_profile_catalog,
             fake_enabled=resolved_settings.kubernetes_serving_fake_enabled,
             batch_size=resolved_settings.batch_size,
             startup_timeout_seconds=resolved_settings.kubernetes_serving_startup_timeout,
@@ -217,6 +226,7 @@ def create_app(
         batch_size=resolved_settings.batch_size,
         scale_to_zero_enabled=resolved_settings.service_scale_to_zero_enabled,
         kubernetes_runtime=kubernetes_replica_runtime,
+        runtime_profile_catalog=runtime_profile_catalog,
     )
     controllers.insert(
         2,
@@ -236,6 +246,7 @@ def create_app(
             cpu_price_per_hour=resolved_settings.cpu_price_per_hour,
             memory_price_per_gb_hour=resolved_settings.memory_price_per_gb_hour,
             gpu_price_per_hour=resolved_settings.gpu_price_per_hour,
+            runtime_profile_catalog=runtime_profile_catalog,
             preemption_enabled=resolved_settings.scheduler_preemption_enabled,
             preemption_min_delta=resolved_settings.scheduler_preemption_min_delta,
         )
@@ -296,6 +307,7 @@ def create_app(
     app.state.fake_replica_runtime = fake_replica_runtime
     app.state.vllm_replica_runtime = vllm_replica_runtime
     app.state.kubernetes_replica_runtime = kubernetes_replica_runtime
+    app.state.runtime_profile_catalog = runtime_profile_catalog
     app.add_middleware(
         RequestBodyLimitMiddleware,
         max_bytes=resolved_settings.api_request_max_bytes,
@@ -336,6 +348,7 @@ def create_app(
     app.include_router(workers.router)
     app.include_router(services.router)
     app.include_router(registry.router)
+    app.include_router(model_variants.router)
     app.include_router(usage.router)
     app.include_router(artifacts.router)
     app.include_router(gateway.router)

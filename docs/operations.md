@@ -87,6 +87,12 @@ uv run alembic check
 4. `alembic check` 不应产生未迁移的模型差异。
 5. 先迁移，再启动新 API/Worker；失败时保留 migration 日志和 DB snapshot。
 
+`0016_service_node_placement` 无法从迁移时正在运行的 Pod 推导完整的兼容节点集。
+升级前必须把所有 logical-model Kubernetes Service 缩到 `desired_replicas=0`，并等待其
+Replica 全部进入 `stopped`、`failed` 或 `lost` 终态；否则迁移会在 DDL 前拒绝执行。
+升级完成后第一次正向扩容会通过正常 admission 使用当前完整 inventory 重建
+`eligible_node_names`。不要用现存 Pod 的 node 列表手工回填该字段，否则会永久缩窄故障转移范围。
+
 ## 代码回滚与数据库回退
 
 Phase I 稳定代码恢复点为 `c47702b`，但“代码能切回”不等于“Phase II 数据可无损降级”。推荐策略：
@@ -98,6 +104,38 @@ Phase I 稳定代码恢复点为 `c47702b`，但“代码能切回”不等于�
 5. 如需回到 Phase I，应恢复升级前 snapshot，再运行 `c47702b` 代码，并明确丢弃升级后的写入窗口。
 
 不要把 `git reset --hard` 当作回滚流程；它会破坏工作树且不能恢复数据库/Object Store。
+
+### Accelerator allocation migration rollback
+
+`0011_accelerator_persistence` 是增量迁移：保留 `gpu_devices`、legacy `gpu_*`
+字段和 reservation 关联表，只追加 vendor/kind、runtime profile、allocation authority
+及 observed allocation 列。升级前后应运行：
+
+```bash
+uv run alembic current
+uv run alembic upgrade 0011_accelerator_persistence
+uv run mini-cloud admin doctor
+```
+
+升级后的只读核查至少包括：
+
+- v0.4 GPU 行映射为 `nvidia/gpu`，fake GPU 的 provenance 仍由 `fake=true` 保存；
+- 已有 concrete device link 能回填 observed device IDs；缺少绑定的历史 GPU
+  reservation 标记为 `legacy_unbound`，不能伪造观测；
+- `orphan_accelerator_allocation` 没有新增问题；
+- terminal task 不存在 active reservation 或 active exact-device link。
+
+若应用错误但 schema 已成功，优先 forward fix。仅在已停止所有写入、完成可恢复备份并确认
+没有需要保留的 A2 新写入后，才可演练：
+
+```bash
+uv run alembic downgrade 0010_ai_serving_infrastructure
+```
+
+该 downgrade 会删除 runtime profile、allocation authority 和 observed allocation 证据，无法还原
+升级后的 Kubernetes Device Plugin 观测；生产恢复应使用升级前 snapshot，而不是把 downgrade
+当作无损回滚。如果同一 Worker 已有不同 vendor 共用 `device_index` 的合法数据，
+downgrade 恢复 v0.4 唯一键时会被数据库拒绝；应停止回退并使用升级前 snapshot。
 
 ## Local backup
 

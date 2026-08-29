@@ -6,10 +6,16 @@ from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
-from core.enums import ACTIVE_TASK_STATUSES, FINAL_TASK_STATUSES, TaskStatus, WorkerStatus
+from core.enums import (
+    ACTIVE_TASK_STATUSES,
+    FINAL_TASK_STATUSES,
+    AllocationAuthority,
+    TaskStatus,
+    WorkerStatus,
+)
 from models.artifact import Artifact, Dataset, JobGroup
 from models.outbox import OutboxEvent
-from models.scheduling import ResourceReservation
+from models.scheduling import ReservationGPUDevice, ResourceReservation
 from models.service import ModelService, ServiceReplica
 from models.task import Task
 from models.usage import ProjectQuotaState
@@ -596,6 +602,7 @@ async def _consistency_checks(
         await _reservations_without_task(session, project_id=project_id, limit=limit),
         await _terminal_tasks_with_reservation(session, project_id=project_id, limit=limit),
         await _terminal_tasks_with_lease(session, project_id=project_id, limit=limit),
+        await _accelerator_allocation_inconsistencies(session, project_id=project_id, limit=limit),
         ConsistencyCheckDiagnostic(
             name="orphan_container",
             status="not_observable",
@@ -831,6 +838,77 @@ async def _terminal_tasks_with_lease(
             for task in tasks
         ),
     )
+
+
+async def _accelerator_allocation_inconsistencies(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID | None,
+    limit: int,
+) -> ConsistencyCheckDiagnostic:
+    active_links = (
+        select(func.count(ReservationGPUDevice.id))
+        .where(
+            ReservationGPUDevice.reservation_id == ResourceReservation.id,
+            ReservationGPUDevice.released_at.is_(None),
+        )
+        .correlate(ResourceReservation)
+        .scalar_subquery()
+    )
+    exact_without_binding = and_(
+        ResourceReservation.allocation_authority
+        == AllocationAuthority.CONTROL_PLANE_EXACT_DEVICE.value,
+        ResourceReservation.legacy_unbound.is_(False),
+        active_links != ResourceReservation.gpu_count,
+    )
+    plugin_with_binding = and_(
+        ResourceReservation.allocation_authority
+        == AllocationAuthority.KUBERNETES_DEVICE_PLUGIN.value,
+        active_links > 0,
+    )
+    filters: list[ColumnElement[bool]] = [
+        ResourceReservation.released_at.is_(None),
+        ResourceReservation.gpu_count > 0,
+        or_(exact_without_binding, plugin_with_binding),
+    ]
+    if project_id is not None:
+        filters.append(ResourceReservation.project_id == project_id)
+    total = int(
+        await session.scalar(select(func.count(ResourceReservation.id)).where(*filters)) or 0
+    )
+    rows = list(
+        (
+            await session.execute(
+                select(ResourceReservation, active_links.label("active_device_bindings"))
+                .where(*filters)
+                .order_by(ResourceReservation.created_at, ResourceReservation.id)
+                .limit(limit)
+            )
+        ).all()
+    )
+    return _issue_check(
+        "orphan_accelerator_allocation",
+        total,
+        tuple(
+            ConsistencyIssueDiagnostic(
+                resource_type="reservation",
+                resource_id=str(reservation.id),
+                task_id=reservation.task_id,
+                reason=(
+                    f"{reservation.allocation_authority} reservation has "
+                    f"{binding_count} active exact-device bindings; "
+                    f"expected {_expected_exact_bindings(reservation)}"
+                ),
+            )
+            for reservation, binding_count in rows
+        ),
+    )
+
+
+def _expected_exact_bindings(reservation: ResourceReservation) -> int:
+    if reservation.allocation_authority == AllocationAuthority.CONTROL_PLANE_EXACT_DEVICE.value:
+        return reservation.gpu_count
+    return 0
 
 
 async def _processed_outbox_inconsistencies(

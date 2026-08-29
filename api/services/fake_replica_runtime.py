@@ -4,6 +4,7 @@ import asyncio
 import os
 import socket
 import sys
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import timedelta
@@ -327,29 +328,35 @@ class FakeReplicaRuntimeController:
                 return False
             if parsed.hostname not in {"127.0.0.1", "::1", "localhost"} or port is None:
                 return False
-        matched = False
-        for process in psutil.process_iter(["cmdline"]):
-            try:
-                command = process.info.get("cmdline") or []
-                if not _fake_process_matches(
-                    command,
-                    script_path=self.script_path,
-                    port=port,
-                    model=model,
-                    replica_id=replica_id,
-                    execution_id=execution_id,
-                ):
-                    continue
-                matched = True
-                process.terminate()
+        deadline = time.monotonic() + self.stop_timeout_seconds
+        while True:
+            matched = False
+            for process in psutil.process_iter(["cmdline"]):
                 try:
-                    process.wait(timeout=self.stop_timeout_seconds)
-                except psutil.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=self.stop_timeout_seconds)
-            except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
-                continue
-        return matched
+                    command = process.info.get("cmdline") or []
+                    if not _fake_process_matches(
+                        command,
+                        script_path=self.script_path,
+                        port=port,
+                        model=model,
+                        replica_id=replica_id,
+                        execution_id=execution_id,
+                    ):
+                        continue
+                    matched = True
+                    process.terminate()
+                    try:
+                        process.wait(timeout=self.stop_timeout_seconds)
+                    except psutil.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=self.stop_timeout_seconds)
+                except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+                    continue
+            if matched or time.monotonic() >= deadline:
+                return matched
+            # A just-spawned process may not have completed execve when the
+            # replacement controller takes its first process snapshot.
+            time.sleep(0.02)
 
     async def _claim_pending_replicas(self) -> list[FakeReplicaClaim]:
         async with self.database.session() as session, session.begin():

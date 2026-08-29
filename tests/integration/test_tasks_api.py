@@ -81,6 +81,25 @@ async def test_api_persists_and_returns_structured_retry_policy(
     assert queried.json()["retry_policy"] == payload["retry_policy"]
 
 
+async def test_legacy_api_principal_cannot_submit_ascend_workload(
+    api_client: AsyncClient,
+) -> None:
+    payload = _payload()
+    payload.pop("gpu_count")
+    payload["accelerator"] = {
+        "count": 1,
+        "memory_mb_per_device": 32_000,
+        "allowed_vendors": ["huawei-ascend"],
+        "allowed_kinds": ["npu"],
+        "selection_policy": "ascend-only",
+    }
+
+    response = await api_client.post("/api/v1/tasks", json=payload)
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "LEGACY_WORKLOAD_RESTRICTED"
+
+
 async def test_api_idempotency_reuses_task_and_rejects_changed_payload(
     api_client: AsyncClient,
     database: Database,

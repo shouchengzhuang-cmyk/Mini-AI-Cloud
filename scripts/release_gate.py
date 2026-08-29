@@ -16,9 +16,9 @@ from typer._click.core import Command
 from typer.core import TyperGroup, TyperOption
 from typer.main import get_command
 
-RELEASE_VERSION = "0.4.0"
+RELEASE_VERSION = "0.5.0"
 # Pin this alongside RELEASE_VERSION so retries cannot discover a different predecessor.
-PREVIOUS_RELEASE_TAG: str | None = None
+PREVIOUS_RELEASE_TAG: str | None = "v0.4.0"
 ACTION_SHA = re.compile(r"^[0-9a-f]{40}$")
 SECRET_PATTERNS = {
     "private-key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
@@ -310,10 +310,14 @@ def prepare_release_bundle(root: Path, output_root: Path) -> Path:
         "github_release": "NOT_CREATED",
         "deployment_status": "NOT_DEPLOYED",
         "real_gpu": "NOT_RUN",
+        "real_nvidia_hardware": "REAL_HW_NOT_RUN",
+        "real_huawei_ascend_hardware": "REAL_HW_NOT_RUN",
         "validation": validation,
         "limitations": [
-            "No real NVIDIA GPU acceptance was run.",
-            "No production HA or multi-physical-node claim is made.",
+            "No real NVIDIA GPU/vLLM acceptance was run.",
+            "No real Huawei Ascend/vLLM-Ascend acceptance was run.",
+            "No production HA, multi-physical-node, SLA, universal hardware compatibility, "
+            "or complete Kubernetes-native platform claim is made.",
             "Preparing this bundle does not create a GitHub Release or deploy services.",
         ],
     }
@@ -360,10 +364,14 @@ This file prepares release notes; it does **not** create a GitHub Release or dep
 
 ## Evidence boundary and limitations
 
-- Real NVIDIA/vLLM GPU acceptance: **NOT RUN**.
+- NVIDIA and Huawei Ascend runtime profiles, admission, routing, fallback, circuit breaking,
+  and dual-backend benchmark contracts are included.
+- Real NVIDIA GPU/vLLM acceptance: **REAL_HW_NOT_RUN**.
+- Real Huawei Ascend/vLLM-Ascend acceptance: **REAL_HW_NOT_RUN**.
 - Production deployment: **NOT DEPLOYED**.
 - GitHub Release: **NOT CREATED**.
-- Production HA and multiple physical Kubernetes nodes remain outside the verified scope.
+- Production HA, multiple physical Kubernetes nodes, SLA, universal hardware compatibility,
+  and a complete Kubernetes-native platform remain outside the verified scope.
 """
 
 

@@ -1,0 +1,3 @@
+| Chip Name     | Chip Logic ID | NPU ID | Chip ID |
+| Ascend 910B4  | 3             | 4      | 0       |
+| broken        | x             | 5      | 0       |

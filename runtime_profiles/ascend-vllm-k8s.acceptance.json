@@ -1,0 +1,47 @@
+{
+  "schema_version": "1.0.0",
+  "profile_identity": "ascend-vllm-k8s-a2@2.0.0",
+  "image_reference": "quay.io/ascend/vllm-ascend@sha256:471744200c5d0c768c1f6c6a6816dcae0fd551de2487d4d129b6fb750024ce6a",
+  "image_platform_digests": {
+    "linux/amd64": "sha256:95aab9f2b491c04b9a879f270237be1e382990c1c05c6d65f4e55b7bdb31edc3",
+    "linux/arm64": "sha256:4ee78def8f33d59d48f116d1dfa793332c23c99ecab4f0d7dd5cd62d0fb4e6c1"
+  },
+  "product_generation": "Atlas A2 (Ascend 910B)",
+  "vllm_ascend_version": "0.23.0",
+  "vllm_ascend_commit": "5cb98caaadeff42b5b62b996e34bb2aaa29d20fd",
+  "vllm_version": "0.23.0",
+  "python_version": "3.12",
+  "cann_version": "9.1.0",
+  "torch_version": "2.10.0",
+  "torch_npu_version": "2.10.0.post4",
+  "mindcluster_version": "v26.1.0",
+  "resource_name": "huawei.com/Ascend910",
+  "allocation_authority": "kubernetes_device_plugin",
+  "cluster": {
+    "runtime_class_name": "ascend",
+    "runtime_handler": "ascend",
+    "scheduler_name": "volcano",
+    "plugin_daemonset_label_selector": "name=ascend-device-plugin-ds",
+    "vendor_node_label": "accelerator.mini-ai-cloud/vendor",
+    "vendor_node_value": "huawei-ascend",
+    "chip_name_label": "node.kubernetes.io/npu.chip.name",
+    "chip_name_prefix": "Ascend910B"
+  },
+  "visibility": {
+    "environment_name": "ASCEND_VISIBLE_DEVICES",
+    "source": "pod-annotation",
+    "annotation_key": "huawei.com/Ascend910",
+    "scheduling_mode": "mindcluster-volcano-full-card"
+  },
+  "evidence_status": "REAL_HW_NOT_RUN",
+  "observed_at": "2026-08-28",
+  "sources": [
+    "https://github.com/vllm-project/vllm-ascend/releases/tag/v0.23.0",
+    "https://docs.vllm.ai/projects/ascend/en/v0.23.0/",
+    "https://github.com/Ascend/mind-cluster/tree/v26.1.0",
+    "https://github.com/Ascend/mind-cluster/blob/v26.1.0/docs/en/scheduling/api/k8s.md",
+    "https://github.com/Ascend/mind-cluster/blob/v26.1.0/docs/zh/scheduling/02_quick_start/quick_start.md",
+    "https://www.hiascend.com/document/detail/zh/Atlas%20200I%20A2/23.0.0/re/npu/npusmi_012.html",
+    "https://www.hiascend.com/document/detail/zh/Atlas%20200I%20A2/24.1.0/re/npu/npusmi_013.html"
+  ]
+}

@@ -96,6 +96,14 @@ class ExecutionSpec:
     project_id: uuid.UUID | None = None
     gpu_device_ids: tuple[str, ...] = ()
     runtime_type: str = "docker"
+    selected_vendor: str | None = None
+    selected_kind: str | None = None
+    selected_model: str | None = None
+    runtime_profile_id: str | None = None
+    runtime_profile_version: str | None = None
+    runtime_profile_digest: str | None = None
+    model_variant_id: uuid.UUID | None = None
+    allocation_authority: str | None = None
     mounts: tuple[RuntimeMount, ...] = ()
 
 

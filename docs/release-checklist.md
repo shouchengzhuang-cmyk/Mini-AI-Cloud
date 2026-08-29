@@ -1,4 +1,4 @@
-# Mini AI Cloud 0.4.0 release checklist
+# Mini AI Cloud 0.5.0 release checklist
 
 This checklist prepares a release. Completing it does not authorize a GitHub Release or a
 deployment.
@@ -6,10 +6,12 @@ deployment.
 ## Identity and compatibility
 
 - [ ] `pyproject.toml`, installed metadata, API OpenAPI version, README, CLI and image labels say
-  `mini-ai-cloud` / `mini-cloud` / `0.4.0` consistently.
+  `mini-ai-cloud` / `mini-cloud` / `0.5.0` consistently.
 - [ ] `python scripts/release_gate.py contracts` matches reviewed OpenAPI and CLI v1 snapshots.
 - [ ] The deprecated `mini-docker-cloud` entry point still works and emits its warning.
 - [ ] `CHANGELOG.md` and generated release notes describe only committed changes.
+- [ ] `evidence/m6-release-coverage.json` and generated `docs/m6-release-coverage.md` show
+  A1-A11, post-A11 hardening, benchmark review fixes, and PRs #20-#27 as fully represented.
 
 ## Quality and safety
 
@@ -36,8 +38,10 @@ deployment.
 
 ## Limitations and authorization
 
-- [ ] README and release notes retain **NOT RUN** for real NVIDIA GPU acceptance when applicable.
-- [ ] No production HA, multi-physical-node, or managed-cloud claim was added.
+- [ ] README and release notes retain `REAL_HW_NOT_RUN` for both real NVIDIA and real Huawei
+  Ascend acceptance.
+- [ ] No production HA, multi-physical-node, universal hardware compatibility, SLA, complete
+  Kubernetes-native platform, or managed-cloud claim was added.
 - [ ] `docs/comparison.md` remains a responsibility comparison, not an unmeasured superiority claim.
 - [ ] A human explicitly authorizes the tag/GitHub Release after reviewing CI and artifacts.
 - [ ] A separate explicit authorization exists before any deployment.

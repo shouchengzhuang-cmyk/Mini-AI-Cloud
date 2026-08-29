@@ -1,0 +1,15 @@
+misconfigurations:
+  # The pinned CI-only sample Device Plugin must register with kubelet as root and privileged.
+  - id: KSV-0017
+    paths:
+      - deploy/nvidia-runtime/00-fake-device-plugin.yaml
+      - app/deploy/nvidia-runtime/00-fake-device-plugin.yaml
+  - id: KSV-0118
+    paths:
+      - deploy/nvidia-runtime/00-fake-device-plugin.yaml
+      - app/deploy/nvidia-runtime/00-fake-device-plugin.yaml
+  # The same plugin creates fake CDI device entries through the explicitly mounted /dev path.
+  - id: KSV-0121
+    paths:
+      - deploy/nvidia-runtime/00-fake-device-plugin.yaml
+      - app/deploy/nvidia-runtime/00-fake-device-plugin.yaml

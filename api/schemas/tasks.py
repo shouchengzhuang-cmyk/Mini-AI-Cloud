@@ -13,9 +13,17 @@ from pydantic import (
     model_validator,
 )
 
+from api.schemas.accelerators import (
+    AcceleratorRequest,
+    reconcile_legacy_gpu_fields,
+    require_current_execution_support,
+)
 from api.schemas.common import PaginationMeta, PaginationQuery, RequestModel, ResponseModel
 from api.schemas.task_artifacts import TaskInputArtifact, TaskOutputArtifact
 from core.enums import (
+    AcceleratorKind,
+    AcceleratorVendor,
+    AllocationAuthority,
     ErrorCategory,
     ErrorCode,
     LogStream,
@@ -96,9 +104,33 @@ class TaskCreate(RequestModel):
     memory_limit_mb: StrictInt = Field(default=256, ge=16, le=1_048_576)
     labels: dict[StrictStr, StrictStr] = Field(default_factory=dict)
     network_enabled: StrictBool = False
-    gpu_count: StrictInt = Field(default=0, ge=0, le=64)
-    gpu_memory_mb: StrictInt = Field(default=0, ge=0, le=1_048_576)
-    gpu_model: StrictStr | None = Field(default=None, min_length=1, max_length=255)
+    accelerator: AcceleratorRequest | None = Field(
+        default=None,
+        description=("Vendor-neutral NVIDIA/Ascend accelerator request used by A9 admission."),
+    )
+    gpu_count: StrictInt = Field(
+        default=0,
+        ge=0,
+        le=64,
+        json_schema_extra={"deprecated": True},
+        description="Deprecated v0.4 NVIDIA GPU count; use accelerator.count.",
+    )
+    gpu_memory_mb: StrictInt = Field(
+        default=0,
+        ge=0,
+        le=1_048_576,
+        json_schema_extra={"deprecated": True},
+        description=(
+            "Deprecated v0.4 memory per NVIDIA GPU; use accelerator.memory_mb_per_device."
+        ),
+    )
+    gpu_model: StrictStr | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        json_schema_extra={"deprecated": True},
+        description="Deprecated v0.4 NVIDIA model; use accelerator.allowed_models.",
+    )
     tolerations: list[dict[StrictStr, StrictStr]] = Field(default_factory=list, max_length=64)
     priority: StrictInt = Field(default=50, ge=0, le=100)
     preemptible: StrictBool = False
@@ -150,6 +182,16 @@ class TaskCreate(RequestModel):
     def validate_labels(cls, labels: dict[str, str]) -> dict[str, str]:
         return _validate_labels(labels)
 
+    @field_validator("gpu_model")
+    @classmethod
+    def validate_gpu_model(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        model = value.strip()
+        if not model or any(ord(character) < 32 for character in model):
+            raise ValueError("gpu_model must not be blank or contain control characters")
+        return model
+
     @field_validator("depends_on")
     @classmethod
     def validate_dependencies(cls, dependencies: list[uuid.UUID]) -> list[uuid.UUID]:
@@ -180,6 +222,16 @@ class TaskCreate(RequestModel):
 
     @model_validator(mode="after")
     def validate_secret_environment(self) -> "TaskCreate":
+        gpu_count, gpu_memory_mb, gpu_model = reconcile_legacy_gpu_fields(
+            accelerator=self.accelerator,
+            gpu_count=self.gpu_count,
+            gpu_memory_mb=self.gpu_memory_mb,
+            gpu_model=self.gpu_model,
+            fields_set=self.model_fields_set,
+        )
+        object.__setattr__(self, "gpu_count", gpu_count)
+        object.__setattr__(self, "gpu_memory_mb", gpu_memory_mb)
+        object.__setattr__(self, "gpu_model", gpu_model)
         secret_names = [binding.env_name for binding in self.secret_bindings]
         if len(secret_names) != len(set(secret_names)):
             raise ValueError("secret binding env_name values must be unique")
@@ -202,6 +254,17 @@ class TaskCreate(RequestModel):
         if self.retry_policy is not None:
             return self.retry_policy
         return RetryPolicy(max_attempts=self.max_retries + 1)
+
+    @property
+    def effective_accelerator(self) -> AcceleratorRequest:
+        return self.accelerator or AcceleratorRequest.from_legacy_gpu(
+            gpu_count=self.gpu_count,
+            gpu_memory_mb=self.gpu_memory_mb,
+            gpu_model=self.gpu_model,
+        )
+
+    def require_current_accelerator_execution_support(self) -> None:
+        require_current_execution_support(self.accelerator)
 
 
 class TaskCreated(ResponseModel):
@@ -245,6 +308,15 @@ class TaskResponse(ResponseModel):
     gpu_memory_mb: int
     gpu_model: str | None
     gpu_device_ids: list[str]
+    accelerator_request_json: dict[str, object] | None
+    selected_vendor: AcceleratorVendor | None
+    selected_kind: AcceleratorKind | None
+    selected_model: str | None
+    runtime_profile_id: str | None
+    runtime_profile_version: str | None
+    runtime_profile_digest: str | None
+    model_variant_id: uuid.UUID | None
+    allocation_authority: AllocationAuthority | None
     network_enabled: bool
     network_mode: str
     labels: dict[str, str]

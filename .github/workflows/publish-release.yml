@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
-      RELEASE_VERSION: 0.4.0
+      RELEASE_VERSION: 0.5.0
       KIND_VERSION: v0.27.0
       KUBECTL_VERSION: v1.32.2
       GH_TOKEN: ${{ github.token }}
@@ -175,6 +175,7 @@ jobs:
           scanners: vuln,secret,misconfig
           severity: HIGH,CRITICAL
           ignore-unfixed: true
+          trivyignores: .trivyignore.yaml
           exit-code: '1'
 
       - name: Scan release candidate container
@@ -184,6 +185,7 @@ jobs:
           scanners: vuln,secret,misconfig
           severity: HIGH,CRITICAL
           ignore-unfixed: true
+          trivyignores: .trivyignore.yaml
           exit-code: '1'
 
       - name: Generate image SPDX SBOM

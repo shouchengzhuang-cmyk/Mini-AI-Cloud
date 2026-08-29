@@ -2,28 +2,47 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
 from sqlalchemy import func, select, update
 
+from api.schemas.accelerators import AcceleratorRequest
 from core.database import Database
-from core.enums import RuntimeType, TaskStatus, WorkerStatus
+from core.enums import (
+    AcceleratorKind,
+    AcceleratorSelectionPolicy,
+    AcceleratorVendor,
+    ModelAvailabilityStatus,
+    RuntimeType,
+    TaskStatus,
+    WorkerStatus,
+)
 from core.rbac import ProjectStatus
+from core.runtime_profiles import RuntimeProfileCatalog, runtime_profile_binding_id
+from models.admission import AdmissionEvent
 from models.identity import Project
-from models.scheduling import PlacementAttempt
+from models.model_variant import LogicalModel, ModelVariant
+from models.scheduling import PlacementAttempt, ReservationGPUDevice, ResourceReservation
+from models.service import ServiceReplica, ServingRuntime
 from models.task import Task
 from models.usage import ProjectQuotaState, TaskExecution
 from models.worker import Worker
+from repositories.admission import AdmissionRepository
 from repositories.quotas import QuotaRepository
+from repositories.reservations import ReservationRepository
 from repositories.scheduling import PlacementConflict, SchedulingRepository
+from repositories.services import ServiceRepository
 from repositories.tasks import TaskRepository
 from repositories.workers import WorkerRepository
+from scheduler.admission import AdmissionRequest
 from scheduler.global_scheduler import GlobalScheduler
 
 pytestmark = pytest.mark.integration
 
 LEGACY_PROJECT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+REPOSITORY_ROOT = Path(__file__).parents[2]
 
 
 def _scheduler(database: Database, *, batch_size: int = 16) -> GlobalScheduler:
@@ -37,6 +56,9 @@ def _scheduler(database: Database, *, batch_size: int = 16) -> GlobalScheduler:
         memory_price_per_gb_hour=0.005,
         gpu_price_per_hour=1.0,
         batch_size=batch_size,
+        runtime_profile_catalog=RuntimeProfileCatalog.from_path(
+            REPOSITORY_ROOT / "runtime_profiles/manifest.json"
+        ),
     )
 
 
@@ -288,6 +310,353 @@ async def test_authoritative_placement_refreshes_worker_fence_from_database(
                 memory_price_per_gb_hour=0.005,
                 gpu_price_per_hour=1.0,
             )
+
+
+async def test_ascend_batch_uses_typed_quota_without_database_device_binding(
+    database: Database,
+) -> None:
+    catalog = RuntimeProfileCatalog.from_path(REPOSITORY_ROOT / "runtime_profiles/manifest.json")
+    entry = next(
+        item for item in catalog.manifest.profiles if item.identity == "ascend-vllm-k8s-a2@2.0.0"
+    )
+    binding_id = runtime_profile_binding_id(
+        profile_id=entry.profile_id,
+        profile_version=entry.profile_version,
+        semantic_digest=entry.semantic_digest,
+    )
+    async with database.session() as session, session.begin():
+        worker = await WorkerRepository.register(
+            session,
+            worker_id="ascend-batch-worker",
+            hostname="ascend-batch-worker.test",
+            concurrency=2,
+            cpu_count=8,
+            memory_total_mb=65_536,
+            docker_version=None,
+            labels={},
+            gpu_count=2,
+            gpu_model="Atlas A2",
+            gpu_memory_mb=128_000,
+            runtime_types=["kubernetes"],
+        )
+        await session.flush()
+        await WorkerRepository.replace_gpu_inventory(
+            session,
+            worker_id=worker.id,
+            worker_session_id=worker.worker_session_id,
+            devices=[
+                {
+                    "uuid": f"ASCEND-910B-{index}",
+                    "index": index,
+                    "vendor": "huawei-ascend",
+                    "accelerator_kind": "npu",
+                    "model": "Atlas A2",
+                    "memory_total_mb": 64_000,
+                    "memory_free_mb": 63_000,
+                    "compute_arch": "Ascend910B",
+                    "runtime_profile_ids": [binding_id],
+                    "capabilities": ["bfloat16", "streaming"],
+                    "kubernetes_resource_name": "huawei.com/Ascend910",
+                }
+                for index in range(2)
+            ],
+        )
+        await QuotaRepository.initialize(session, project_id=LEGACY_PROJECT_ID)
+        await QuotaRepository.replace(
+            session,
+            project_id=LEGACY_PROJECT_ID,
+            max_queued_tasks=None,
+            max_running_tasks=None,
+            max_cpu_millicores=None,
+            max_memory_mb=None,
+            max_gpus=None,
+            max_services=None,
+            max_service_replicas=None,
+            max_artifact_bytes=None,
+            daily_cost_limit=None,
+            max_nvidia_gpus=0,
+            max_ascend_npus=None,
+        )
+        accelerator = AcceleratorRequest.model_validate(
+            {
+                "count": 2,
+                "allowed_vendors": ["huawei-ascend"],
+                "allowed_kinds": ["npu"],
+                "allowed_models": ["Atlas A2"],
+                "runtime_profile": "ascend-vllm-k8s-a2",
+                "selection_policy": "ascend-only",
+            }
+        )
+        task = await TaskRepository.create_queued(
+            session,
+            image="python:3.12-slim",
+            command=["python", "-c", "print('ascend')"],
+            environment={},
+            timeout_seconds=60,
+            max_retries=0,
+            cpu_limit=1.0,
+            memory_limit_mb=1_024,
+            labels={},
+            network_enabled=False,
+            gpu_count=2,
+            gpu_memory_mb=32_000,
+            accelerator_request_json=accelerator.model_dump(mode="json"),
+            runtime_type=RuntimeType.KUBERNETES.value,
+            priority=50,
+            idempotency_key=None,
+            request_hash=None,
+            project_id=LEGACY_PROJECT_ID,
+        )
+        task_id = task.id
+
+    result = await _scheduler(database).run_once()
+
+    assert result.placed is True
+    async with database.session() as session:
+        loaded_task = await TaskRepository.get(session, task_id)
+        reservation = await session.scalar(
+            select(ResourceReservation).where(ResourceReservation.task_id == task_id)
+        )
+        binding_count = int(await session.scalar(select(func.count(ReservationGPUDevice.id))) or 0)
+        state = await session.get(ProjectQuotaState, LEGACY_PROJECT_ID)
+        events = list(
+            await session.scalars(
+                select(AdmissionEvent).where(AdmissionEvent.workload_id == task_id)
+            )
+        )
+    assert loaded_task is not None and loaded_task.selected_vendor == "huawei-ascend"
+    assert loaded_task.runtime_profile_version == "2.0.0"
+    assert loaded_task.gpu_device_ids == []
+    assert reservation is not None
+    assert reservation.allocation_authority == "kubernetes_device_plugin"
+    assert reservation.requested_vendor == "huawei-ascend"
+    assert binding_count == 0
+    assert state is not None and state.reserved_ascend_npus == 2
+    assert state.reserved_nvidia_gpus == 0
+    assert [event.outcome for event in events] == ["admitted"]
+
+    async with database.session() as session, session.begin():
+        blocked_task = await TaskRepository.create_queued(
+            session,
+            image="python:3.12-slim",
+            command=["python", "-c", "print('blocked ascend')"],
+            environment={},
+            timeout_seconds=60,
+            max_retries=0,
+            cpu_limit=1.0,
+            memory_limit_mb=1_024,
+            labels={},
+            network_enabled=False,
+            gpu_count=2,
+            gpu_memory_mb=32_000,
+            accelerator_request_json=accelerator.model_dump(mode="json"),
+            runtime_type=RuntimeType.KUBERNETES.value,
+            priority=50,
+            idempotency_key=None,
+            request_hash=None,
+            project_id=LEGACY_PROJECT_ID,
+        )
+        blocked_task_id = blocked_task.id
+
+    blocked_result = await _scheduler(database).run_once()
+
+    assert blocked_result.task_id == blocked_task_id
+    assert blocked_result.placed is False
+    assert blocked_result.reason == "ascend_capacity_unavailable"
+    async with database.session() as session:
+        blocked_events = list(
+            await session.scalars(
+                select(AdmissionEvent).where(AdmissionEvent.workload_id == blocked_task_id)
+            )
+        )
+    assert [event.outcome for event in blocked_events] == ["rejected"]
+
+    async with database.session() as session, session.begin():
+        locked_task = await TaskRepository.get(session, task_id, for_update=True)
+        assert locked_task is not None and locked_task.execution_id is not None
+        assert await ReservationRepository.release_and_settle(
+            session,
+            task=locked_task,
+            execution_id=locked_task.execution_id,
+            final_status=TaskStatus.SUCCEEDED.value,
+            now=datetime.now(UTC),
+            release_reason="test_terminal",
+        )
+    async with database.session() as session:
+        released_state = await session.get(ProjectQuotaState, LEGACY_PROJECT_ID)
+    assert released_state is not None
+    assert released_state.reserved_ascend_npus == 0
+    assert released_state.reserved_nvidia_gpus == 0
+
+
+async def test_logical_service_admission_pins_variant_and_replica_snapshot(
+    database: Database,
+) -> None:
+    catalog = RuntimeProfileCatalog.from_path(REPOSITORY_ROOT / "runtime_profiles/manifest.json")
+    entry = next(
+        item for item in catalog.manifest.profiles if item.identity == "ascend-vllm-k8s-a2@2.0.0"
+    )
+    profile = catalog.load_exact(
+        profile_id=entry.profile_id,
+        profile_version=entry.profile_version,
+        semantic_digest=entry.semantic_digest,
+    )
+    service_id = uuid.uuid4()
+    logical_model_id = uuid.uuid4()
+    variant_id = uuid.uuid4()
+    async with database.session() as session, session.begin():
+        worker = await WorkerRepository.register(
+            session,
+            worker_id="ascend-serving-worker",
+            hostname="ascend-serving-worker.test",
+            concurrency=2,
+            cpu_count=8,
+            memory_total_mb=65_536,
+            docker_version=None,
+            labels={},
+            gpu_count=1,
+            gpu_model="Atlas A2",
+            gpu_memory_mb=64_000,
+            runtime_types=["kubernetes"],
+        )
+        await session.flush()
+        await WorkerRepository.replace_gpu_inventory(
+            session,
+            worker_id=worker.id,
+            worker_session_id=worker.worker_session_id,
+            devices=[
+                {
+                    "uuid": "ASCEND-SERVING-0",
+                    "index": 0,
+                    "vendor": "huawei-ascend",
+                    "accelerator_kind": "npu",
+                    "model": "Atlas A2",
+                    "memory_total_mb": 64_000,
+                    "memory_free_mb": 63_000,
+                    "compute_arch": "Ascend910B",
+                    "runtime_profile_ids": [
+                        runtime_profile_binding_id(
+                            profile_id=entry.profile_id,
+                            profile_version=entry.profile_version,
+                            semantic_digest=entry.semantic_digest,
+                        )
+                    ],
+                    "capabilities": ["bfloat16", "streaming"],
+                    "kubernetes_resource_name": profile.kubernetes.resource_name,
+                }
+            ],
+        )
+        await QuotaRepository.initialize(session, project_id=LEGACY_PROJECT_ID)
+        await QuotaRepository.replace(
+            session,
+            project_id=LEGACY_PROJECT_ID,
+            max_queued_tasks=None,
+            max_running_tasks=None,
+            max_cpu_millicores=None,
+            max_memory_mb=None,
+            max_gpus=1,
+            max_services=1,
+            max_service_replicas=1,
+            max_artifact_bytes=None,
+            daily_cost_limit=None,
+            max_nvidia_gpus=0,
+            max_ascend_npus=1,
+        )
+        session.add(
+            LogicalModel(
+                id=logical_model_id,
+                project_id=LEGACY_PROJECT_ID,
+                name="logical-chat",
+                public_name="logical-chat",
+                status=ModelAvailabilityStatus.READY,
+            )
+        )
+        session.add(
+            ModelVariant(
+                id=variant_id,
+                logical_model_id=logical_model_id,
+                name="ascend-a2",
+                vendor=AcceleratorVendor.HUAWEI_ASCEND,
+                kind=AcceleratorKind.NPU,
+                runtime_profile_id=entry.profile_id,
+                runtime_profile_version=entry.profile_version,
+                runtime_profile_digest=entry.semantic_digest,
+                artifact_source="org/physical-ascend-model",
+                artifact_revision="revision-1",
+                artifact_digest="sha256:" + "a" * 64,
+                architecture="test-architecture",
+                dtype="bfloat16",
+                status=ModelAvailabilityStatus.READY,
+            )
+        )
+        await session.flush()
+        result = await AdmissionRepository.admit_logical_model_service(
+            session,
+            catalog=catalog,
+            project_id=LEGACY_PROJECT_ID,
+            service_id=service_id,
+            logical_model_id=logical_model_id,
+            request=AdmissionRequest(
+                count=1,
+                allowed_vendors=frozenset({AcceleratorVendor.HUAWEI_ASCEND}),
+                allowed_kinds=frozenset({AcceleratorKind.NPU}),
+                runtime_profile_id=entry.profile_id,
+                model_variant_id=str(variant_id),
+                selection_policy=AcceleratorSelectionPolicy.ASCEND_ONLY,
+            ),
+            minimum_memory_mb=32_000,
+            desired_replicas=1,
+            requested_dtype="bfloat16",
+        )
+        assert result.snapshot is not None
+        snapshot = result.snapshot
+        service = await ServiceRepository.create(
+            session,
+            service_id=service_id,
+            project_id=LEGACY_PROJECT_ID,
+            name="logical-chat-service",
+            model=snapshot.artifact_source,
+            model_revision=snapshot.artifact_revision,
+            runtime=ServingRuntime.VLLM,
+            runtime_type=RuntimeType.KUBERNETES,
+            image=profile.image.reference,
+            cpu_millicores=1_000,
+            memory_mb=4_096,
+            gpu_count=1,
+            gpu_memory_mb=32_000,
+            desired_replicas=1,
+            logical_model_id=snapshot.logical_model_id,
+            model_variant_id=snapshot.model_variant_id,
+            selected_vendor=snapshot.vendor,
+            selected_kind=snapshot.kind.value,
+            selected_model=snapshot.selected_model,
+            runtime_profile_id=snapshot.runtime_profile_id,
+            runtime_profile_version=snapshot.runtime_profile_version,
+            runtime_profile_digest=snapshot.runtime_profile_digest,
+            allocation_authority=snapshot.allocation_authority.value,
+            accelerator_resource_name=snapshot.accelerator_resource_name,
+            selection_policy=snapshot.selection_policy.value,
+            eligible_node_names=snapshot.eligible_node_names,
+        )
+        await ServiceRepository.reconcile_locked(session, service)
+
+    async with database.session() as session:
+        replica = await session.scalar(
+            select(ServiceReplica).where(ServiceReplica.service_id == service_id)
+        )
+        state = await session.get(ProjectQuotaState, LEGACY_PROJECT_ID)
+        events = list(
+            await session.scalars(
+                select(AdmissionEvent).where(AdmissionEvent.workload_id == service_id)
+            )
+        )
+    assert replica is not None
+    assert replica.model_variant_id == variant_id
+    assert replica.selected_vendor == "huawei-ascend"
+    assert replica.runtime_profile_digest == entry.semantic_digest
+    assert state is not None and state.service_reserved_ascend_npus == 1
+    assert state.service_reserved_nvidia_gpus == 0
+    assert [event.outcome for event in events] == ["admitted"]
 
 
 async def test_placement_conflict_is_recorded_and_does_not_abort_batch(

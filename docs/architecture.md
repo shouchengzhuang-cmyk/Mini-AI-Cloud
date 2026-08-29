@@ -46,7 +46,7 @@ API 可以与后台 controller 同进程运行，也可以通过 `CONTROL_PLANE_
 | 数据 | 权威来源 | 非权威加速层 |
 | --- | --- | --- |
 | Task 状态、当前执行权、lease | PostgreSQL | Redis ready 通知 |
-| 资源 reservation 与 GPU device ownership | PostgreSQL | Worker heartbeat inventory |
+| 资源 reservation、accelerator allocation intent/evidence 与 exact device ownership | PostgreSQL | Worker heartbeat inventory |
 | Project quota 与并发计数 | PostgreSQL 锁内更新 | 无 |
 | Usage/成本 | immutable usage ledger | 聚合查询 |
 | Service desired/actual state、replica lease | PostgreSQL | controller 内存节拍 |
@@ -106,6 +106,18 @@ B reports for B1       -> accepted
 调度成功时，TaskExecution、ResourceReservation、ReservationGPUDevice 与 Worker accounting 在同一事务写入。终态、取消、timeout、lease recovery 和 stale execution 都必须走幂等释放路径。
 
 Worker re-register 不得把旧 execution 已持有的 reservation 清零；它只更新声明的总资源和 inventory，过量占用时进入 draining，由 lease/终态路径负责释放。
+
+Accelerator 发现的 provider、可观测失败语义和 Kubernetes capacity-slot 边界见
+[Accelerator inventory providers](accelerator-inventory.md)。
+
+### Accelerator allocation authority
+
+PostgreSQL 同时保存 accelerator 的请求快照与观测证据，但设备绑定方式由 `allocation_authority` 区分：
+
+- `control_plane_exact_device`：控制面在调度事务内写入 `ReservationGPUDevice` 链接，并立即保存与链接一致的 device ID 和 vendor 观测值。
+- `kubernetes_device_plugin`：控制面只保存 vendor/kind/profile 请求，不创建 exact-device 链接；只有 Pod 或 device plugin 报告后才能原子写入观测到的 device IDs。
+
+请求快照与观测证据同步保存在 reservation 和 execution 上，便于终态后追溯。终态释放会清除 active reservation/device ownership，但不删除 execution 上的历史快照。
 
 ## Runtime abstraction
 
@@ -182,6 +194,8 @@ Task 可通过 `depends_on` 表达同 Project 依赖；依赖未全部成功时�
 - 一个 Task 同一时刻至多一个当前 execution。
 - 旧 `execution_id` 不能续租、追加有效结果或覆盖新执行。
 - 一个 GPU device 同一时刻至多一个 active reservation。
+- exact-device allocation 必须有与请求数量、vendor 一致的具体设备链接和观测 ID。
+- Kubernetes device-plugin allocation 在观测前不得伪造 device ID，且不得持有 exact-device 链接。
 - terminal Task 不应保留 active reservation；释放和 usage settlement 幂等。
 - quota state 不为负，且并发创建不能越过上限。
 - API Key/Secret 明文不得出现在数据库、响应列表、结构化日志或异常文本。

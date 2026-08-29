@@ -13,7 +13,15 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import Select, func, select
 
 from core.database import Database
-from core.enums import ErrorCode, RuntimeType, WorkerStatus
+from core.enums import (
+    AcceleratorKind,
+    AcceleratorSelectionPolicy,
+    AcceleratorVendor,
+    AllocationAuthority,
+    ErrorCode,
+    RuntimeType,
+    WorkerStatus,
+)
 from core.logging import get_logger
 from core.metrics import (
     K8S_SERVING_LAUNCH_FAILURES,
@@ -21,6 +29,11 @@ from core.metrics import (
     K8S_SERVING_PODS,
     K8S_SERVING_RECONCILE_DURATION,
     K8S_SERVING_REPLACEMENTS,
+)
+from core.runtime_profiles import (
+    RuntimeProfile,
+    RuntimeProfileCatalog,
+    RuntimeProfileCompatibilityError,
 )
 from models.service import (
     ModelService,
@@ -42,6 +55,7 @@ from worker.kubernetes_serving_runtime import (
     WORKER_ID_LABEL,
     KubernetesServingHandle,
     KubernetesServingLaunchSpec,
+    KubernetesServingOwnershipError,
     KubernetesServingOwnershipIdentity,
     KubernetesServingRecoveryConflict,
     KubernetesServingRuntime,
@@ -50,6 +64,7 @@ from worker.kubernetes_serving_runtime import (
 
 _BACKOFF_REASON = "KUBERNETES_SERVING_BACKOFF"
 _IMAGE_REQUIRED_REASON = "KUBERNETES_SERVING_IMAGE_REQUIRED"
+_RUNTIME_PROFILE_INVALID_REASON = "KUBERNETES_RUNTIME_PROFILE_INVALID"
 _MAX_ERROR_MESSAGE_BYTES = 4096
 _MAX_BACKOFF_SECONDS = 300.0
 _MAX_RECOVERY_CONFLICT_WARNINGS = 20
@@ -97,6 +112,10 @@ class KubernetesReplicaClaim:
     cpu_millicores: int
     memory_mb: int
     claimed_at: datetime
+    eligible_node_names: tuple[str, ...] = ()
+    accelerator_count: int = 0
+    tensor_parallel_size: int = 1
+    runtime_profile: RuntimeProfile | None = None
     replacement_reason: str | None = None
 
 
@@ -123,10 +142,13 @@ class _ManagedReplica:
     expected_stop: bool = False
     stop_requested_at: datetime | None = None
     metric_state: str = "unknown"
+    quarantined: bool = False
+    quarantine_error_code: str | None = None
+    quarantine_error_message: str | None = None
 
 
 class KubernetesReplicaRuntimeController:
-    """Converge fenced Fake service replicas onto Kubernetes Pods.
+    """Converge fenced profile-backed and explicitly enabled Fake replicas onto Pods.
 
     The controller uses a stable virtual Worker id and a process-scoped Worker
     session.  PostgreSQL remains the ownership authority; Kubernetes labels are
@@ -143,6 +165,7 @@ class KubernetesReplicaRuntimeController:
         app_env: str,
         cluster_id: str,
         image: str | None,
+        runtime_profile_catalog: RuntimeProfileCatalog | None = None,
         fake_enabled: bool = False,
         worker_id: str | None = None,
         batch_size: int = 10,
@@ -155,10 +178,8 @@ class KubernetesReplicaRuntimeController:
         fake_startup_delay_seconds: float = 0.0,
         fake_chunk_delay_seconds: float = 0.0,
     ) -> None:
-        if app_env not in {"development", "test"}:
+        if fake_enabled and app_env not in {"development", "test"}:
             raise ValueError("Kubernetes Fake serving is prohibited outside development and test")
-        if not fake_enabled:
-            raise ValueError("Kubernetes Fake serving requires explicit opt-in")
         resolved_cluster_id = cluster_id.strip()
         if not _KUBERNETES_LABEL_VALUE.fullmatch(resolved_cluster_id):
             raise ValueError("cluster_id must be a Kubernetes label value")
@@ -184,6 +205,8 @@ class KubernetesReplicaRuntimeController:
         self.runtime = runtime
         self.cluster_id = resolved_cluster_id
         self.default_image = image.strip() if image is not None and image.strip() else None
+        self.runtime_profile_catalog = runtime_profile_catalog
+        self.fake_enabled = fake_enabled
         self.worker_id = resolved_worker_id
         self.worker_session_id = uuid.uuid4()
         self.batch_size = batch_size
@@ -196,6 +219,9 @@ class KubernetesReplicaRuntimeController:
         self.fake_startup_delay_seconds = fake_startup_delay_seconds
         self.fake_chunk_delay_seconds = fake_chunk_delay_seconds
         self._handles: dict[uuid.UUID, _ManagedReplica] = {}
+        self._quarantined_claims: dict[uuid.UUID, KubernetesReplicaClaim] = {}
+        self._unresolved_recovery_conflicts = False
+        self._recovery_refresh_required = False
         self._cycle_lock = asyncio.Lock()
         self._registered = False
         self._recovered = False
@@ -206,7 +232,7 @@ class KubernetesReplicaRuntimeController:
 
     @property
     def active_pod_count(self) -> int:
-        return len(self._handles)
+        return len(set(self._handles) | set(self._quarantined_claims))
 
     @property
     def admission_ready(self) -> bool:
@@ -216,12 +242,20 @@ class KubernetesReplicaRuntimeController:
             self._admission_ready
             and self._registered
             and self._recovered
+            and not self._unresolved_recovery_conflicts
             and not self._closing
             and not self._closed
         )
 
     @staticmethod
-    def claim_candidates_query(limit: int) -> Select[tuple[ModelService]]:
+    def claim_candidates_query(
+        limit: int,
+        *,
+        fake_enabled: bool = True,
+    ) -> Select[tuple[ModelService]]:
+        supported_runtimes = {ServingRuntime.VLLM}
+        if fake_enabled:
+            supported_runtimes.add(ServingRuntime.FAKE)
         pending_exists = (
             select(ServiceReplica.id)
             .where(
@@ -234,7 +268,7 @@ class KubernetesReplicaRuntimeController:
         return (
             select(ModelService)
             .where(
-                ModelService.runtime == ServingRuntime.FAKE,
+                ModelService.runtime.in_(supported_runtimes),
                 ModelService.runtime_type == RuntimeType.KUBERNETES,
                 ModelService.desired_replicas > 0,
                 pending_exists,
@@ -263,10 +297,11 @@ class KubernetesReplicaRuntimeController:
                 self._recovered = True
                 if not await self._session_is_current():
                     self._handles.clear()
+                    self._quarantined_claims.clear()
                     raise StaleKubernetesServingController(
                         "Worker session changed during Kubernetes serving startup"
                     )
-                self._admission_ready = True
+                self._admission_ready = not self._unresolved_recovery_conflicts
                 return KubernetesRuntimeRunResult(
                     recovered=recovered,
                     orphans_cleaned=orphans_cleaned,
@@ -302,11 +337,26 @@ class KubernetesReplicaRuntimeController:
                     self._recovered = True
                 else:
                     await self._heartbeat_worker()
+                    if self._recovery_refresh_required:
+                        (
+                            recovered,
+                            orphans_cleaned,
+                            recovery_conflicts,
+                        ) = await self._recover_managed_resources()
+                        startup_result = KubernetesRuntimeRunResult(
+                            recovered=recovered,
+                            orphans_cleaned=orphans_cleaned,
+                            recovery_conflicts=recovery_conflicts,
+                        )
 
                 stopped = await self._stop_requested_replicas()
                 ready, failed, inspected_stale = await self._inspect_managed_replicas()
                 lease_stale = await self._renew_active_leases()
-                claims, waiting_backoff = await self._claim_pending_replicas()
+                claims: list[KubernetesReplicaClaim]
+                if self._unresolved_recovery_conflicts:
+                    claims, waiting_backoff = [], 0
+                else:
+                    claims, waiting_backoff = await self._claim_pending_replicas()
                 for claim in claims:
                     if claim.replacement_reason is not None:
                         K8S_SERVING_REPLACEMENTS.labels(reason=claim.replacement_reason).inc()
@@ -358,9 +408,10 @@ class KubernetesReplicaRuntimeController:
                     )
                 if not await self._session_is_current():
                     self._handles.clear()
+                    self._quarantined_claims.clear()
                     self._admission_ready = False
                     return result
-                self._admission_ready = True
+                self._admission_ready = not self._unresolved_recovery_conflicts
                 return result
             except asyncio.CancelledError:
                 self._admission_ready = False
@@ -390,6 +441,7 @@ class KubernetesReplicaRuntimeController:
                         worker_session_id=self.worker_session_id,
                     )
             self._handles.clear()
+            self._quarantined_claims.clear()
             await self.runtime.close()
 
     def _publish_pod_metrics(self) -> None:
@@ -397,6 +449,7 @@ class KubernetesReplicaRuntimeController:
         for item in self._handles.values():
             state = "terminating" if item.expected_stop else item.metric_state
             counts[state] += 1
+        counts["unknown"] += len(set(self._quarantined_claims).difference(self._handles))
         for state in _POD_METRIC_STATES:
             K8S_SERVING_PODS.labels(state=state).set(counts[state])
 
@@ -441,6 +494,7 @@ class KubernetesReplicaRuntimeController:
             )
         if worker is None:
             self._handles.clear()
+            self._quarantined_claims.clear()
             raise StaleKubernetesServingController(
                 "Kubernetes serving Worker session is owned by a newer controller"
             )
@@ -502,7 +556,10 @@ class KubernetesReplicaRuntimeController:
                     select(ServiceReplica, ModelService)
                     .join(ModelService, ModelService.id == ServiceReplica.service_id)
                     .where(
-                        ModelService.runtime == ServingRuntime.FAKE,
+                        ModelService.runtime.in_(
+                            {ServingRuntime.VLLM}
+                            | ({ServingRuntime.FAKE} if self.fake_enabled else set())
+                        ),
                         ModelService.runtime_type == RuntimeType.KUBERNETES,
                         ServiceReplica.worker_id == self.worker_id,
                         ServiceReplica.execution_id.is_not(None),
@@ -522,9 +579,12 @@ class KubernetesReplicaRuntimeController:
             if replica.execution_id is not None
         }
         matched_replica_ids: set[uuid.UUID] = set()
+        quarantined_claims: dict[uuid.UUID, KubernetesReplicaClaim] = {}
+        unresolved_conflicts = False
         for conflict in conflicts:
             ownership = conflict.ownership
             if ownership is None:
+                unresolved_conflicts = True
                 continue
             pair = replicas_by_execution.get(ownership.execution_id)
             if pair is not None and _ownership_matches_replica(
@@ -534,11 +594,48 @@ class KubernetesReplicaRuntimeController:
                 self.worker_id,
                 self.cluster_id,
             ):
-                # The workload contract is unsafe to adopt, but its complete
-                # identity fence proves that this active DB execution still has
-                # a concrete Kubernetes resource. Quarantine it for operator
-                # repair instead of converting uncertainty into deletion/loss.
-                matched_replica_ids.add(pair[0].id)
+                replica, service = pair
+                assert replica.execution_id is not None
+                try:
+                    claim = _claim_from_models(
+                        replica,
+                        service,
+                        self.default_image,
+                        self.runtime_profile_catalog,
+                    )
+                except RuntimeProfileCompatibilityError:
+                    claim = None
+                if claim is None:
+                    claim = KubernetesReplicaClaim(
+                        service_id=service.id,
+                        replica_id=replica.id,
+                        project_id=service.project_id,
+                        generation=replica.generation,
+                        execution_id=replica.execution_id,
+                        image="unavailable",
+                        model=service.model,
+                        cpu_millicores=service.cpu_millicores,
+                        memory_mb=service.memory_mb,
+                        claimed_at=_replica_claimed_at(replica),
+                    )
+                accepted = await self._quarantine_replica_values(
+                    replica_id=replica.id,
+                    generation=replica.generation,
+                    execution_id=replica.execution_id,
+                    error_code=ErrorCode.GPU_ALLOCATION_FAILED.value,
+                    error_message=_bounded_message(
+                        "Kubernetes serving recovery ownership or contract conflict",
+                        conflict.message,
+                    ),
+                )
+                if accepted:
+                    matched_replica_ids.add(replica.id)
+                    quarantined_claims[replica.id] = claim
+                    self._handles.pop(replica.id, None)
+                else:
+                    unresolved_conflicts = True
+                continue
+            unresolved_conflicts = True
         recovered = 0
         orphans_cleaned = 0
         for handle in handles:
@@ -552,6 +649,7 @@ class KubernetesReplicaRuntimeController:
             ):
                 if not await self._force_cleanup_if_current(handle):
                     self._handles.clear()
+                    self._quarantined_claims.clear()
                     raise StaleKubernetesServingController(
                         "Worker session changed during Kubernetes orphan recovery"
                     )
@@ -559,7 +657,95 @@ class KubernetesReplicaRuntimeController:
                 continue
             replica, service = pair
             assert replica.execution_id is not None
-            claim = _claim_from_models(replica, service, self.default_image)
+            if _is_persistently_quarantined(replica):
+                try:
+                    quarantine_claim = _claim_from_models(
+                        replica,
+                        service,
+                        self.default_image,
+                        self.runtime_profile_catalog,
+                    )
+                except RuntimeProfileCompatibilityError:
+                    quarantine_claim = None
+                if quarantine_claim is None:
+                    quarantine_claim = KubernetesReplicaClaim(
+                        service_id=service.id,
+                        replica_id=replica.id,
+                        project_id=service.project_id,
+                        generation=replica.generation,
+                        execution_id=replica.execution_id,
+                        image="unavailable",
+                        model=service.model,
+                        cpu_millicores=service.cpu_millicores,
+                        memory_mb=service.memory_mb,
+                        claimed_at=_replica_claimed_at(replica),
+                    )
+                item = _ManagedReplica(
+                    claim=quarantine_claim,
+                    handle=handle,
+                    startup_deadline=quarantine_claim.claimed_at
+                    + timedelta(seconds=self.startup_timeout_seconds),
+                    published=replica.status
+                    in {
+                        ReplicaStatus.RUNNING,
+                        ReplicaStatus.DRAINING,
+                        ReplicaStatus.STOPPING,
+                    },
+                )
+                self._handles[replica.id] = item
+                outcome = await self._quarantine_managed_replica(
+                    item,
+                    error_code=replica.error_code or ErrorCode.GPU_ALLOCATION_FAILED.value,
+                    error_message=(
+                        replica.error_message
+                        or "Kubernetes serving Pod remains persistently quarantined"
+                    ),
+                )
+                matched_replica_ids.add(replica.id)
+                orphans_cleaned += int(outcome == "failed")
+                continue
+            try:
+                claim = _claim_from_models(
+                    replica,
+                    service,
+                    self.default_image,
+                    self.runtime_profile_catalog,
+                )
+            except RuntimeProfileCompatibilityError as error:
+                self.logger.warning(
+                    "Kubernetes serving replica profile rejected during recovery",
+                    service_id=str(service.id),
+                    replica_id=str(replica.id),
+                    reason=_bounded_message(str(error)),
+                )
+                quarantine_claim = KubernetesReplicaClaim(
+                    service_id=service.id,
+                    replica_id=replica.id,
+                    project_id=service.project_id,
+                    generation=replica.generation,
+                    execution_id=replica.execution_id,
+                    image="unavailable",
+                    model=service.model,
+                    cpu_millicores=service.cpu_millicores,
+                    memory_mb=service.memory_mb,
+                    claimed_at=_replica_claimed_at(replica),
+                )
+                item = _ManagedReplica(
+                    claim=quarantine_claim,
+                    handle=handle,
+                    startup_deadline=quarantine_claim.claimed_at
+                    + timedelta(seconds=self.startup_timeout_seconds),
+                    published=True,
+                )
+                self._handles[replica.id] = item
+                outcome = await self._quarantine_managed_replica(
+                    item,
+                    error_code=_RUNTIME_PROFILE_INVALID_REASON,
+                    error_message=_bounded_message(str(error)),
+                )
+                matched_replica_ids.add(replica.id)
+                orphans_cleaned += int(outcome == "failed")
+                continue
             if claim is None:
                 if not await self._force_cleanup_if_current(handle):
                     raise StaleKubernetesServingController(
@@ -585,6 +771,68 @@ class KubernetesReplicaRuntimeController:
                 )
                 orphans_cleaned += 1
                 continue
+            requires_observed_assignment = claim.runtime_profile is not None and replica.status in {
+                ReplicaStatus.RUNNING,
+                ReplicaStatus.DRAINING,
+            }
+            if requires_observed_assignment and (
+                handle.node_name is None
+                or replica.assigned_node_name is None
+                or handle.node_name != replica.assigned_node_name
+            ):
+                item = _ManagedReplica(
+                    claim=claim,
+                    handle=handle,
+                    startup_deadline=claim.claimed_at
+                    + timedelta(seconds=self.startup_timeout_seconds),
+                    published=True,
+                )
+                self._handles[replica.id] = item
+                outcome = await self._quarantine_managed_replica(
+                    item,
+                    error_code=ErrorCode.GPU_ALLOCATION_FAILED.value,
+                    error_message=(
+                        "Recovered Kubernetes serving Pod assignment is missing or changed"
+                    ),
+                )
+                matched_replica_ids.add(replica.id)
+                orphans_cleaned += int(outcome == "failed")
+                continue
+            if claim.runtime_profile is not None and handle.node_name is not None:
+                try:
+                    assignment_recorded = await self._record_assignment(
+                        claim,
+                        handle.node_name,
+                    )
+                except ValueError as error:
+                    self.logger.warning(
+                        "Kubernetes serving replica assignment rejected during recovery",
+                        service_id=str(service.id),
+                        replica_id=str(replica.id),
+                        reason=_bounded_message(str(error)),
+                    )
+                    item = _ManagedReplica(
+                        claim=claim,
+                        handle=handle,
+                        startup_deadline=claim.claimed_at
+                        + timedelta(seconds=self.startup_timeout_seconds),
+                        published=True,
+                    )
+                    self._handles[replica.id] = item
+                    outcome = await self._quarantine_managed_replica(
+                        item,
+                        error_code=ErrorCode.GPU_ALLOCATION_FAILED.value,
+                        error_message="Kubernetes serving assigned-node snapshot is invalid",
+                    )
+                    matched_replica_ids.add(replica.id)
+                    orphans_cleaned += int(outcome == "failed")
+                    continue
+                if not assignment_recorded:
+                    self._handles.pop(replica.id, None)
+                    self._quarantined_claims.pop(replica.id, None)
+                    raise StaleKubernetesServingController(
+                        "Worker session changed during assignment recovery"
+                    )
             item = _ManagedReplica(
                 claim=claim,
                 handle=handle,
@@ -602,6 +850,7 @@ class KubernetesReplicaRuntimeController:
                 stop_requested_at=None,
             )
             self._handles[replica.id] = item
+            quarantined_claims.pop(replica.id, None)
             matched_replica_ids.add(replica.id)
             recovered += 1
 
@@ -609,7 +858,17 @@ class KubernetesReplicaRuntimeController:
             if replica.id in matched_replica_ids:
                 continue
             assert replica.execution_id is not None
-            claim = _claim_from_models(replica, service, self.default_image)
+            snapshot_error: RuntimeProfileCompatibilityError | None = None
+            try:
+                claim = _claim_from_models(
+                    replica,
+                    service,
+                    self.default_image,
+                    self.runtime_profile_catalog,
+                )
+            except RuntimeProfileCompatibilityError as error:
+                snapshot_error = error
+                claim = None
             if claim is None:
                 claim = KubernetesReplicaClaim(
                     service_id=service.id,
@@ -624,26 +883,43 @@ class KubernetesReplicaRuntimeController:
                     claimed_at=_replica_claimed_at(replica),
                 )
             terminal_status = (
-                ReplicaStatus.STOPPED
-                if replica.status in {ReplicaStatus.DRAINING, ReplicaStatus.STOPPING}
-                else ReplicaStatus.LOST
+                ReplicaStatus.FAILED
+                if snapshot_error is not None
+                else (
+                    ReplicaStatus.STOPPED
+                    if replica.status in {ReplicaStatus.DRAINING, ReplicaStatus.STOPPING}
+                    else ReplicaStatus.LOST
+                )
             )
             await self._mark_terminal(
                 claim,
                 status=terminal_status,
                 error_code=(
-                    None
-                    if terminal_status == ReplicaStatus.STOPPED
-                    else ErrorCode.WORKER_LOST.value
+                    _RUNTIME_PROFILE_INVALID_REASON
+                    if snapshot_error is not None
+                    else (
+                        None
+                        if terminal_status == ReplicaStatus.STOPPED
+                        else ErrorCode.WORKER_LOST.value
+                    )
                 ),
-                error_message="Kubernetes serving controller restarted without a managed Pod",
-                apply_backoff=terminal_status == ReplicaStatus.LOST,
+                error_message=(
+                    _bounded_message(str(snapshot_error))
+                    if snapshot_error is not None
+                    else "Kubernetes serving controller restarted without a managed Pod"
+                ),
+                apply_backoff=terminal_status in {ReplicaStatus.FAILED, ReplicaStatus.LOST},
                 launch_failure=replica.status
                 in {
                     ReplicaStatus.STARTING,
                     ReplicaStatus.LOADING,
                 },
             )
+        for replica_id in set(self._handles).difference(matched_replica_ids):
+            self._handles.pop(replica_id, None)
+        self._quarantined_claims = quarantined_claims
+        self._unresolved_recovery_conflicts = unresolved_conflicts
+        self._recovery_refresh_required = bool(conflicts)
         return recovered, orphans_cleaned, len(conflicts)
 
     def _record_recovery_conflicts(
@@ -671,7 +947,14 @@ class KubernetesReplicaRuntimeController:
         claims: list[KubernetesReplicaClaim] = []
         waiting_backoff = 0
         async with self.database.session() as session, session.begin():
-            services = list(await session.scalars(self.claim_candidates_query(self.batch_size)))
+            services = list(
+                await session.scalars(
+                    self.claim_candidates_query(
+                        self.batch_size,
+                        fake_enabled=self.fake_enabled,
+                    )
+                )
+            )
             if not services:
                 return [], 0
             now = await database_utcnow(session)
@@ -682,8 +965,10 @@ class KubernetesReplicaRuntimeController:
                 if not _retry_is_due(service, now):
                     waiting_backoff += 1
                     continue
-                image = service.image or self.default_image
-                if image is None:
+                if (
+                    service.runtime == ServingRuntime.FAKE
+                    and (service.image or self.default_image) is None
+                ):
                     _record_scheduling_reason(
                         service,
                         reason=_IMAGE_REQUIRED_REASON,
@@ -726,6 +1011,36 @@ class KubernetesReplicaRuntimeController:
                     )
                 )
                 for replica in replicas:
+                    try:
+                        runtime_profile = _runtime_profile_from_replica_snapshot(
+                            replica=replica,
+                            service_runtime=service.runtime,
+                            catalog=self.runtime_profile_catalog,
+                        )
+                        if runtime_profile is not None:
+                            _eligible_node_names_from_replica_snapshot(replica)
+                    except RuntimeProfileCompatibilityError as error:
+                        _fail_pending_replica_snapshot(replica, error=error, now=now)
+                        _record_scheduling_reason(
+                            service,
+                            reason=_RUNTIME_PROFILE_INVALID_REASON,
+                            details={"message": _bounded_message(str(error))},
+                            now=now,
+                        )
+                        continue
+                    image = (
+                        runtime_profile.image.reference
+                        if runtime_profile is not None
+                        else service.image or self.default_image
+                    )
+                    if image is None:
+                        _record_scheduling_reason(
+                            service,
+                            reason=_IMAGE_REQUIRED_REASON,
+                            details={},
+                            now=now,
+                        )
+                        continue
                     execution_id = uuid.uuid4()
                     accepted = await ServiceRepository.bind_replica_execution(
                         session,
@@ -738,18 +1053,30 @@ class KubernetesReplicaRuntimeController:
                     )
                     if accepted:
                         assert replica.started_at is not None
+                        claim = _claim_from_models(
+                            replica,
+                            service,
+                            self.default_image,
+                            self.runtime_profile_catalog,
+                        )
+                        if claim is None:
+                            raise RuntimeError("claimed Kubernetes replica has no launch image")
                         claims.append(
                             KubernetesReplicaClaim(
-                                service_id=service.id,
-                                replica_id=replica.id,
-                                project_id=service.project_id,
-                                generation=service.generation,
-                                execution_id=execution_id,
-                                image=image,
-                                model=service.model,
-                                cpu_millicores=service.cpu_millicores,
-                                memory_mb=service.memory_mb,
-                                claimed_at=_as_utc(replica.started_at),
+                                service_id=claim.service_id,
+                                replica_id=claim.replica_id,
+                                project_id=claim.project_id,
+                                generation=claim.generation,
+                                execution_id=claim.execution_id,
+                                image=claim.image,
+                                model=claim.model,
+                                cpu_millicores=claim.cpu_millicores,
+                                memory_mb=claim.memory_mb,
+                                claimed_at=claim.claimed_at,
+                                accelerator_count=claim.accelerator_count,
+                                tensor_parallel_size=claim.tensor_parallel_size,
+                                runtime_profile=claim.runtime_profile,
+                                eligible_node_names=claim.eligible_node_names,
                                 replacement_reason=_replacement_metric_reason(service, replica),
                             )
                         )
@@ -769,6 +1096,10 @@ class KubernetesReplicaRuntimeController:
             startup_delay_seconds=self.fake_startup_delay_seconds,
             chunk_delay_seconds=self.fake_chunk_delay_seconds,
             container_port=8000,
+            accelerator_count=claim.accelerator_count,
+            tensor_parallel_size=claim.tensor_parallel_size,
+            runtime_profile=claim.runtime_profile,
+            eligible_node_names=claim.eligible_node_names,
         )
         handle: KubernetesServingHandle | None = None
         try:
@@ -826,10 +1157,36 @@ class KubernetesReplicaRuntimeController:
     async def _inspect_managed_replicas(self) -> tuple[int, int, int]:
         ready = failed = stale = 0
         for item in list(self._handles.values()):
+            if item.quarantined:
+                outcome = await self._quarantine_managed_replica(
+                    item,
+                    error_code=(
+                        item.quarantine_error_code or ErrorCode.GPU_ALLOCATION_FAILED.value
+                    ),
+                    error_message=(
+                        item.quarantine_error_message
+                        or "Kubernetes serving Pod remains quarantined"
+                    ),
+                )
+                failed += int(outcome == "failed")
+                stale += int(outcome == "stale")
+                continue
             try:
                 state = await self.runtime.inspect(item.handle)
             except asyncio.CancelledError:
                 raise
+            except KubernetesServingOwnershipError as exc:
+                outcome = await self._quarantine_managed_replica(
+                    item,
+                    error_code=ErrorCode.GPU_ALLOCATION_FAILED.value,
+                    error_message=_bounded_message(
+                        "Kubernetes serving Pod ownership or contract drift",
+                        str(exc),
+                    ),
+                )
+                failed += int(outcome == "failed")
+                stale += int(outcome == "stale")
+                continue
             except Exception as exc:
                 self.logger.warning(
                     "Kubernetes serving resource inspection failed",
@@ -838,7 +1195,26 @@ class KubernetesReplicaRuntimeController:
                 )
                 continue
             item.metric_state = _pod_metric_state(state)
-            outcome = await self._advance_item(item, state)
+            try:
+                outcome = await self._advance_item(item, state)
+            except asyncio.CancelledError:
+                raise
+            except KubernetesServingOwnershipError as exc:
+                outcome = await self._quarantine_managed_replica(
+                    item,
+                    error_code=ErrorCode.GPU_ALLOCATION_FAILED.value,
+                    error_message=_bounded_message(
+                        "Kubernetes serving Pod cleanup ownership drift",
+                        str(exc),
+                    ),
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "Kubernetes serving resource state transition deferred",
+                    replica_id=str(item.claim.replica_id),
+                    error_type=type(exc).__name__,
+                )
+                continue
             ready += int(outcome == "ready")
             failed += int(outcome == "failed")
             stale += int(outcome == "stale")
@@ -850,6 +1226,31 @@ class KubernetesReplicaRuntimeController:
         state: KubernetesServingState,
     ) -> str:
         claim = item.claim
+        if claim.runtime_profile is not None:
+            if state.node_name is None and state.ready:
+                return await self._quarantine_managed_replica(
+                    item,
+                    error_code=ErrorCode.GPU_ALLOCATION_FAILED.value,
+                    error_message="Ready Kubernetes serving Pod has no assigned node",
+                )
+            if state.node_name is not None:
+                try:
+                    assignment_recorded = await self._record_assignment(
+                        claim,
+                        state.node_name,
+                    )
+                except ValueError as exc:
+                    return await self._quarantine_managed_replica(
+                        item,
+                        error_code=ErrorCode.GPU_ALLOCATION_FAILED.value,
+                        error_message=_bounded_message(
+                            "Kubernetes serving Pod assignment drift",
+                            str(exc),
+                        ),
+                    )
+                if not assignment_recorded:
+                    self._handles.pop(claim.replica_id, None)
+                    return "stale"
         if state.missing:
             status = ReplicaStatus.STOPPED if item.expected_stop else ReplicaStatus.LOST
             if not item.expected_stop and not await self._force_cleanup_if_current(item.handle):
@@ -970,6 +1371,88 @@ class KubernetesReplicaRuntimeController:
             return "failed" if accepted else "stale"
         return "launched"
 
+    async def _record_assignment(
+        self,
+        claim: KubernetesReplicaClaim,
+        node_name: str,
+    ) -> bool:
+        async with self.database.session() as session, session.begin():
+            return await ServiceRepository.record_replica_assignment(
+                session,
+                replica_id=claim.replica_id,
+                generation=claim.generation,
+                execution_id=claim.execution_id,
+                node_name=node_name,
+                worker_id=self.worker_id,
+                worker_session_id=self.worker_session_id,
+            )
+
+    async def _quarantine_managed_replica(
+        self,
+        item: _ManagedReplica,
+        *,
+        error_code: str,
+        error_message: str,
+    ) -> str:
+        cleanup_succeeded = False
+        try:
+            cleanup_succeeded = await self._force_cleanup_if_current(item.handle)
+        except Exception as exc:
+            self.logger.warning(
+                "Kubernetes serving quarantined Pod cleanup deferred",
+                replica_id=str(item.claim.replica_id),
+                error_type=type(exc).__name__,
+            )
+        if cleanup_succeeded:
+            accepted = await self._mark_terminal(
+                item.claim,
+                status=ReplicaStatus.FAILED,
+                error_code=error_code,
+                error_message=error_message,
+                apply_backoff=True,
+                launch_failure=not item.published,
+            )
+            self._handles.pop(item.claim.replica_id, None)
+            self._quarantined_claims.pop(item.claim.replica_id, None)
+            return "failed" if accepted else "stale"
+        accepted = await self._quarantine_replica_values(
+            replica_id=item.claim.replica_id,
+            generation=item.claim.generation,
+            execution_id=item.claim.execution_id,
+            error_code=error_code,
+            error_message=error_message,
+        )
+        if not accepted:
+            self._handles.pop(item.claim.replica_id, None)
+            self._quarantined_claims.pop(item.claim.replica_id, None)
+            return "stale"
+        item.quarantined = True
+        item.published = True
+        item.quarantine_error_code = error_code
+        item.quarantine_error_message = error_message
+        return "quarantined"
+
+    async def _quarantine_replica_values(
+        self,
+        *,
+        replica_id: uuid.UUID,
+        generation: int,
+        execution_id: uuid.UUID,
+        error_code: str,
+        error_message: str,
+    ) -> bool:
+        async with self.database.session() as session, session.begin():
+            return await ServiceRepository.quarantine_replica_runtime(
+                session,
+                replica_id=replica_id,
+                generation=generation,
+                execution_id=execution_id,
+                error_code=error_code,
+                error_message=_bounded_message(error_message),
+                worker_id=self.worker_id,
+                worker_session_id=self.worker_session_id,
+            )
+
     async def _stop_requested_replicas(self) -> int:
         async with self.database.session() as session:
             now = await database_utcnow(session)
@@ -978,7 +1461,10 @@ class KubernetesReplicaRuntimeController:
                     select(ServiceReplica)
                     .join(ModelService, ModelService.id == ServiceReplica.service_id)
                     .where(
-                        ModelService.runtime == ServingRuntime.FAKE,
+                        ModelService.runtime.in_(
+                            {ServingRuntime.VLLM}
+                            | ({ServingRuntime.FAKE} if self.fake_enabled else set())
+                        ),
                         ModelService.runtime_type == RuntimeType.KUBERNETES,
                         ServiceReplica.worker_id == self.worker_id,
                         ServiceReplica.execution_id.is_not(None),
@@ -997,6 +1483,10 @@ class KubernetesReplicaRuntimeController:
             ):
                 continue
             item = self._handles.get(replica.id)
+            if item is not None and item.quarantined:
+                continue
+            if replica.id in self._quarantined_claims:
+                continue
             if item is None:
                 accepted = await self._mark_terminal_values(
                     service_id=replica.service_id,
@@ -1014,8 +1504,30 @@ class KubernetesReplicaRuntimeController:
             if item.expected_stop and not force:
                 continue
             if force:
-                if not await self._force_cleanup_if_current(item.handle):
+                try:
+                    cleanup_succeeded = await self._force_cleanup_if_current(item.handle)
+                except asyncio.CancelledError:
+                    raise
+                except KubernetesServingOwnershipError as exc:
+                    await self._quarantine_managed_replica(
+                        item,
+                        error_code=ErrorCode.GPU_ALLOCATION_FAILED.value,
+                        error_message=_bounded_message(
+                            "Kubernetes serving Pod force-cleanup ownership drift",
+                            str(exc),
+                        ),
+                    )
+                    continue
+                except Exception as exc:
+                    self.logger.warning(
+                        "Kubernetes serving Pod force cleanup deferred",
+                        replica_id=str(replica.id),
+                        error_type=type(exc).__name__,
+                    )
+                    continue
+                if not cleanup_succeeded:
                     self._handles.clear()
+                    self._quarantined_claims.clear()
                     raise StaleKubernetesServingController(
                         "Worker session changed before Kubernetes Pod force cleanup"
                     )
@@ -1032,8 +1544,30 @@ class KubernetesReplicaRuntimeController:
                 self._handles.pop(replica.id, None)
                 stopped += int(accepted)
             else:
-                if not await self._request_stop_if_current(item.handle):
+                try:
+                    stop_requested = await self._request_stop_if_current(item.handle)
+                except asyncio.CancelledError:
+                    raise
+                except KubernetesServingOwnershipError as exc:
+                    await self._quarantine_managed_replica(
+                        item,
+                        error_code=ErrorCode.GPU_ALLOCATION_FAILED.value,
+                        error_message=_bounded_message(
+                            "Kubernetes serving Pod drain ownership drift",
+                            str(exc),
+                        ),
+                    )
+                    continue
+                except Exception as exc:
+                    self.logger.warning(
+                        "Kubernetes serving Pod drain request deferred",
+                        replica_id=str(replica.id),
+                        error_type=type(exc).__name__,
+                    )
+                    continue
+                if not stop_requested:
                     self._handles.clear()
+                    self._quarantined_claims.clear()
                     raise StaleKubernetesServingController(
                         "Worker session changed before Kubernetes Pod drain"
                     )
@@ -1059,13 +1593,15 @@ class KubernetesReplicaRuntimeController:
         )
 
     async def _renew_active_leases(self) -> int:
-        if not self._handles:
+        if not self._handles and not self._quarantined_claims:
             return 0
         stale: list[uuid.UUID] = []
         async with self.database.session() as session, session.begin():
             now = await database_utcnow(session)
             lease_expires_at = now + timedelta(seconds=self.lease_seconds)
             for replica_id, item in self._handles.items():
+                if item.quarantined:
+                    continue
                 claim = item.claim
                 renewed = await ServiceRepository.renew_replica_lease(
                     session,
@@ -1082,6 +1618,7 @@ class KubernetesReplicaRuntimeController:
         # session which has already adopted the same Kubernetes resource.
         for replica_id in stale:
             self._handles.pop(replica_id, None)
+            self._quarantined_claims.pop(replica_id, None)
         return len(stale)
 
     async def _publish_loading(self, claim: KubernetesReplicaClaim, endpoint_url: str) -> bool:
@@ -1232,12 +1769,24 @@ def _claim_from_models(
     replica: ServiceReplica,
     service: ModelService,
     default_image: str | None,
+    runtime_profile_catalog: RuntimeProfileCatalog | None,
 ) -> KubernetesReplicaClaim | None:
     if replica.execution_id is None:
         return None
-    image = service.image or default_image
+    runtime_profile = _runtime_profile_from_replica_snapshot(
+        replica=replica,
+        service_runtime=service.runtime,
+        catalog=runtime_profile_catalog,
+    )
+    image = runtime_profile.image.reference if runtime_profile is not None else service.image
+    image = image or default_image
     if image is None:
         return None
+    accelerator_count = service.tensor_parallel_size if runtime_profile is not None else 0
+    tensor_parallel_size = service.tensor_parallel_size if runtime_profile is not None else 1
+    eligible_node_names = (
+        _eligible_node_names_from_replica_snapshot(replica) if runtime_profile is not None else ()
+    )
     return KubernetesReplicaClaim(
         service_id=service.id,
         replica_id=replica.id,
@@ -1249,7 +1798,120 @@ def _claim_from_models(
         cpu_millicores=service.cpu_millicores,
         memory_mb=service.memory_mb,
         claimed_at=_replica_claimed_at(replica),
+        eligible_node_names=eligible_node_names,
+        accelerator_count=accelerator_count,
+        tensor_parallel_size=tensor_parallel_size,
+        runtime_profile=runtime_profile,
     )
+
+
+def _eligible_node_names_from_replica_snapshot(replica: ServiceReplica) -> tuple[str, ...]:
+    raw_names = replica.eligible_node_names
+    if not isinstance(raw_names, list) or not raw_names:
+        raise RuntimeProfileCompatibilityError(
+            "replica eligible-node snapshot is empty; the service must be re-admitted"
+        )
+    if any(not isinstance(value, str) for value in raw_names):
+        raise RuntimeProfileCompatibilityError(
+            "replica eligible-node snapshot contains a non-string value"
+        )
+    names = tuple(raw_names)
+    if names != tuple(sorted(set(names))):
+        raise RuntimeProfileCompatibilityError("replica eligible-node snapshot is not canonical")
+    return names
+
+
+def _runtime_profile_from_replica_snapshot(
+    *,
+    replica: ServiceReplica,
+    service_runtime: ServingRuntime,
+    catalog: RuntimeProfileCatalog | None,
+) -> RuntimeProfile | None:
+    snapshot = {
+        "model_variant_id": replica.model_variant_id,
+        "selected_vendor": replica.selected_vendor,
+        "selected_kind": replica.selected_kind,
+        "selected_model": replica.selected_model,
+        "runtime_profile_id": replica.runtime_profile_id,
+        "runtime_profile_version": replica.runtime_profile_version,
+        "runtime_profile_digest": replica.runtime_profile_digest,
+        "allocation_authority": replica.allocation_authority,
+        "accelerator_resource_name": replica.accelerator_resource_name,
+        "selection_policy": replica.selection_policy,
+    }
+    has_snapshot = any(value is not None for value in snapshot.values())
+    if service_runtime == ServingRuntime.FAKE:
+        if has_snapshot:
+            raise RuntimeProfileCompatibilityError(
+                "Fake Kubernetes replicas must not carry an accelerator snapshot"
+            )
+        return None
+    if service_runtime != ServingRuntime.VLLM:
+        raise RuntimeProfileCompatibilityError(
+            f"unsupported Kubernetes serving runtime: {service_runtime.value}"
+        )
+
+    missing = sorted(
+        name
+        for name, value in snapshot.items()
+        if value is None or (isinstance(value, str) and not value.strip())
+    )
+    if missing:
+        raise RuntimeProfileCompatibilityError(
+            f"incomplete replica accelerator snapshot: {', '.join(missing)}"
+        )
+    if catalog is None:
+        raise RuntimeProfileCompatibilityError("runtime profile catalog is unavailable")
+
+    assert replica.selected_vendor is not None
+    assert replica.selected_kind is not None
+    assert replica.runtime_profile_id is not None
+    assert replica.runtime_profile_version is not None
+    assert replica.runtime_profile_digest is not None
+    assert replica.allocation_authority is not None
+    assert replica.accelerator_resource_name is not None
+    assert replica.selection_policy is not None
+    try:
+        vendor = AcceleratorVendor(replica.selected_vendor)
+        kind = AcceleratorKind(replica.selected_kind)
+        authority = AllocationAuthority(replica.allocation_authority)
+        policy = AcceleratorSelectionPolicy(replica.selection_policy)
+    except ValueError as error:
+        raise RuntimeProfileCompatibilityError(
+            "replica accelerator snapshot contains an unsupported enum value"
+        ) from error
+    if authority != AllocationAuthority.KUBERNETES_DEVICE_PLUGIN:
+        raise RuntimeProfileCompatibilityError(
+            "Kubernetes accelerator launch requires kubernetes_device_plugin authority"
+        )
+    if (
+        policy == AcceleratorSelectionPolicy.NVIDIA_ONLY and vendor != AcceleratorVendor.NVIDIA
+    ) or (
+        policy == AcceleratorSelectionPolicy.ASCEND_ONLY
+        and vendor != AcceleratorVendor.HUAWEI_ASCEND
+    ):
+        raise RuntimeProfileCompatibilityError(
+            "replica selection policy does not match the selected vendor"
+        )
+
+    profile = catalog.load_exact(
+        profile_id=replica.runtime_profile_id,
+        profile_version=replica.runtime_profile_version,
+        semantic_digest=replica.runtime_profile_digest,
+    )
+    if profile.vendor is not vendor or profile.kind is not kind:
+        raise RuntimeProfileCompatibilityError(
+            "replica vendor/kind does not match the runtime profile"
+        )
+    if profile.allocation_authority is not authority:
+        raise RuntimeProfileCompatibilityError(
+            "replica allocation authority does not match the runtime profile"
+        )
+    if profile.kubernetes.resource_name != replica.accelerator_resource_name:
+        raise RuntimeProfileCompatibilityError(
+            "replica accelerator resource does not match the runtime profile"
+        )
+    return profile
 
 
 def _replica_claimed_at(replica: ServiceReplica) -> datetime:
@@ -1376,6 +2038,23 @@ def _record_scheduling_reason(
     service.version += 1
 
 
+def _fail_pending_replica_snapshot(
+    replica: ServiceReplica,
+    *,
+    error: RuntimeProfileCompatibilityError,
+    now: datetime,
+) -> None:
+    replica.status = ReplicaStatus.FAILED
+    replica.health = ReplicaHealth.UNHEALTHY
+    replica.error_code = _RUNTIME_PROFILE_INVALID_REASON
+    replica.error_message = _bounded_message(str(error))
+    replica.endpoint_url = None
+    replica.lease_expires_at = None
+    replica.stopped_at = now
+    replica.updated_at = now
+    replica.version += 1
+
+
 def _bounded_message(*parts: str) -> str:
     normalized = (
         ": ".join(" ".join(part.replace("\x00", " ").split()) for part in parts if part.strip())
@@ -1417,6 +2096,18 @@ def _replacement_metric_reason(service: ModelService, replica: ServiceReplica) -
     if _backoff_failure_count(service) > 0:
         return "failure_backoff"
     return "terminal_replica"
+
+
+def _is_persistently_quarantined(replica: ServiceReplica) -> bool:
+    """Recognize a fenced runtime quarantine without confusing unclaimed rows."""
+
+    return (
+        replica.execution_id is not None
+        and replica.lease_expires_at is None
+        and replica.health == ReplicaHealth.UNHEALTHY
+        and replica.endpoint_url is None
+        and replica.error_code is not None
+    )
 
 
 def _failure_metric_reason(error_code: str | None, status: ReplicaStatus) -> str:

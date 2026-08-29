@@ -1,5 +1,6 @@
 import json
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated
 
 from pydantic import BeforeValidator, Field, model_validator
@@ -8,6 +9,9 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 _LOCAL_API_KEY_PEPPER = "local-development-api-key-pepper-change-me"
 _LOCAL_WORKER_AUTH_TOKEN = "local-development-worker-token"
 _PRODUCTION_CREDENTIAL_MIN_BYTES = 32
+_DEFAULT_RUNTIME_PROFILE_MANIFEST = str(
+    Path(__file__).parents[1] / "runtime_profiles" / "manifest.json"
+)
 
 
 def _parse_labels(value: object) -> dict[str, str]:
@@ -73,6 +77,7 @@ class Settings(BaseSettings):
     worker_labels: Labels = Field(default_factory=lambda: {"runtime": "docker", "region": "local"})
     worker_runtime_types: str = "docker"
     worker_node_name: str | None = None
+    accelerator_inventory_providers: str = "nvidia-smi"
     fake_gpu_count: int = Field(default=0, ge=0, le=64)
     fake_gpu_model: str = "FAKE-A100"
     fake_gpu_memory_mb: int = Field(default=40_960, ge=1)
@@ -141,6 +146,7 @@ class Settings(BaseSettings):
     kubernetes_kubeconfig: str | None = None
     kubernetes_in_cluster: bool = False
     kubernetes_cleanup_grace_seconds: int = Field(default=30, ge=0, le=3600)
+    runtime_profile_manifest_path: str = _DEFAULT_RUNTIME_PROFILE_MANIFEST
 
     kubernetes_serving_enabled: bool = False
     kubernetes_serving_fake_enabled: bool = False
@@ -181,6 +187,9 @@ class Settings(BaseSettings):
     service_proxy_connect_timeout: float = Field(default=5.0, gt=0)
     service_proxy_first_token_timeout: float = Field(default=30.0, gt=0)
     service_proxy_timeout: float = Field(default=120.0, gt=0)
+    service_proxy_fallback_attempts: int = Field(default=1, ge=0, le=1)
+    service_vendor_circuit_failure_threshold: int = Field(default=2, ge=1, le=100)
+    service_vendor_circuit_cooldown_seconds: int = Field(default=30, ge=1, le=3600)
     service_proxy_max_response_bytes: int = Field(
         default=16 * 1024 * 1024,
         ge=1024,
@@ -238,6 +247,26 @@ class Settings(BaseSettings):
             raise ValueError("Kubernetes fake serving must remain disabled in production")
         if self.fake_gpu_count and self.app_env == "production":
             raise ValueError("FAKE_GPU_COUNT must be zero in production")
+        inventory_providers = tuple(
+            name.strip() for name in self.accelerator_inventory_providers.split(",") if name.strip()
+        )
+        allowed_inventory_providers = {
+            "nvidia-smi",
+            "ascend-npu-smi",
+            "kubernetes-node",
+            "fake",
+            "none",
+        }
+        if not inventory_providers or not set(inventory_providers) <= allowed_inventory_providers:
+            raise ValueError("ACCELERATOR_INVENTORY_PROVIDERS contains an unsupported provider")
+        if len(inventory_providers) != len(set(inventory_providers)):
+            raise ValueError("ACCELERATOR_INVENTORY_PROVIDERS must not contain duplicates")
+        if ({"fake", "none"} & set(inventory_providers)) and len(inventory_providers) != 1:
+            raise ValueError(
+                "ACCELERATOR_INVENTORY_PROVIDERS fake and none values must be exclusive"
+            )
+        if self.app_env == "production" and "fake" in inventory_providers:
+            raise ValueError("fake accelerator inventory is forbidden in production")
         runtime_types = {
             item.strip() for item in self.worker_runtime_types.split(",") if item.strip()
         }

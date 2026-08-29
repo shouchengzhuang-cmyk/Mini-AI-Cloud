@@ -10,20 +10,32 @@ import pytest
 from kubernetes_asyncio.client.exceptions import ApiException
 
 from core.enums import ErrorCategory, ErrorCode
+from core.runtime_profiles import RuntimeProfileCatalog
 from worker.kubernetes_runtime import (
+    ACCELERATOR_COUNT_ANNOTATION,
+    ACCELERATOR_KIND_LABEL,
+    ACCELERATOR_RESOURCE_ANNOTATION,
+    ACCELERATOR_VENDOR_LABEL,
+    ALLOCATION_AUTHORITY_ANNOTATION,
     EXECUTION_ID_LABEL,
     MANAGED_LABEL,
     NETWORK_POLICY_RESOURCE_KIND,
     PROJECT_ID_LABEL,
     RESOURCE_KIND_LABEL,
+    RUNTIME_PROFILE_DIGEST_ANNOTATION,
+    RUNTIME_PROFILE_ID_LABEL,
+    RUNTIME_PROFILE_VERSION_LABEL,
     TASK_ID_LABEL,
     WORKER_ID_LABEL,
+    KubernetesGpuUnavailable,
     KubernetesImagePullFailed,
     KubernetesOomKilled,
     KubernetesRuntime,
     KubernetesRuntimeError,
 )
 from worker.runtime import ComputeRuntime, ExecutionSpec, RuntimeHandle, RuntimeMount
+
+REPOSITORY_ROOT = Path(__file__).parents[2]
 
 
 def _spec() -> ExecutionSpec:
@@ -72,7 +84,12 @@ def _fake_networking_api() -> SimpleNamespace:
     )
 
 
-def _runtime(api: object, *, networking_api: object | None = None) -> KubernetesRuntime:
+def _runtime(
+    api: object,
+    *,
+    networking_api: object | None = None,
+    runtime_profile_catalog: RuntimeProfileCatalog | None = None,
+) -> KubernetesRuntime:
     return KubernetesRuntime(
         namespace="runtime-tests",
         node_name="gpu-node-a",
@@ -80,6 +97,7 @@ def _runtime(api: object, *, networking_api: object | None = None) -> Kubernetes
         poll_interval=0.001,
         api=api,
         networking_api=networking_api or _fake_networking_api(),
+        runtime_profile_catalog=runtime_profile_catalog,
     )
 
 
@@ -151,6 +169,70 @@ async def test_prepare_builds_fenced_pod_with_resources_node_and_deadline() -> N
     assert handle.runtime_type == "kubernetes"
     assert handle.resource_kind == "pod"
     assert handle.object_id == expected_name
+
+
+async def test_prepare_renders_ascend_resource_from_exact_runtime_profile() -> None:
+    api = SimpleNamespace(create_namespaced_pod=AsyncMock())
+    api.create_namespaced_pod.side_effect = lambda *, namespace, body: body
+    catalog = RuntimeProfileCatalog.from_path(REPOSITORY_ROOT / "runtime_profiles/manifest.json")
+    entry = next(
+        profile
+        for profile in catalog.manifest.profiles
+        if profile.identity == "ascend-vllm-k8s-a2@2.0.0"
+    )
+    spec = replace(
+        _spec(),
+        selected_vendor=entry.vendor.value,
+        selected_kind=entry.kind.value,
+        runtime_profile_id=entry.profile_id,
+        runtime_profile_version=entry.profile_version,
+        runtime_profile_digest=entry.semantic_digest,
+        allocation_authority="kubernetes_device_plugin",
+    )
+
+    await _runtime(api, runtime_profile_catalog=catalog).prepare(spec)
+
+    pod = api.create_namespaced_pod.call_args.kwargs["body"]
+    container = pod.spec.containers[0]
+    assert container.resources.requests["huawei.com/Ascend910"] == "2"
+    assert "nvidia.com/gpu" not in container.resources.requests
+    assert pod.spec.runtime_class_name == "ascend"
+    assert pod.spec.scheduler_name == "volcano"
+    assert pod.spec.node_selector == {"accelerator.mini-ai-cloud/vendor": "huawei-ascend"}
+    assert pod.spec.tolerations[0].key == "huawei.com/Ascend910"
+    assert pod.metadata.labels[ACCELERATOR_VENDOR_LABEL] == "huawei-ascend"
+    assert pod.metadata.labels[ACCELERATOR_KIND_LABEL] == "npu"
+    assert pod.metadata.labels[RUNTIME_PROFILE_ID_LABEL] == entry.profile_id
+    assert pod.metadata.labels[RUNTIME_PROFILE_VERSION_LABEL] == entry.profile_version
+    assert pod.metadata.annotations == {
+        RUNTIME_PROFILE_DIGEST_ANNOTATION: entry.semantic_digest,
+        ACCELERATOR_RESOURCE_ANNOTATION: "huawei.com/Ascend910",
+        ACCELERATOR_COUNT_ANNOTATION: "2",
+        ALLOCATION_AUTHORITY_ANNOTATION: "kubernetes_device_plugin",
+    }
+    visibility = next(item for item in container.env if item.name == "ASCEND_VISIBLE_DEVICES")
+    assert visibility.value_from.field_ref.field_path == (
+        "metadata.annotations['huawei.com/Ascend910']"
+    )
+
+
+def test_vendor_aware_kubernetes_task_fails_closed_on_profile_drift() -> None:
+    catalog = RuntimeProfileCatalog.from_path(REPOSITORY_ROOT / "runtime_profiles/manifest.json")
+    entry = next(
+        profile for profile in catalog.manifest.profiles if profile.vendor.value == "nvidia"
+    )
+    spec = replace(
+        _spec(),
+        selected_vendor=entry.vendor.value,
+        selected_kind=entry.kind.value,
+        runtime_profile_id=entry.profile_id,
+        runtime_profile_version=entry.profile_version,
+        runtime_profile_digest="sha256:" + "0" * 64,
+        allocation_authority="kubernetes_device_plugin",
+    )
+
+    with pytest.raises(KubernetesGpuUnavailable, match="digest"):
+        _runtime(SimpleNamespace(), runtime_profile_catalog=catalog)._build_pod(spec)
 
 
 async def test_prepare_creates_task_scoped_deny_all_policy_before_pod() -> None:

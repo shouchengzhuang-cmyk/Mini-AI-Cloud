@@ -6,7 +6,7 @@
 
 - Python 3.12、FastAPI、PostgreSQL、Redis、Docker Compose、Kubernetes/Kind、Prometheus 和 Grafana 组成单机开发与隔离验收栈。
 - API、worker、scheduler、runtime、serving controller 和 CLI 通过明确的 repository/service 边界协作；Docker 与 Kubernetes runtime 使用同一 execution lifecycle 语义。
-- 当前 release 准备版本是 `0.4.0`；仓库仍保留兼容的 `mini-docker-cloud` CLI 别名。
+- 当前 release 准备版本是 `0.5.0`；仓库仍保留兼容的 `mini-docker-cloud` CLI 别名。
 
 ## Correctness and safety
 
@@ -17,7 +17,7 @@
 
 ## Verified surface
 
-- 当前源码树由 pytest 收集 `609` 个测试；最终 PASS 状态以同一 release SHA 的 `make test-release` 输出和 `build/evidence/<git-sha>/manifest.json` 为准。
+- 当前源码树由 pytest 收集 `935` 个测试；最终 PASS 状态以同一 release SHA 的 `make test-release` 输出和 `build/evidence/<git-sha>/manifest.json` 为准。
 - `make test-release` 串联 lock、Ruff、mypy、evidence schema、Compose config、完整 pytest、wheel 独立安装、非 root container smoke、真实隔离 Kind serving E2E、commit-bound evidence 和 release-preparation bundle。
 - Kind 默认强制刷新远端镜像；显式 `KIND_SERVING_PULL=false` 只允许复用已经存在的固定本地镜像，用于代理抖动后的可审计离线重跑。
 - OpenAPI 与 CLI v1 完整快照、锁定依赖清单、GitHub Action SHA pin、secret pattern scan、CycloneDX SBOM 和容器基线均由 release gate 检查。
@@ -26,6 +26,7 @@
 ## Evidence boundary
 
 - 本地 PostgreSQL、Docker daemon 和单节点 Kind 是真实执行环境，但不是生产 HA 或多物理节点 Kubernetes 证据。
-- 没有运行真实 NVIDIA GPU/vLLM acceptance 时，所有 release manifest 和 release notes 必须保留 `REAL_GPU: NOT_RUN`。
+- NVIDIA + Huawei Ascend 的 Runtime Profile、准入、路由、fallback、circuit 与双后端 benchmark 合同已经实现；A1-A11 及堆叠 PR 处置由 `evidence/m6-release-coverage.json` 机器校验。
+- 真实 NVIDIA GPU/vLLM 与真实 Huawei Ascend/vLLM-Ascend acceptance 都未运行；所有 release manifest 和 release notes 必须保留对应 `REAL_HW_NOT_RUN`。
 - release preparation 明确记录 `NOT_CREATED` 和 `NOT_DEPLOYED`；它不创建 GitHub Release，也不部署服务。
-- 不声称替代 KServe、Volcano、Ray Serve 或托管云平台；[`comparison.md`](comparison.md) 只比较职责边界。
+- 不声称生产 HA、SLA、通用硬件兼容、完整 Kubernetes-native platform，或替代 KServe、Volcano、Ray Serve、托管云平台；[`comparison.md`](comparison.md) 只比较职责边界。

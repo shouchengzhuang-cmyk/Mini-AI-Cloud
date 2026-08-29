@@ -17,6 +17,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
         with:
           enable-cache: true
@@ -35,6 +37,12 @@ jobs:
           grep -Fq "deprecated" <<<"${legacy_output}"
       - name: Validate evidence contract
         run: uv run python scripts/validate_evidence.py
+      - name: Validate runtime profile contracts
+        run: uv run python scripts/validate_runtime_profiles.py
+      - name: Validate NVIDIA runtime contract
+        run: uv run python scripts/validate_nvidia_runtime.py
+      - name: Validate Ascend runtime contract
+        run: uv run python scripts/validate_ascend_runtime.py
       - name: Validate Compose configuration
         run: docker compose config --quiet
       - name: Ruff format
@@ -162,7 +170,11 @@ jobs:
 
           import yaml
 
-          paths = [Path(".github/workflows/ci.yml"), *Path("deploy/kind-serving").glob("*.yaml")]
+          paths = [
+              Path(".github/workflows/ci.yml"),
+              *Path("deploy/kind-serving").glob("*.yaml"),
+              *Path("deploy/nvidia-runtime").glob("*.yaml"),
+          ]
           for path in paths:
               documents = list(yaml.safe_load_all(path.read_text(encoding="utf-8")))
               if not documents or any(document is None for document in documents):
@@ -179,6 +191,8 @@ jobs:
         run: make kind-serving-up
       - name: Run mandatory real Kind serving E2E
         run: make test-kind-serving
+      - name: Run fake device-plugin allocation profile
+        run: make test-nvidia-fake-device-plugin
       - name: Collect credential-safe Kind diagnostics
         if: always()
         run: bash scripts/kind_serving.sh diagnostics

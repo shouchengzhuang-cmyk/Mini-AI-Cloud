@@ -15,6 +15,9 @@ from api.pagination import CursorKey
 from core.enums import (
     ACTIVE_TASK_STATUSES,
     FINAL_TASK_STATUSES,
+    AcceleratorKind,
+    AcceleratorVendor,
+    AllocationAuthority,
     ErrorCategory,
     ErrorCode,
     LogStream,
@@ -186,6 +189,19 @@ def _prepare_for_assignment(task: Task) -> None:
     task.unschedulable_reason = None
 
 
+def _accelerator_request_vendors(
+    request: dict[str, object] | None,
+    *,
+    gpu_count: int,
+) -> tuple[AcceleratorVendor, ...] | None:
+    if gpu_count == 0 or request is None:
+        return None
+    raw_vendors = request.get("allowed_vendors")
+    if not isinstance(raw_vendors, list) or not raw_vendors:
+        return None
+    return tuple(AcceleratorVendor(str(value)) for value in raw_vendors)
+
+
 class TaskRepository:
     @staticmethod
     async def get(
@@ -237,6 +253,7 @@ class TaskRepository:
         labels: dict[str, str],
         network_enabled: bool,
         gpu_count: int,
+        accelerator_request_json: dict[str, object] | None = None,
         idempotency_key: str | None,
         request_hash: str | None,
         project_id: uuid.UUID = LEGACY_PROJECT_ID,
@@ -280,6 +297,10 @@ class TaskRepository:
             cpu_millicores=round(cpu_limit * 1000),
             memory_mb=memory_limit_mb,
             gpu_count=gpu_count,
+            accelerator_vendors=_accelerator_request_vendors(
+                accelerator_request_json,
+                gpu_count=gpu_count,
+            ),
         )
         await QuotaRepository.admit_queued(session, project_id=project_id)
         now = await database_utcnow(session)
@@ -305,6 +326,7 @@ class TaskRepository:
             labels=labels,
             network_enabled=network_enabled,
             gpu_count=gpu_count,
+            accelerator_request_json=accelerator_request_json,
             gpu_memory_mb=gpu_memory_mb,
             gpu_model=gpu_model,
             runtime_type=runtime_type,
@@ -746,6 +768,8 @@ class TaskRepository:
                     GPUDevice.worker_id == worker.id,
                     GPUDevice.health == "healthy",
                     GPUDevice.memory_free_mb >= task.gpu_memory_mb,
+                    GPUDevice.vendor == AcceleratorVendor.NVIDIA.value,
+                    GPUDevice.accelerator_kind == AcceleratorKind.GPU.value,
                     ~GPUDevice.id.in_(allocated_ids),
                 )
                 .order_by(
@@ -795,6 +819,14 @@ class TaskRepository:
             memory_mb=task.memory_limit_mb,
             gpu_count=task.gpu_count,
             gpu_model=task.gpu_model,
+            allocation_authority=AllocationAuthority.CONTROL_PLANE_EXACT_DEVICE.value,
+            requested_vendor=(AcceleratorVendor.NVIDIA.value if task.gpu_count else None),
+            requested_kind=(AcceleratorKind.GPU.value if task.gpu_count else None),
+            observed_device_ids_json=(
+                [device.device_uuid for device in devices] if devices else None
+            ),
+            observed_vendor=(AcceleratorVendor.NVIDIA.value if devices else None),
+            observed_at=(now if devices else None),
             cpu_price_per_hour=Decimal(str(cpu_price_per_hour)),
             memory_price_per_gb_hour=Decimal(str(memory_price_per_gb_hour)),
             gpu_price_per_hour=Decimal(str(gpu_price_per_hour)),
@@ -813,6 +845,14 @@ class TaskRepository:
             memory_mb=task.memory_limit_mb,
             gpu_count=task.gpu_count,
             legacy_unbound=False,
+            allocation_authority=AllocationAuthority.CONTROL_PLANE_EXACT_DEVICE.value,
+            requested_vendor=(AcceleratorVendor.NVIDIA.value if task.gpu_count else None),
+            requested_kind=(AcceleratorKind.GPU.value if task.gpu_count else None),
+            observed_device_ids_json=(
+                [device.device_uuid for device in devices] if devices else None
+            ),
+            observed_vendor=(AcceleratorVendor.NVIDIA.value if devices else None),
+            observed_at=(now if devices else None),
             created_at=now,
         )
         session.add(reservation)
@@ -825,12 +865,15 @@ class TaskRepository:
                     created_at=now,
                 )
             )
+        await session.flush()
+        await ReservationRepository.assert_exact_device_binding(session, reservation)
         await QuotaRepository.reserve_execution(
             session,
             project_id=task.project_id,
             cpu_millicores=task.cpu_millicores,
             memory_mb=task.memory_limit_mb,
             gpu_count=task.gpu_count,
+            accelerator_vendor=(AcceleratorVendor.NVIDIA if task.gpu_count else None),
         )
         OutboxRepository.add(
             session,

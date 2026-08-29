@@ -2,7 +2,7 @@
 
 *An evidence-driven experimental control plane for reliable AI workload scheduling and model serving.*
 
-Python distribution、CLI、Compose project 与默认镜像统一使用 `mini-ai-cloud` / `mini-cloud` 身份；当前准备版本为 `0.4.0`。本分支只完成发布准备，不代表已经创建 GitHub Release 或部署生产。
+Python distribution、CLI、Compose project 与默认镜像统一使用 `mini-ai-cloud` / `mini-cloud` 身份；当前准备版本为 `0.5.0`。本分支只完成发布准备，不代表已经创建 GitHub Release 或部署生产。
 
 Mini AI Cloud 是一个面向 AI 工作负载控制面正确性的轻量级实验平台。它重点研究在并发调度、Worker、Pod、Controller 故障和在线请求缩容时，如何依靠 PostgreSQL 这一状态真相源、lease、execution fencing 与 reconciliation，让任务和模型服务状态收敛。
 
@@ -14,8 +14,9 @@ Mini AI Cloud 是一个面向 AI 工作负载控制面正确性的轻量级实�
 - **Ownership and fencing**：Worker session、lease 和 `execution_id` 如何阻止旧进程继续续租、写回终态或删除新执行的资源。
 - **Failure recovery**：API、Worker、Controller 或 Pod 重启和丢失后，reconciliation 如何从 PostgreSQL desired state 恢复，并隔离单个漂移资源。
 - **Model serving lifecycle**：Replica 如何经过 starting、loading、running、draining，Gateway 如何避开不健康或正在排空的副本，以及活跃 SSE 请求结束后如何完成缩容。
+- **Dual-vendor serving contracts**：NVIDIA 与 Huawei Ascend 的 Runtime Profile、准入、路由、fallback、circuit 与实际物理 variant 用量如何保持可审计；真实双硬件运行仍为 `REAL_HW_NOT_RUN`。
 
-功能存在、自动化测试通过和真实外部运行是三种不同证据。逐项状态见 [验证证据矩阵](docs/verification-matrix.md)，Phase IV-A.1 的实时验收状态见 [Kubernetes Serving 验证报告](docs/verification-report-phase4a-2026-08-24.md)。
+功能存在、自动化测试通过和真实外部运行是三种不同证据。逐项状态见 [验证证据矩阵](docs/verification-matrix.md)，M6 A1–A11 与堆叠 PR 处置见 [M6 发布覆盖表](docs/m6-release-coverage.md)，Phase IV-A.1 的实时验收状态见 [Kubernetes Serving 验证报告](docs/verification-report-phase4a-2026-08-24.md)。
 
 ## 五分钟 Quickstart
 

@@ -1,0 +1,36 @@
+{
+  "metadata": {
+    "name": "dual-stack-node",
+    "uid": "node-uid-1",
+    "labels": {
+      "accelerator.mini-ai-cloud/vendor": "nvidia",
+      "nvidia.com/gpu.product": "NVIDIA-A100-SXM4-40GB",
+      "nvidia.com/gpu.memory": "40960",
+      "nvidia.com/gpu.count": "2",
+      "nvidia.com/gpu.compute.major": "8",
+      "nvidia.com/gpu.sharing-strategy": "none",
+      "nvidia.com/mig.strategy": "none",
+      "node.kubernetes.io/npu.chip.name": "910B3",
+      "mind-cluster/npu-chip-memory": "64G"
+    }
+  },
+  "spec": {
+    "unschedulable": false
+  },
+  "status": {
+    "conditions": [
+      {
+        "type": "Ready",
+        "status": "True"
+      }
+    ],
+    "allocatable": {
+      "cpu": "64",
+      "memory": "512Gi",
+      "nvidia.com/gpu": "2",
+      "huawei.com/Ascend910": "4",
+      "huawei.com/Ascend910-memory": "262144",
+      "huawei.com/Ascend910-Unhealthy": "1"
+    }
+  }
+}

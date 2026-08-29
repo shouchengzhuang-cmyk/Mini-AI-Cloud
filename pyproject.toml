@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mini-ai-cloud"
-version = "0.4.0"
+version = "0.5.0"
 description = "Evidence-driven control plane for reliable AI workload scheduling and serving"
 readme = "README.md"
 license = "MIT"
@@ -56,6 +56,9 @@ Security = "https://github.com/shouchengzhuang-cmyk/Mini-AI-Cloud/security/polic
 
 [tool.hatch.build.targets.wheel]
 packages = ["api", "cli", "core", "models", "repositories", "scheduler", "worker"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"runtime_profiles" = "runtime_profiles"
 
 [tool.ruff]
 target-version = "py312"
