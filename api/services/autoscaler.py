@@ -4,8 +4,9 @@ import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
+from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
 from api.services.gateway import ServiceLoad, ServiceMetricsSource
 from core.database import Database
@@ -68,120 +69,171 @@ class ServiceAutoscaler:
         missing = 0
         cooling_down = 0
         async with self.database.session() as session:
-            candidate_rows = list(
-                (
-                    await session.execute(
-                        select(
-                            ModelService.id,
-                            ModelService.logical_model_id,
-                            ModelService.runtime_type,
-                        )
-                        .where(ModelService.autoscaling_enabled.is_(True))
-                        .order_by(
-                            ModelService.last_autoscale_checked_at.asc().nullsfirst(),
-                            ModelService.id,
-                        )
+            scan_started_at = await database_utcnow(session)
+        cursor: tuple[datetime | None, UUID] | None = None
+        # Keep each candidate snapshot bounded. The fixed scan boundary and the
+        # bounded examined-id set prevent rows updated by this pass from moving
+        # behind the keyset cursor and being selected again.
+        examined_service_ids: set[UUID] = set()
+        while examined < self.batch_size:
+            async with self.database.session() as session:
+                candidate_query = select(
+                    ModelService.id,
+                    ModelService.logical_model_id,
+                    ModelService.runtime_type,
+                    ModelService.last_autoscale_checked_at,
+                ).where(
+                    ModelService.autoscaling_enabled.is_(True),
+                    or_(
+                        ModelService.last_autoscale_checked_at.is_(None),
+                        ModelService.last_autoscale_checked_at <= scan_started_at,
+                    ),
+                )
+                if examined_service_ids:
+                    candidate_query = candidate_query.where(
+                        ModelService.id.not_in(examined_service_ids)
                     )
-                ).all()
-            )
-        for service_id, logical_model_id, runtime_type in candidate_rows:
-            if examined >= self.batch_size:
+                if cursor is not None:
+                    cursor_checked_at, cursor_service_id = cursor
+                    if cursor_checked_at is None:
+                        candidate_query = candidate_query.where(
+                            or_(
+                                and_(
+                                    ModelService.last_autoscale_checked_at.is_(None),
+                                    ModelService.id > cursor_service_id,
+                                ),
+                                ModelService.last_autoscale_checked_at.is_not(None),
+                            )
+                        )
+                    else:
+                        candidate_query = candidate_query.where(
+                            ModelService.last_autoscale_checked_at.is_not(None),
+                            or_(
+                                ModelService.last_autoscale_checked_at > cursor_checked_at,
+                                and_(
+                                    ModelService.last_autoscale_checked_at == cursor_checked_at,
+                                    ModelService.id > cursor_service_id,
+                                ),
+                            ),
+                        )
+                candidate_rows = list(
+                    (
+                        await session.execute(
+                            candidate_query.order_by(
+                                ModelService.last_autoscale_checked_at.asc().nullsfirst(),
+                                ModelService.id,
+                            ).limit(self.batch_size)
+                        )
+                    ).all()
+                )
+            if not candidate_rows:
                 break
-            async with self.database.session() as session, session.begin():
-                if runtime_type == RuntimeType.KUBERNETES and logical_model_id is not None:
-                    locked_logical_model_id = await session.scalar(
-                        select(LogicalModel.id)
-                        .where(LogicalModel.id == logical_model_id)
+            cursor = (candidate_rows[-1][3], candidate_rows[-1][0])
+            for service_id, logical_model_id, runtime_type, _checked_at in candidate_rows:
+                if examined >= self.batch_size:
+                    break
+                async with self.database.session() as session, session.begin():
+                    if runtime_type == RuntimeType.KUBERNETES and logical_model_id is not None:
+                        locked_logical_model_id = await session.scalar(
+                            select(LogicalModel.id)
+                            .where(LogicalModel.id == logical_model_id)
+                            .with_for_update(skip_locked=True)
+                        )
+                        if locked_logical_model_id is None:
+                            continue
+                    service = await session.scalar(
+                        select(ModelService)
+                        .where(
+                            ModelService.id == service_id,
+                            ModelService.autoscaling_enabled.is_(True),
+                        )
                         .with_for_update(skip_locked=True)
                     )
-                    if locked_logical_model_id is None:
+                    if service is None:
                         continue
-                service = await session.scalar(
-                    select(ModelService)
-                    .where(
-                        ModelService.id == service_id,
-                        ModelService.autoscaling_enabled.is_(True),
+                    if service.last_autoscale_checked_at != _checked_at:
+                        # Another pass processed or reordered this candidate after
+                        # the unlocked page scan. Leave it for a future fair pass.
+                        continue
+                    expected_logical_model_id = (
+                        logical_model_id if runtime_type == RuntimeType.KUBERNETES else None
                     )
-                    .with_for_update(skip_locked=True)
-                )
-                if service is None:
-                    continue
-                expected_logical_model_id = (
-                    logical_model_id if runtime_type == RuntimeType.KUBERNETES else None
-                )
-                actual_logical_model_id = (
-                    service.logical_model_id
-                    if service.runtime_type == RuntimeType.KUBERNETES
-                    else None
-                )
-                if actual_logical_model_id != expected_logical_model_id:
-                    # The admission identity is immutable through public APIs. If a
-                    # direct database mutation races the unlocked scan, retry it on a
-                    # later pass after acquiring the correct logical-model lock.
-                    continue
-                # Preserve the shared lock order used by gateway routing and scale:
-                # logical model -> service -> project quota.
-                await QuotaRepository.get_locked(session, project_id=service.project_id)
-                now = await database_utcnow(session)
-                examined += 1
-                service.last_autoscale_checked_at = now
-                load = await self.metrics.snapshot(service.id)
-                if not _usable_load(load, now, self.metric_max_age_seconds):
-                    missing += 1
-                    continue
-                assert load is not None
-                if _in_cooldown(service, now):
-                    cooling_down += 1
-                    continue
-                target = _target_replicas(
-                    service,
-                    active_requests=load.active_requests,
-                    scale_to_zero_enabled=self.scale_to_zero_enabled,
-                )
-                if target == service.desired_replicas:
-                    held += 1
-                    continue
-                eligible_node_names: tuple[str, ...] | None = None
-                if (
-                    service.runtime_type == RuntimeType.KUBERNETES
-                    and target > service.desired_replicas
-                    and not self._kubernetes_admission_ready()
-                ):
-                    held += 1
-                    continue
-                if (
-                    service.runtime_type == RuntimeType.KUBERNETES
-                    and service.logical_model_id is not None
-                    and target > service.desired_replicas
-                ):
-                    if self.runtime_profile_catalog is None:
+                    actual_logical_model_id = (
+                        service.logical_model_id
+                        if service.runtime_type == RuntimeType.KUBERNETES
+                        else None
+                    )
+                    if actual_logical_model_id != expected_logical_model_id:
+                        # The admission identity is immutable through public APIs. If a
+                        # direct database mutation races the unlocked scan, retry it on a
+                        # later pass after acquiring the correct logical-model lock.
+                        continue
+                    # Preserve the shared lock order used by gateway routing and scale:
+                    # logical model -> service -> project quota.
+                    await QuotaRepository.get_locked(session, project_id=service.project_id)
+                    now = await database_utcnow(session)
+                    examined += 1
+                    examined_service_ids.add(service.id)
+                    service.last_autoscale_checked_at = now
+                    load = await self.metrics.snapshot(service.id)
+                    if not _usable_load(load, now, self.metric_max_age_seconds):
+                        missing += 1
+                        continue
+                    assert load is not None
+                    if _in_cooldown(service, now):
+                        cooling_down += 1
+                        continue
+                    target = _target_replicas(
+                        service,
+                        active_requests=load.active_requests,
+                        scale_to_zero_enabled=self.scale_to_zero_enabled,
+                    )
+                    if target == service.desired_replicas:
                         held += 1
                         continue
-                    admission = await AdmissionRepository.revalidate_logical_model_service_scale(
-                        session,
-                        catalog=self.runtime_profile_catalog,
-                        service=service,
-                        desired_replicas=target,
-                    )
-                    if not admission.allowed or admission.snapshot is None:
+                    eligible_node_names: tuple[str, ...] | None = None
+                    if (
+                        service.runtime_type == RuntimeType.KUBERNETES
+                        and target > service.desired_replicas
+                        and not self._kubernetes_admission_ready()
+                    ):
                         held += 1
                         continue
-                    eligible_node_names = admission.snapshot.eligible_node_names
-                try:
-                    updated = await ServiceRepository.set_desired_replicas(
-                        session,
-                        service_id=service.id,
-                        project_id=service.project_id,
-                        desired_replicas=target,
-                        eligible_node_names=eligible_node_names,
-                    )
-                except QuotaExceededError:
-                    held += 1
-                    continue
-                if updated is None:
-                    continue
-                updated.last_scaled_at = now
-                scaled += 1
+                    if (
+                        service.runtime_type == RuntimeType.KUBERNETES
+                        and service.logical_model_id is not None
+                        and target > service.desired_replicas
+                    ):
+                        if self.runtime_profile_catalog is None:
+                            held += 1
+                            continue
+                        admission = (
+                            await AdmissionRepository.revalidate_logical_model_service_scale(
+                                session,
+                                catalog=self.runtime_profile_catalog,
+                                service=service,
+                                desired_replicas=target,
+                            )
+                        )
+                        if not admission.allowed or admission.snapshot is None:
+                            held += 1
+                            continue
+                        eligible_node_names = admission.snapshot.eligible_node_names
+                    try:
+                        updated = await ServiceRepository.set_desired_replicas(
+                            session,
+                            service_id=service.id,
+                            project_id=service.project_id,
+                            desired_replicas=target,
+                            eligible_node_names=eligible_node_names,
+                        )
+                    except QuotaExceededError:
+                        held += 1
+                        continue
+                    if updated is None:
+                        continue
+                    updated.last_scaled_at = now
+                    scaled += 1
         result = AutoscaleRunResult(
             examined=examined,
             scaled=scaled,
