@@ -1,5 +1,6 @@
 import uuid
 from pathlib import Path
+from typing import TypedDict
 
 import pytest
 from sqlalchemy import func, select
@@ -11,7 +12,7 @@ from core.enums import LogStream, TaskStatus, WorkerStatus
 from models.artifact import Artifact
 from models.scheduling import ResourceReservation
 from models.task import TaskLog
-from models.usage import ProjectQuotaState
+from models.usage import ProjectQuotaState, TaskExecution
 from repositories.secrets import SecretResolutionError, TaskSecretBindingRepository
 from repositories.task_artifacts import (
     OutputArtifactSpec,
@@ -26,11 +27,24 @@ from worker.artifact_workspace import ArtifactWorkspaceManager
 pytestmark = pytest.mark.integration
 
 
+class _RuntimeIdentity(TypedDict):
+    runtime_type: str
+    resource_kind: str
+    resource_name: str
+    namespace: str
+    resource_uid: str
+    runtime_worker_session_id: uuid.UUID
+    spec_hash: str
+    observed_pod_name: str
+    observed_pod_uid: str
+
+
 async def _register(
     database: Database,
     *,
     worker_id: str,
     worker_session_id: uuid.UUID,
+    runtime_types: list[str] | None = None,
 ) -> None:
     async with database.session() as session, session.begin():
         await WorkerRepository.register(
@@ -42,14 +56,15 @@ async def _register(
             cpu_count=4,
             memory_total_mb=4096,
             docker_version="test",
-            labels={"runtime": "docker"},
+            labels={"runtime": (runtime_types or ["docker"])[0]},
+            runtime_types=runtime_types,
             gpu_count=0,
             gpu_model=None,
             gpu_memory_mb=0,
         )
 
 
-async def _create_task(database: Database) -> uuid.UUID:
+async def _create_task(database: Database, *, runtime_type: str = "docker") -> uuid.UUID:
     async with database.session() as session, session.begin():
         task = await TaskRepository.create_queued(
             session,
@@ -60,11 +75,12 @@ async def _create_task(database: Database) -> uuid.UUID:
             max_retries=0,
             cpu_limit=1.0,
             memory_limit_mb=128,
-            labels={"runtime": "docker"},
+            labels={"runtime": runtime_type},
             network_enabled=False,
             gpu_count=0,
             idempotency_key=None,
             request_hash=None,
+            runtime_type=runtime_type,
         )
         return task.id
 
@@ -302,6 +318,227 @@ async def test_reregistration_fences_every_old_worker_write(database: Database) 
     assert worker.running_tasks == 3
     assert worker.reserved_cpu == 3.0
     assert active_reservations == 3
+
+
+async def test_kubernetes_restart_handoff_preserves_creation_fence_and_blocks_zombie_delete(
+    database: Database,
+) -> None:
+    worker_id = "worker-kubernetes-restart"
+    creation_session = uuid.uuid4()
+    controller_session_b = uuid.uuid4()
+    controller_session_c = uuid.uuid4()
+    await _register(
+        database,
+        worker_id=worker_id,
+        worker_session_id=creation_session,
+        runtime_types=["kubernetes"],
+    )
+    task_id = await _create_task(database, runtime_type="kubernetes")
+    execution_id = await _claim(
+        database,
+        task_id=task_id,
+        worker_id=worker_id,
+        worker_session_id=creation_session,
+    )
+    runtime_identity: _RuntimeIdentity = {
+        "runtime_type": "kubernetes",
+        "resource_kind": "job",
+        "resource_name": f"mini-ai-job-{task_id.hex[:12]}-{execution_id.hex[:12]}",
+        "namespace": "mini-ai-runtime",
+        "resource_uid": "job-uid-original",
+        "runtime_worker_session_id": creation_session,
+        "spec_hash": "a" * 32,
+        "observed_pod_name": "controlled-pod-a",
+        "observed_pod_uid": "pod-uid-a",
+    }
+    observation: dict[str, str | None] = {
+        "task_id": str(task_id),
+        "execution_id": str(execution_id),
+        "worker_session_id": str(creation_session),
+        "controller_session_id": str(controller_session_b),
+        "namespace": runtime_identity["namespace"],
+        "resource_name": runtime_identity["resource_name"],
+        "resource_uid": runtime_identity["resource_uid"],
+        "spec_hash": runtime_identity["spec_hash"],
+        "observed_pod_name": runtime_identity["observed_pod_name"],
+        "observed_pod_uid": runtime_identity["observed_pod_uid"],
+    }
+
+    async with database.session() as session, session.begin():
+        await TaskRepository.mark_pulling(
+            session,
+            task_id=task_id,
+            worker_id=worker_id,
+            execution_id=execution_id,
+            worker_session_id=creation_session,
+            lease_seconds=30,
+        )
+        await TaskRepository.mark_running(
+            session,
+            task_id=task_id,
+            worker_id=worker_id,
+            execution_id=execution_id,
+            worker_session_id=creation_session,
+            lease_seconds=30,
+        )
+        await TaskRepository.record_runtime_handle(
+            session,
+            task_id=task_id,
+            worker_id=worker_id,
+            execution_id=execution_id,
+            worker_session_id=creation_session,
+            **runtime_identity,
+        )
+
+    await _register(
+        database,
+        worker_id=worker_id,
+        worker_session_id=controller_session_b,
+        runtime_types=["kubernetes"],
+    )
+    async with database.session() as session, session.begin():
+        recovered = await TaskRepository.transfer_recoverable_kubernetes_executions(
+            session,
+            worker_id=worker_id,
+            new_worker_session_id=controller_session_b,
+            lease_seconds=30,
+            observations=[observation],
+        )
+    assert [(item.task_id, item.execution_id) for item in recovered] == [
+        (task_id, execution_id)
+    ]
+
+    async with database.session() as session, session.begin():
+        assert not await TaskRepository.runtime_cleanup_owned(
+            session,
+            task_id=task_id,
+            worker_id=worker_id,
+            execution_id=execution_id,
+            worker_session_id=creation_session,
+            runtime_type="kubernetes",
+            resource_name=str(runtime_identity["resource_name"]),
+            resource_uid=str(runtime_identity["resource_uid"]),
+            spec_hash=str(runtime_identity["spec_hash"]),
+        )
+        assert await TaskRepository.runtime_cleanup_owned(
+            session,
+            task_id=task_id,
+            worker_id=worker_id,
+            execution_id=execution_id,
+            worker_session_id=controller_session_b,
+            runtime_type="kubernetes",
+            resource_name=str(runtime_identity["resource_name"]),
+            resource_uid=str(runtime_identity["resource_uid"]),
+            spec_hash=str(runtime_identity["spec_hash"]),
+        )
+        execution = await session.get(TaskExecution, execution_id)
+        reservation = await session.scalar(
+            select(ResourceReservation).where(
+                ResourceReservation.execution_id == execution_id
+            )
+        )
+        task = await TaskRepository.get(session, task_id)
+        assert execution is not None and reservation is not None and task is not None
+        assert execution.worker_session_id == controller_session_b
+        assert reservation.worker_session_id == controller_session_b
+        assert execution.runtime_worker_session_id == creation_session
+        assert task.runtime_handle is not None
+        assert task.runtime_handle["runtime_worker_session_id"] == str(creation_session)
+
+    async with database.session() as session, session.begin():
+        with pytest.raises(StaleExecutionError, match="worker session is stale"):
+            await TaskRepository.record_runtime_handle(
+                session,
+                task_id=task_id,
+                worker_id=worker_id,
+                execution_id=execution_id,
+                worker_session_id=creation_session,
+                **runtime_identity,
+            )
+
+    changed_pod_identity: _RuntimeIdentity = {
+        **runtime_identity,
+        "observed_pod_name": "replacement-pod",
+        "observed_pod_uid": "replacement-pod-uid",
+    }
+    async with database.session() as session, session.begin():
+        with pytest.raises(StaleExecutionError, match="Pod identity is immutable"):
+            await TaskRepository.record_runtime_handle(
+                session,
+                task_id=task_id,
+                worker_id=worker_id,
+                execution_id=execution_id,
+                worker_session_id=controller_session_b,
+                **changed_pod_identity,
+            )
+        missing_pod_observation = {
+            **observation,
+            "observed_pod_name": None,
+            "observed_pod_uid": None,
+        }
+        assert (
+            await TaskRepository.transfer_recoverable_kubernetes_executions(
+                session,
+                worker_id=worker_id,
+                new_worker_session_id=controller_session_b,
+                lease_seconds=30,
+                observations=[missing_pod_observation],
+            )
+            == []
+        )
+
+    # A later process registration fences controller B before either contender
+    # can delete the immutable Job.  The stale contender loses the CAS; the
+    # current process can transfer the already-adopted execution again without
+    # rewriting the Job creation-session label.
+    await _register(
+        database,
+        worker_id=worker_id,
+        worker_session_id=controller_session_c,
+        runtime_types=["kubernetes"],
+    )
+    observation["controller_session_id"] = str(controller_session_c)
+    async with database.session() as session, session.begin():
+        assert (
+            await TaskRepository.transfer_recoverable_kubernetes_executions(
+                session,
+                worker_id=worker_id,
+                new_worker_session_id=controller_session_b,
+                lease_seconds=30,
+                observations=[observation],
+            )
+            == []
+        )
+        recovered_again = await TaskRepository.transfer_recoverable_kubernetes_executions(
+            session,
+            worker_id=worker_id,
+            new_worker_session_id=controller_session_c,
+            lease_seconds=30,
+            observations=[observation],
+        )
+        assert len(recovered_again) == 1
+        assert not await TaskRepository.runtime_cleanup_owned(
+            session,
+            task_id=task_id,
+            worker_id=worker_id,
+            execution_id=execution_id,
+            worker_session_id=controller_session_b,
+            runtime_type="kubernetes",
+            resource_name=str(runtime_identity["resource_name"]),
+            resource_uid=str(runtime_identity["resource_uid"]),
+            spec_hash=str(runtime_identity["spec_hash"]),
+        )
+        assert await TaskRepository.runtime_cleanup_owned(
+            session,
+            task_id=task_id,
+            worker_id=worker_id,
+            execution_id=execution_id,
+            worker_session_id=controller_session_c,
+            runtime_type="kubernetes",
+            resource_name=str(runtime_identity["resource_name"]),
+            resource_uid=str(runtime_identity["resource_uid"]),
+            spec_hash=str(runtime_identity["spec_hash"]),
+        )
 
 
 async def test_reregistration_fences_artifact_materialize_and_publish(

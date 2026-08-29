@@ -131,8 +131,13 @@ class TaskExecutor:
         self.worker_session_id = worker_session_id
         self.logger = get_logger("task_executor")
 
-    async def execute(self, execution: ActiveExecution) -> ExecutionResult:
-        handle: RuntimeHandle | None = None
+    async def execute(
+        self,
+        execution: ActiveExecution,
+        *,
+        recovered_handle: RuntimeHandle | None = None,
+    ) -> ExecutionResult:
+        handle: RuntimeHandle | None = recovered_handle
         log_task: asyncio.Task[None] | None = None
         resolved_secrets = ResolvedTaskSecrets({})
         secret_values: tuple[str, ...] = ()
@@ -163,36 +168,46 @@ class TaskExecutor:
                     deadline,
                 )
             await self._system_log(execution, f"pulling image {task.image}")
-            handle = await self._before_deadline(
-                self.runtime.prepare(
-                    self._execution_spec(
-                        task,
-                        execution,
-                        environment=runtime_environment,
-                        mounts=(
-                            tuple(
-                                RuntimeMount(
-                                    host_path=str(mount.host_path),
-                                    container_path=mount.container_path,
-                                    read_only=mount.read_only,
-                                    volume_name=mount.volume_name,
-                                    volume_subpath=mount.volume_subpath,
+            if handle is None:
+                handle = await self._before_deadline(
+                    self.runtime.prepare(
+                        self._execution_spec(
+                            task,
+                            execution,
+                            environment=runtime_environment,
+                            mounts=(
+                                tuple(
+                                    RuntimeMount(
+                                        host_path=str(mount.host_path),
+                                        container_path=mount.container_path,
+                                        read_only=mount.read_only,
+                                        volume_name=mount.volume_name,
+                                        volume_subpath=mount.volume_subpath,
+                                    )
+                                    for mount in prepared_artifacts.mounts
                                 )
-                                for mount in prepared_artifacts.mounts
-                            )
-                            if prepared_artifacts is not None
-                            else ()
-                        ),
-                    )
-                ),
-                deadline,
-            )
+                                if prepared_artifacts is not None
+                                else ()
+                            ),
+                        )
+                    ),
+                    deadline,
+                )
+            elif handle.runtime_type != task.runtime_type.value:
+                raise StaleExecutionError(
+                    "recovered runtime handle does not match the task runtime"
+                )
             assert handle is not None
+            await self._record_runtime_handle(execution, handle)
             pre_start_stop = await self._pre_start_stop_reason(execution)
             if pre_start_stop == "ownership_lost":
                 return ExecutionResult(accepted=False, status=None)
             if pre_start_stop == "cancelled":
-                await self._best_effort_stop(handle, secret_values=secret_values)
+                await self._best_effort_stop(
+                    handle,
+                    execution=execution,
+                    secret_values=secret_values,
+                )
                 return await self._finish(
                     execution,
                     target=TaskStatus.CANCELLED,
@@ -213,6 +228,7 @@ class TaskExecutor:
             await self._before_deadline(log_ready.wait(), deadline)
             if log_task.done():
                 await log_task
+            await self._record_runtime_handle(execution, handle)
             await self._before_deadline(self.runtime.start(handle), deadline)
             await self._mark_running(execution)
             await self._system_log(execution, f"{handle.resource_kind} {handle.display_id} started")
@@ -223,7 +239,7 @@ class TaskExecutor:
                 "ownership_lost",
                 "log_limit_exceeded",
             }:
-                await self.runtime.stop(handle)
+                await self._stop_owned(handle, execution)
             if outcome.reason == "ownership_lost":
                 self.logger.warning(
                     "container stopped after fencing token was revoked",
@@ -301,7 +317,11 @@ class TaskExecutor:
             return ExecutionResult(accepted=False, status=None)
         except RuntimeFailure as exc:
             if handle is not None:
-                await self._best_effort_stop(handle, secret_values=secret_values)
+                await self._best_effort_stop(
+                    handle,
+                    execution=execution,
+                    secret_values=secret_values,
+                )
             safe_error = redact_text(str(exc), secret_values)
             await self._best_effort_log(execution, f"runtime failed: {safe_error}")
             self.logger.error(
@@ -323,7 +343,11 @@ class TaskExecutor:
             )
         except (ExecutionTimedOut, TimeoutError):
             if handle is not None:
-                await self._best_effort_stop(handle, secret_values=secret_values)
+                await self._best_effort_stop(
+                    handle,
+                    execution=execution,
+                    secret_values=secret_values,
+                )
             await self._best_effort_log(execution, "task timed out")
             return await self._finish(
                 execution,
@@ -334,7 +358,11 @@ class TaskExecutor:
             )
         except Exception as exc:
             if handle is not None:
-                await self._best_effort_stop(handle, secret_values=secret_values)
+                await self._best_effort_stop(
+                    handle,
+                    execution=execution,
+                    secret_values=secret_values,
+                )
             safe_error = redact_text(str(exc), secret_values)
             await self._best_effort_log(execution, f"execution failed: {safe_error}")
             # Tracebacks can render arbitrary exception arguments. Avoid attaching
@@ -361,7 +389,15 @@ class TaskExecutor:
                 await asyncio.gather(log_task, return_exceptions=True)
             if handle is not None:
                 try:
-                    await self.runtime.cleanup(handle)
+                    if await self._runtime_cleanup_owned(handle, execution):
+                        await self.runtime.cleanup(handle)
+                    else:
+                        self.logger.warning(
+                            "runtime cleanup skipped after DB ownership fence changed",
+                            task_id=str(execution.task_id),
+                            execution_id=str(execution.execution_id),
+                            runtime_object_id=handle.object_id,
+                        )
                 except Exception as exc:
                     self.logger.error(
                         "runtime cleanup failed",
@@ -392,6 +428,46 @@ class TaskExecutor:
                 worker_id=self.worker_id,
                 execution_id=execution.execution_id,
                 lease_seconds=self.settings.task_lease_seconds,
+                worker_session_id=self.worker_session_id,
+            )
+
+    async def _record_runtime_handle(
+        self,
+        execution: ActiveExecution,
+        handle: RuntimeHandle,
+    ) -> None:
+        if handle.runtime_type != "kubernetes":
+            return
+        if (
+            self.worker_session_id is None
+            or handle.controller_session_id != self.worker_session_id
+        ):
+            raise StaleExecutionError(
+                "Kubernetes Job handle controller session is stale"
+            )
+        try:
+            runtime_worker_session_id = uuid.UUID(
+                handle.labels["mini-ai-cloud/worker-session-id"]
+            )
+        except (KeyError, ValueError) as exc:
+            raise RuntimeError(
+                "Kubernetes Job handle has an invalid creation worker session"
+            ) from exc
+        async with self.database.session() as session, session.begin():
+            await TaskRepository.record_runtime_handle(
+                session,
+                task_id=execution.task_id,
+                worker_id=self.worker_id,
+                execution_id=execution.execution_id,
+                runtime_type=handle.runtime_type,
+                resource_kind=handle.resource_kind,
+                resource_name=handle.object_id,
+                namespace=handle.namespace,
+                resource_uid=handle.resource_uid,
+                runtime_worker_session_id=runtime_worker_session_id,
+                spec_hash=handle.spec_hash,
+                observed_pod_name=handle.observation.pod_name,
+                observed_pod_uid=handle.observation.pod_uid,
                 worker_session_id=self.worker_session_id,
             )
 
@@ -631,16 +707,55 @@ class TaskExecutor:
             return
 
     async def _best_effort_stop(
-        self, handle: RuntimeHandle, *, secret_values: tuple[str, ...] = ()
+        self,
+        handle: RuntimeHandle,
+        *,
+        execution: ActiveExecution,
+        secret_values: tuple[str, ...] = (),
     ) -> None:
         try:
-            await self.runtime.stop(handle)
+            await self._stop_owned(handle, execution)
+        except StaleExecutionError:
+            return
         except Exception as exc:
             self.logger.error(
                 "failed to stop runtime object",
                 runtime_type=handle.runtime_type,
                 runtime_object_id=handle.object_id,
                 error=redact_text(str(exc), secret_values),
+            )
+
+    async def _stop_owned(
+        self,
+        handle: RuntimeHandle,
+        execution: ActiveExecution,
+    ) -> None:
+        if not await self._runtime_cleanup_owned(handle, execution):
+            raise StaleExecutionError(
+                "runtime deletion skipped because controller ownership changed"
+            )
+        await self.runtime.stop(handle)
+
+    async def _runtime_cleanup_owned(
+        self,
+        handle: RuntimeHandle,
+        execution: ActiveExecution,
+    ) -> bool:
+        if handle.runtime_type != "kubernetes":
+            return True
+        if self.worker_session_id is None:
+            return False
+        async with self.database.session() as session:
+            return await TaskRepository.runtime_cleanup_owned(
+                session,
+                task_id=execution.task_id,
+                worker_id=self.worker_id,
+                execution_id=execution.execution_id,
+                worker_session_id=self.worker_session_id,
+                runtime_type=handle.runtime_type,
+                resource_name=handle.object_id,
+                resource_uid=handle.resource_uid,
+                spec_hash=handle.spec_hash,
             )
 
     def _execution_spec(
@@ -676,6 +791,7 @@ class TaskExecutor:
             model_variant_id=task.model_variant_id,
             allocation_authority=task.allocation_authority,
             mounts=mounts,
+            worker_session_id=self.worker_session_id,
         )
 
     async def _finish(
