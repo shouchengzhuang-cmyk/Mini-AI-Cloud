@@ -209,9 +209,9 @@ class ServiceAutoscaler:
         if self.database.engine.dialect.name == "sqlite":
             # SQLite readers block a writer commit while a cursor is open. Its
             # supported local/test deployments therefore close a materialized
-            # snapshot before the per-candidate write transactions begin.
+            # bounded snapshot before the per-candidate write transactions begin.
             async with self.database.session() as session:
-                candidates = list((await session.execute(query)).all())
+                candidates = list((await session.execute(query.limit(self.batch_size))).all())
             for service_id, logical_model_id, runtime_type, checked_at in candidates:
                 yield service_id, logical_model_id, runtime_type, checked_at
             return
