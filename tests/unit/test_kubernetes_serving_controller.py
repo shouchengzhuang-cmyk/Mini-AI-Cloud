@@ -1020,6 +1020,59 @@ async def test_recovery_isolates_legacy_replica_and_adopts_valid_sibling(
     await replacement.close()
 
 
+async def test_recovery_reconstructs_pre_0016_placement_from_owned_pods(
+    kubernetes_controller_database: Database,
+) -> None:
+    service_id, catalog = await _create_profile_service(
+        kubernetes_controller_database,
+        desired_replicas=2,
+    )
+    runtime = _Runtime()
+    first = _controller(
+        kubernetes_controller_database,
+        runtime,
+        runtime_profile_catalog=catalog,
+    )
+    await first.startup()
+    launched = await first.run_once()
+    assert launched.claimed == 2
+    await first.close()
+
+    async with kubernetes_controller_database.session() as session, session.begin():
+        service = await session.get(ModelService, service_id, with_for_update=True)
+        assert service is not None
+        service.eligible_node_names = []
+        replicas = await ServiceRepository.list_replicas(
+            session,
+            service_id,
+            for_update=True,
+        )
+        for replica in replicas:
+            replica.eligible_node_names = []
+            replica.assigned_node_name = None
+
+    runtime.closed = False
+    replacement = _controller(
+        kubernetes_controller_database,
+        runtime,
+        worker_id=first.worker_id,
+        runtime_profile_catalog=catalog,
+    )
+    startup = await replacement.startup()
+
+    async with kubernetes_controller_database.session() as session:
+        service = await session.get(ModelService, service_id)
+        assert service is not None
+        replicas = await ServiceRepository.list_replicas(session, service_id)
+    assert startup.recovered == 2
+    assert startup.orphans_cleaned == 0
+    assert service.eligible_node_names == ["gpu-node-a"]
+    assert all(replica.eligible_node_names == ["gpu-node-a"] for replica in replicas)
+    assert all(replica.assigned_node_name == "gpu-node-a" for replica in replicas)
+    assert runtime.force_cleaned == []
+    await replacement.close()
+
+
 async def test_contract_drift_cleanup_refusal_quarantines_without_releasing_capacity(
     kubernetes_controller_database: Database,
     monkeypatch: pytest.MonkeyPatch,

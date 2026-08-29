@@ -17,6 +17,7 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 _TABLE_NAMES = ("model_services", "service_replicas")
+_INFLIGHT_SERVICE_STATUSES = ("pending", "deploying")
 
 
 @contextmanager
@@ -53,7 +54,51 @@ def _snapshot_sql(*, include_eligible_nodes: bool) -> str:
     )
 
 
+def _reject_inflight_legacy_services() -> None:
+    """Do not migrate a service before Kubernetes has observable placement."""
+
+    context = op.get_context()
+    if context.as_sql:
+        if context.dialect.name != "postgresql":
+            raise RuntimeError("0016 offline SQL preflight is supported only for PostgreSQL")
+        op.execute(
+            sa.text(
+                "DO $$ BEGIN "
+                "IF EXISTS (SELECT 1 FROM model_services "
+                "WHERE logical_model_id IS NOT NULL "
+                "AND runtime_type = 'kubernetes' "
+                "AND status IN ('pending', 'deploying')) THEN "
+                "RAISE EXCEPTION '0016 cannot migrate pending or deploying logical "
+                "Kubernetes services'; "
+                "END IF; END $$"
+            )
+        )
+        return
+    services = sa.table(
+        "model_services",
+        sa.column("logical_model_id", sa.Uuid()),
+        sa.column("runtime_type", sa.String(32)),
+        sa.column("status", sa.String(32)),
+    )
+    count = op.get_bind().scalar(
+        sa.select(sa.func.count())
+        .select_from(services)
+        .where(
+            services.c.logical_model_id.is_not(None),
+            services.c.runtime_type == "kubernetes",
+            services.c.status.in_(_INFLIGHT_SERVICE_STATUSES),
+        )
+    )
+    if count:
+        raise RuntimeError(
+            "0016 cannot reconstruct immutable node placement for pending or deploying "
+            "logical Kubernetes services; wait for them to become running/degraded or "
+            "stop them before upgrading"
+        )
+
+
 def upgrade() -> None:
+    _reject_inflight_legacy_services()
     with _preserve_sqlite_referencing_rows():
         for table_name in _TABLE_NAMES:
             with op.batch_alter_table(table_name) as batch:
@@ -61,9 +106,10 @@ def upgrade() -> None:
                     sa.Column("eligible_node_names", sa.JSON(none_as_null=True), nullable=True)
                 )
 
-            json_empty = (
-                "'[]'::json" if op.get_bind().dialect.name == "postgresql" else "'[]'"
-            )
+            json_empty = "'[]'::json" if op.get_bind().dialect.name == "postgresql" else "'[]'"
+            # Pre-0016 schemas did not persist the immutable eligible set. For stable
+            # services, [] is a one-time recovery marker: the controller may replace it
+            # only after matching an owned Pod and observing its actual Kubernetes node.
             op.execute(
                 sa.text(
                     f"UPDATE {table_name} SET eligible_node_names = {json_empty} "
@@ -72,9 +118,7 @@ def upgrade() -> None:
             )
 
             with op.batch_alter_table(table_name) as batch:
-                batch.drop_constraint(
-                    op.f(f"ck_{table_name}_admission_snapshot"), type_="check"
-                )
+                batch.drop_constraint(op.f(f"ck_{table_name}_admission_snapshot"), type_="check")
                 batch.create_check_constraint(
                     op.f(f"ck_{table_name}_admission_snapshot"),
                     _snapshot_sql(include_eligible_nodes=True),
@@ -91,9 +135,7 @@ def downgrade() -> None:
 
         for table_name in reversed(_TABLE_NAMES):
             with op.batch_alter_table(table_name) as batch:
-                batch.drop_constraint(
-                    op.f(f"ck_{table_name}_admission_snapshot"), type_="check"
-                )
+                batch.drop_constraint(op.f(f"ck_{table_name}_admission_snapshot"), type_="check")
                 batch.create_check_constraint(
                     op.f(f"ck_{table_name}_admission_snapshot"),
                     _snapshot_sql(include_eligible_nodes=False),

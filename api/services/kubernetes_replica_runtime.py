@@ -578,6 +578,23 @@ class KubernetesReplicaRuntimeController:
             for replica, service in rows
             if replica.execution_id is not None
         }
+        replicas_by_service: dict[uuid.UUID, list[ServiceReplica]] = {}
+        services_by_id: dict[uuid.UUID, ModelService] = {}
+        for replica, service in rows:
+            replicas_by_service.setdefault(service.id, []).append(replica)
+            services_by_id[service.id] = service
+        legacy_recovery_service_ids = {
+            service_id
+            for service_id, replicas in replicas_by_service.items()
+            if services_by_id[service_id].logical_model_id is not None
+            and services_by_id[service_id].eligible_node_names == []
+            and all(
+                replica.logical_model_id is not None
+                and replica.eligible_node_names == []
+                and replica.assigned_node_name is None
+                for replica in replicas
+            )
+        }
         matched_replica_ids: set[uuid.UUID] = set()
         quarantined_claims: dict[uuid.UUID, KubernetesReplicaClaim] = {}
         unresolved_conflicts = False
@@ -657,6 +674,35 @@ class KubernetesReplicaRuntimeController:
                 continue
             replica, service = pair
             assert replica.execution_id is not None
+            if (
+                service.id in legacy_recovery_service_ids
+                and replica.eligible_node_names == []
+                and handle.node_name is not None
+            ):
+                try:
+                    recovered_placement = await self._recover_legacy_placement(
+                        replica,
+                        handle.node_name,
+                    )
+                except ValueError as error:
+                    self.logger.warning(
+                        "Pre-0016 Kubernetes serving placement could not be recovered",
+                        service_id=str(service.id),
+                        replica_id=str(replica.id),
+                        reason=_bounded_message(str(error)),
+                    )
+                else:
+                    if not recovered_placement:
+                        self._handles.clear()
+                        self._quarantined_claims.clear()
+                        raise StaleKubernetesServingController(
+                            "Worker session changed during legacy placement recovery"
+                        )
+                    service.eligible_node_names = sorted(
+                        {*service.eligible_node_names, handle.node_name}
+                    )
+                    replica.eligible_node_names = [handle.node_name]
+                    replica.assigned_node_name = handle.node_name
             if _is_persistently_quarantined(replica):
                 try:
                     quarantine_claim = _claim_from_models(
@@ -1382,6 +1428,23 @@ class KubernetesReplicaRuntimeController:
                 replica_id=claim.replica_id,
                 generation=claim.generation,
                 execution_id=claim.execution_id,
+                node_name=node_name,
+                worker_id=self.worker_id,
+                worker_session_id=self.worker_session_id,
+            )
+
+    async def _recover_legacy_placement(
+        self,
+        replica: ServiceReplica,
+        node_name: str,
+    ) -> bool:
+        assert replica.execution_id is not None
+        async with self.database.session() as session, session.begin():
+            return await ServiceRepository.recover_legacy_replica_placement(
+                session,
+                replica_id=replica.id,
+                generation=replica.generation,
+                execution_id=replica.execution_id,
                 node_name=node_name,
                 worker_id=self.worker_id,
                 worker_session_id=self.worker_session_id,

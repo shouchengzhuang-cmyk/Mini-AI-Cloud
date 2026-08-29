@@ -40,6 +40,13 @@ def _table(metadata: sa.MetaData, name: str) -> sa.Table:
     columns: list[sa.Column[Any] | sa.CheckConstraint] = [
         sa.Column("id", sa.Uuid(), primary_key=True)
     ]
+    if name == "model_services":
+        columns.extend(
+            [
+                sa.Column("runtime_type", sa.String(32), nullable=False),
+                sa.Column("status", sa.String(32), nullable=False),
+            ]
+        )
     if name == "service_replicas":
         columns.append(
             sa.Column(
@@ -71,7 +78,12 @@ def _table(metadata: sa.MetaData, name: str) -> sa.Table:
     return sa.Table(name, metadata, *columns)
 
 
-def _logical_snapshot(row_id: uuid.UUID, **overrides: object) -> dict[str, object]:
+def _logical_snapshot(
+    row_id: uuid.UUID,
+    *,
+    service: bool = False,
+    **overrides: object,
+) -> dict[str, object]:
     values: dict[str, object] = {
         "id": row_id,
         "logical_model_id": uuid.uuid4(),
@@ -86,12 +98,14 @@ def _logical_snapshot(row_id: uuid.UUID, **overrides: object) -> dict[str, objec
         "accelerator_resource_name": "nvidia.com/gpu",
         "selection_policy": "nvidia-only",
     }
+    if service:
+        values.update(runtime_type="kubernetes", status="running")
     values.update(overrides)
     return values
 
 
 def _reflected_logical_snapshot(**overrides: object) -> dict[str, object]:
-    values = _logical_snapshot(uuid.uuid4(), **overrides)
+    values = _logical_snapshot(uuid.uuid4(), service=True, **overrides)
     for key in ("id", "service_id", "logical_model_id", "model_variant_id"):
         if isinstance(values.get(key), uuid.UUID):
             values[key] = str(values[key])
@@ -112,7 +126,7 @@ def test_service_node_placement_migration_backfills_and_downgrades(
     migration = _load_migration()
     with engine.connect() as connection:
         connection.exec_driver_sql("PRAGMA foreign_keys=ON")
-        connection.execute(services.insert().values(_logical_snapshot(service_id)))
+        connection.execute(services.insert().values(_logical_snapshot(service_id, service=True)))
         connection.execute(
             replicas.insert().values(_logical_snapshot(replica_id, service_id=service_id))
         )
@@ -185,6 +199,49 @@ def test_service_node_placement_migration_backfills_and_downgrades(
             assert "eligible_node_names" not in {
                 column["name"] for column in sa.inspect(connection).get_columns(table_name)
             }
+    engine.dispose()
+
+
+def test_service_node_placement_migration_rejects_inflight_legacy_service_before_ddl(
+    tmp_path: Path,
+) -> None:
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'inflight-service.sqlite3'}")
+    metadata = sa.MetaData()
+    services = _table(metadata, "model_services")
+    replicas = _table(metadata, "service_replicas")
+    metadata.create_all(engine)
+    service_id = uuid.uuid4()
+    replica_id = uuid.uuid4()
+
+    migration = _load_migration()
+    with engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+        connection.execute(
+            services.insert().values(
+                _logical_snapshot(service_id, service=True, status="deploying")
+            )
+        )
+        connection.execute(
+            replicas.insert().values(_logical_snapshot(replica_id, service_id=service_id))
+        )
+        connection.commit()
+        context = MigrationContext.configure(connection)
+        migration.op = Operations(context)
+
+        with pytest.raises(RuntimeError, match="pending or deploying"):
+            with context.begin_transaction(_per_migration=True):
+                migration.upgrade()
+
+        assert "eligible_node_names" not in {
+            column["name"] for column in sa.inspect(connection).get_columns("model_services")
+        }
+        assert (
+            connection.execute(sa.select(sa.func.count()).select_from(services)).scalar_one() == 1
+        )
+        assert (
+            connection.execute(sa.select(sa.func.count()).select_from(replicas)).scalar_one() == 1
+        )
+        assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
     engine.dispose()
 
 
