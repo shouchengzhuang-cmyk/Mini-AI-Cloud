@@ -305,6 +305,7 @@ async def _ready_dual_vendor_services(
         nvidia_service.runtime_profile_digest = profile_digest
         nvidia_service.allocation_authority = "control_plane_exact_device"
         nvidia_service.selection_policy = "prefer-nvidia"
+        nvidia_service.eligible_node_names = ["worker-a.test", "worker-b.test"]
         for replica in nvidia_replicas:
             replica.logical_model_id = logical_model_id
             replica.model_variant_id = nvidia_variant_id
@@ -316,6 +317,7 @@ async def _ready_dual_vendor_services(
             replica.runtime_profile_digest = profile_digest
             replica.allocation_authority = "control_plane_exact_device"
             replica.selection_policy = "prefer-nvidia"
+            replica.eligible_node_names = ["worker-a.test", "worker-b.test"]
 
         await QuotaRepository.replace(
             session,
@@ -355,6 +357,7 @@ async def _ready_dual_vendor_services(
             runtime_profile_digest=profile_digest,
             allocation_authority="control_plane_exact_device",
             selection_policy="prefer-nvidia",
+            eligible_node_names=["ascend.test"],
         )
         await ServiceRepository.reconcile_locked(session, ascend_service)
         ascend_replica = (await ServiceRepository.list_replicas(session, ascend_service.id))[0]
@@ -1695,6 +1698,202 @@ async def test_ready_logical_model_public_name_routes_to_physical_variant(
     assert route.model_variant_id == nvidia_variant_id
     assert route.selected_vendor == "nvidia"
     assert route.upstream_model == "physical/nvidia"
+
+
+@pytest.mark.parametrize("public_name", ["Public Logical Chat", "m" * 255])
+async def test_listed_logical_model_id_is_accepted_by_http_gateway(
+    gateway_database: Database,
+    public_name: str,
+) -> None:
+    logical_model_id, _nvidia_variant_id, _ascend_variant_id = await _ready_dual_vendor_services(
+        gateway_database
+    )
+    async with gateway_database.session() as session, session.begin():
+        logical_model = await session.get(LogicalModel, logical_model_id)
+        assert logical_model is not None
+        logical_model.public_name = public_name
+
+    dispatched_models: list[str] = []
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        dispatched_models.append(payload["model"])
+        return httpx.Response(200, json={"model": payload["model"], "choices": []})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as upstream_client:
+        gateway = GatewayService(
+            gateway_database,
+            upstream_client,
+            GatewayMetrics(),
+            request_timeout=2,
+            endpoint_host_allowlist="*.test",
+        )
+        app = FastAPI()
+        app.state.gateway_service = gateway
+        register_exception_handlers(app)
+        app.include_router(gateway_routes.router)
+        app.dependency_overrides[get_principal] = _api_key_principal
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://gateway.test",
+        ) as client:
+            listed = await client.get("/v1/models")
+            assert listed.status_code == 200
+            assert [item["id"] for item in listed.json()["data"]] == [public_name]
+
+            completion = await client.post(
+                "/v1/completions",
+                json={"model": public_name, "prompt": "roundtrip"},
+            )
+
+    assert completion.status_code == 200
+    assert completion.json()["model"] == "physical/nvidia"
+    assert dispatched_models == ["physical/nvidia"]
+
+
+async def test_gateway_model_catalog_aggregates_logical_identity_and_filters_policy(
+    gateway_database: Database,
+) -> None:
+    logical_model_id, nvidia_variant_id, _ascend_variant_id = await _ready_dual_vendor_services(
+        gateway_database
+    )
+    async with httpx.AsyncClient() as client:
+        gateway = GatewayService(
+            gateway_database,
+            client,
+            GatewayMetrics(),
+            request_timeout=2,
+        )
+        assert [model.id for model in (await gateway.list_models(project_id=PROJECT_ID)).data] == [
+            "logical-chat"
+        ]
+
+        async with gateway_database.session() as session, session.begin():
+            logical_model = await session.get(LogicalModel, logical_model_id)
+            assert logical_model is not None
+            logical_model.public_name = "Public Logical Chat"
+        listed = await gateway.list_models(project_id=PROJECT_ID)
+        assert [model.id for model in listed.data] == ["Public Logical Chat"]
+
+        async with gateway_database.session() as session, session.begin():
+            logical_model = await session.get(LogicalModel, logical_model_id)
+            nvidia_variant = await session.get(ModelVariant, nvidia_variant_id)
+            assert logical_model is not None and nvidia_variant is not None
+            logical_model.routing_policy = GatewayRoutingPolicy.STRICT_NVIDIA
+            nvidia_variant.status = ModelAvailabilityStatus.DEGRADED
+        assert (await gateway.list_models(project_id=PROJECT_ID)).data == []
+
+        async with gateway_database.session() as session, session.begin():
+            logical_model = await session.get(LogicalModel, logical_model_id)
+            assert logical_model is not None
+            logical_model.routing_policy = GatewayRoutingPolicy.BALANCED
+        assert [model.id for model in (await gateway.list_models(project_id=PROJECT_ID)).data] == [
+            "Public Logical Chat"
+        ]
+
+        ascend_replica_id: uuid.UUID
+        ascend_execution_id: uuid.UUID
+        async with gateway_database.session() as session, session.begin():
+            ascend_service = await session.scalar(
+                select(ModelService).where(
+                    ModelService.logical_model_id == logical_model_id,
+                    ModelService.selected_vendor == "huawei-ascend",
+                )
+            )
+            assert ascend_service is not None
+            ascend_replicas = await ServiceRepository.list_replicas(
+                session, ascend_service.id, for_update=True
+            )
+            assert ascend_replicas
+            ascend_replica_id = ascend_replicas[0].id
+            assert ascend_replicas[0].execution_id is not None
+            ascend_execution_id = ascend_replicas[0].execution_id
+            ascend_replicas[0].execution_id = None
+        assert (await gateway.list_models(project_id=PROJECT_ID)).data == []
+
+        async with gateway_database.session() as session, session.begin():
+            ascend_replica = await session.get(ServiceReplica, ascend_replica_id)
+            assert ascend_replica is not None
+            ascend_replica.execution_id = ascend_execution_id
+        assert [model.id for model in (await gateway.list_models(project_id=PROJECT_ID)).data] == [
+            "Public Logical Chat"
+        ]
+
+        async with gateway_database.session() as session, session.begin():
+            ascend_service = await session.scalar(
+                select(ModelService).where(
+                    ModelService.logical_model_id == logical_model_id,
+                    ModelService.selected_vendor == "huawei-ascend",
+                )
+            )
+            assert ascend_service is not None
+            ascend_replicas = await ServiceRepository.list_replicas(
+                session, ascend_service.id, for_update=True
+            )
+            for replica in ascend_replicas:
+                replica.health = ReplicaHealth.UNHEALTHY
+        assert (await gateway.list_models(project_id=PROJECT_ID)).data == []
+
+        async with gateway_database.session() as session, session.begin():
+            logical_model = await session.get(LogicalModel, logical_model_id)
+            assert logical_model is not None
+            logical_model.status = ModelAvailabilityStatus.DEGRADED
+        assert (await gateway.list_models(project_id=PROJECT_ID)).data == []
+
+
+async def test_gateway_fails_closed_on_historical_cross_namespace_collision(
+    gateway_database: Database,
+) -> None:
+    logical_model_id, _nvidia_variant_id, _ascend_variant_id = await _ready_dual_vendor_services(
+        gateway_database
+    )
+    async with gateway_database.session() as session, session.begin():
+        await ServiceRepository.create(
+            session,
+            project_id=PROJECT_ID,
+            name="legacy-shadow",
+            model="unrelated/direct-model",
+            runtime=ServingRuntime.FAKE,
+            runtime_type=RuntimeType.DOCKER,
+            image=None,
+            cpu_millicores=100,
+            memory_mb=128,
+            gpu_count=0,
+            gpu_memory_mb=0,
+            desired_replicas=0,
+        )
+        logical_model = await session.get(LogicalModel, logical_model_id)
+        assert logical_model is not None
+        logical_model.public_name = "legacy-shadow"
+
+    upstream_calls = 0
+
+    async def upstream(_request: httpx.Request) -> httpx.Response:
+        nonlocal upstream_calls
+        upstream_calls += 1
+        return httpx.Response(200, json={"choices": []})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        gateway = GatewayService(
+            gateway_database,
+            client,
+            GatewayMetrics(),
+            request_timeout=2,
+        )
+        with pytest.raises(APIError) as error:
+            await gateway.forward(
+                project_id=PROJECT_ID,
+                public_model="legacy-shadow",
+                path="/v1/completions",
+                payload={"model": "legacy-shadow", "prompt": "must not dispatch"},
+                request_headers={},
+                stream_requested=False,
+                client_disconnected=lambda: _false(),
+            )
+        assert error.value.status_code == 409
+        assert error.value.code == "GATEWAY_MODEL_NAME_CONFLICT"
+        assert upstream_calls == 0
+        assert (await gateway.list_models(project_id=PROJECT_ID)).data == []
 
 
 @pytest.mark.parametrize(

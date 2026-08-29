@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.accelerators import kind_for_vendor
@@ -19,6 +19,7 @@ from core.enums import (
     WorkerStatus,
     WorkloadType,
 )
+from core.kubernetes_names import validate_kubernetes_dns_subdomain
 from core.runtime_profiles import (
     RuntimeProfileCatalog,
     RuntimeProfileCompatibilityError,
@@ -27,10 +28,11 @@ from core.runtime_profiles import (
 from models.admission import AdmissionEvent
 from models.model_variant import ModelVariant
 from models.scheduling import GPUDevice, ResourceReservation
-from models.service import ModelService
+from models.service import ModelService, ReplicaStatus, ServiceReplica
 from models.task import Task
 from models.worker import Worker
 from repositories.clock import database_utcnow
+from repositories.gateway_model_names import lock_gateway_model_namespace
 from repositories.model_variants import ModelVariantRepository
 from repositories.quotas import (
     QuotaNotFoundError,
@@ -58,6 +60,7 @@ class InventoryDeviceSnapshot:
     worker_status: WorkerStatus
     worker_runtime_types: tuple[str, ...]
     device_uuid: str
+    health: str
     vendor: AcceleratorVendor
     kind: AcceleratorKind
     model: str
@@ -87,6 +90,7 @@ class ServiceAdmissionSnapshot:
     artifact_revision: str
     artifact_digest: str
     dtype: str
+    eligible_node_names: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +136,7 @@ class BatchAdmissionResult:
 class _ServiceCandidateBinding:
     variant: ModelVariant
     resource_name: str | None
+    eligible_node_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,34 +147,284 @@ class _DeferredReservationTotal:
     profile_version: str | None
     profile_digest: str | None
     accelerator_count: int
+    node_name: str | None = None
+    observed_device_ids: tuple[str, ...] | None = None
+    worker_session_matches: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class _DeferredAcceleratorUsage:
-    by_worker_resource: Mapping[tuple[str, str, str], int] = field(default_factory=dict)
+    by_node_resource: Mapping[tuple[str, str, str, str], int] = field(default_factory=dict)
+    unknown_by_worker_resource: Mapping[tuple[str, str, str], int] = field(default_factory=dict)
     unknown_by_worker_vendor: Mapping[tuple[str, str], int] = field(default_factory=dict)
+    unknown_by_vendor_resource: Mapping[tuple[str, str], int] = field(default_factory=dict)
+    unknown_by_vendor: Mapping[str, int] = field(default_factory=dict)
 
     def for_pool(self, *, worker_id: str, vendor: AcceleratorVendor, resource_name: str) -> int:
         vendor_value = vendor.value
-        return self.by_worker_resource.get(
-            (worker_id, vendor_value, resource_name),
-            0,
-        ) + self.unknown_by_worker_vendor.get((worker_id, vendor_value), 0)
+        exact = sum(
+            count
+            for (
+                candidate_worker,
+                _node,
+                candidate_vendor,
+                candidate_resource,
+            ), count in self.by_node_resource.items()
+            if candidate_worker == worker_id
+            and candidate_vendor == vendor_value
+            and candidate_resource == resource_name
+        )
+        return (
+            exact
+            + self.unknown_by_worker_resource.get(
+                (worker_id, vendor_value, resource_name),
+                0,
+            )
+            + self.unknown_by_worker_vendor.get((worker_id, vendor_value), 0)
+            + self.unknown_by_vendor_resource.get((vendor_value, resource_name), 0)
+            + self.unknown_by_vendor.get(vendor_value, 0)
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _ServiceReplicaCommitment:
+    service_id: uuid.UUID
+    replica_ordinal: int
+    vendor: str | None
+    model: str | None
+    resource_name: str | None
+    accelerator_count: int
+    eligible_node_names: tuple[str, ...] | None
+    assigned_node_name: str | None = None
+    generation: int = 1
 
 
 @dataclass(frozen=True, slots=True)
 class _ServiceAcceleratorUsage:
-    by_resource: Mapping[tuple[str, str], int] = field(default_factory=dict)
-    unknown_by_vendor: Mapping[str, int] = field(default_factory=dict)
-    unknown_vendor: int = 0
+    commitments: tuple[_ServiceReplicaCommitment, ...] = ()
 
-    def for_pool(self, *, vendor: AcceleratorVendor, resource_name: str) -> int:
-        vendor_value = vendor.value
-        return (
-            self.by_resource.get((vendor_value, resource_name), 0)
-            + self.unknown_by_vendor.get(vendor_value, 0)
-            + self.unknown_vendor
+
+def _plan_physical_pool_remaining(
+    *,
+    inventory: Sequence[InventoryDeviceSnapshot],
+    vendor: AcceleratorVendor,
+    model: str,
+    resource_name: str,
+    service_usage: _ServiceAcceleratorUsage,
+    deferred_usage: _DeferredAcceleratorUsage,
+) -> dict[tuple[str, str], int] | None:
+    """Plan existing commitments once across one physical accelerator pool.
+
+    A ``None`` result means an incomplete or impossible service snapshot makes
+    the pool unsafe to admit. Existing replica gangs are charged only to their
+    observed Kubernetes node; guessing an unobserved placement can over-admit
+    fragmented tensor-parallel capacity.
+    """
+
+    candidate_node_keys = {
+        (device.worker_id, device.node_name)
+        for device in inventory
+        if device.vendor == vendor
+        and device.model == model
+        and device.kubernetes_resource_name == resource_name
+    }
+    if any(
+        len({device.worker_id for device in inventory if device.node_name == node_name}) != 1
+        for node_name in {
+            candidate_node_name for _worker_id, candidate_node_name in candidate_node_keys
+        }
+    ):
+        return None
+    devices = [
+        device
+        for device in inventory
+        if device.vendor == vendor
+        and device.kubernetes_resource_name == resource_name
+        and (device.worker_id, device.node_name) in candidate_node_keys
+    ]
+    remaining: dict[tuple[str, str], int] = {}
+    for device in devices:
+        node_key = (device.worker_id, device.node_name)
+        remaining[node_key] = remaining.get(node_key, 0) + 1
+
+    vendor_value = vendor.value
+    if (
+        deferred_usage.unknown_by_vendor_resource.get((vendor_value, resource_name), 0) > 0
+        or deferred_usage.unknown_by_vendor.get(vendor_value, 0) > 0
+    ):
+        return None
+    relevant_workers = {key[0] for key in remaining}
+    if any(
+        count > 0
+        and worker_id in relevant_workers
+        and deferred_vendor == vendor_value
+        and deferred_resource == resource_name
+        for (
+            worker_id,
+            deferred_vendor,
+            deferred_resource,
+        ), count in deferred_usage.unknown_by_worker_resource.items()
+    ) or any(
+        count > 0 and worker_id in relevant_workers and deferred_vendor == vendor_value
+        for (worker_id, deferred_vendor), count in deferred_usage.unknown_by_worker_vendor.items()
+    ):
+        return None
+    for (
+        worker_id,
+        node_name,
+        deferred_vendor,
+        deferred_resource,
+    ), deferred in deferred_usage.by_node_resource.items():
+        if deferred_vendor != vendor_value or deferred_resource != resource_name:
+            continue
+        node_key = (worker_id, node_name)
+        if remaining.get(node_key, 0) < deferred:
+            return None
+        remaining[node_key] -= deferred
+
+    for commitment in service_usage.commitments:
+        if commitment.vendor is None:
+            return None
+        if commitment.vendor != vendor.value:
+            continue
+        if commitment.resource_name is None:
+            return None
+        if commitment.resource_name != resource_name:
+            continue
+        if not commitment.eligible_node_names:
+            return None
+        if commitment.assigned_node_name is None:
+            if set(commitment.eligible_node_names).intersection(
+                node_name for _worker_id, node_name in remaining
+            ):
+                return None
+            continue
+        if commitment.assigned_node_name not in set(commitment.eligible_node_names or ()):
+            return None
+        assigned_keys = [
+            node_key for node_key in remaining if node_key[1] == commitment.assigned_node_name
+        ]
+        if not assigned_keys:
+            continue
+        if len(assigned_keys) != 1:
+            return None
+        assigned_key = assigned_keys[0]
+        if commitment.model is None or commitment.model != model:
+            remaining[assigned_key] = 0
+            continue
+        if remaining.get(assigned_key, 0) < commitment.accelerator_count:
+            return None
+        remaining[assigned_key] -= commitment.accelerator_count
+    return remaining
+
+
+def _batch_homogeneous_compatible_devices(
+    *,
+    inventory: Sequence[InventoryDeviceSnapshot],
+    worker_id: str,
+    vendor: AcceleratorVendor,
+    kind: AcceleratorKind,
+    model: str,
+    profile_id: str,
+    resource_name: str,
+    required_capabilities: frozenset[str] = frozenset(),
+    profile_capabilities: frozenset[str] = frozenset(),
+    minimum_memory_mb: int = 0,
+) -> list[InventoryDeviceSnapshot]:
+    candidate_node_keys = {
+        (device.worker_id, device.node_name)
+        for device in inventory
+        if device.worker_id == worker_id
+        and device.health in {"healthy", "inventory-only"}
+        and device.vendor == vendor
+        and device.kind == kind
+        and device.model == model
+        and device.kubernetes_resource_name == resource_name
+        and profile_id in device.runtime_profile_ids
+    }
+    compatible_devices: list[InventoryDeviceSnapshot] = []
+    for node_key in sorted(candidate_node_keys):
+        pool_devices = [
+            device
+            for device in inventory
+            if (device.worker_id, device.node_name) == node_key
+            and device.kubernetes_resource_name == resource_name
+        ]
+        if not pool_devices or not all(
+            device.vendor == vendor
+            and device.kind == kind
+            and device.model == model
+            and device.memory_total_mb >= minimum_memory_mb
+            and profile_id in device.runtime_profile_ids
+            and required_capabilities.issubset(
+                frozenset(device.capabilities) | profile_capabilities
+            )
+            for device in pool_devices
+        ):
+            continue
+        compatible_devices.extend(
+            device for device in pool_devices if device.health in {"healthy", "inventory-only"}
         )
+    return compatible_devices
+
+
+def _batch_pool_available_capacity(
+    *,
+    inventory: Sequence[InventoryDeviceSnapshot],
+    worker_id: str,
+    vendor: AcceleratorVendor,
+    kind: AcceleratorKind,
+    model: str,
+    profile_id: str,
+    resource_name: str,
+    service_usage: _ServiceAcceleratorUsage,
+    deferred_usage: _DeferredAcceleratorUsage,
+    required_capabilities: frozenset[str] = frozenset(),
+    profile_capabilities: frozenset[str] = frozenset(),
+    minimum_memory_mb: int = 0,
+) -> int:
+    remaining = _plan_physical_pool_remaining(
+        inventory=inventory,
+        vendor=vendor,
+        model=model,
+        resource_name=resource_name,
+        service_usage=service_usage,
+        deferred_usage=deferred_usage,
+    )
+    if remaining is None:
+        return 0
+    compatible_by_node: dict[tuple[str, str], int] = {}
+    for device in _batch_homogeneous_compatible_devices(
+        inventory=inventory,
+        worker_id=worker_id,
+        vendor=vendor,
+        kind=kind,
+        model=model,
+        profile_id=profile_id,
+        resource_name=resource_name,
+        required_capabilities=required_capabilities,
+        profile_capabilities=profile_capabilities,
+        minimum_memory_mb=minimum_memory_mb,
+    ):
+        node_key = (device.worker_id, device.node_name)
+        compatible_by_node[node_key] = compatible_by_node.get(node_key, 0) + 1
+    return sum(
+        max(
+            0,
+            compatible_count
+            - (
+                sum(
+                    1
+                    for device in inventory
+                    if (device.worker_id, device.node_name) == node_key
+                    and device.vendor == vendor
+                    and device.kubernetes_resource_name == resource_name
+                )
+                - remaining.get(node_key, 0)
+            ),
+        )
+        for node_key, compatible_count in compatible_by_node.items()
+    )
 
 
 def typed_quota_available(
@@ -257,6 +512,7 @@ class AdmissionRepository:
         minimum_memory_mb: int = 0,
         runtime_type: RuntimeType | None = None,
         for_update: bool = False,
+        include_unavailable: bool = False,
     ) -> list[InventoryDeviceSnapshot]:
         if minimum_memory_mb < 0:
             raise ValueError("minimum_memory_mb must not be negative")
@@ -271,7 +527,6 @@ class AdmissionRepository:
             .where(
                 Worker.status == WorkerStatus.ONLINE,
                 Worker.overcommitted.is_(False),
-                GPUDevice.health.in_(accepted_health),
                 GPUDevice.inventory_generation == Worker.inventory_generation,
                 GPUDevice.memory_free_mb >= minimum_memory_mb,
                 GPUDevice.vendor.in_(tuple(vendor.value for vendor in vendors)),
@@ -286,6 +541,8 @@ class AdmissionRepository:
                 GPUDevice.id,
             )
         )
+        if not include_unavailable:
+            query = query.where(GPUDevice.health.in_(accepted_health))
         if for_update:
             query = query.with_for_update()
         rows = list((await session.execute(query)).all())
@@ -294,15 +551,26 @@ class AdmissionRepository:
             runtime_types = tuple(sorted(set(worker.runtime_types or [])))
             if runtime_type is not None and runtime_type.value not in runtime_types:
                 continue
+            if runtime_type == RuntimeType.KUBERNETES:
+                try:
+                    node_name = validate_kubernetes_dns_subdomain(
+                        worker.node_name,
+                        field_name="worker node_name",
+                    )
+                except (TypeError, ValueError):
+                    continue
+            else:
+                node_name = worker.node_name or worker.id
             result.append(
                 InventoryDeviceSnapshot(
                     device_id=device.id,
                     worker_id=worker.id,
-                    node_name=worker.node_name or worker.id,
+                    node_name=node_name,
                     worker_session_id=worker.worker_session_id,
                     worker_status=worker.status,
                     worker_runtime_types=runtime_types,
                     device_uuid=device.device_uuid,
+                    health=device.health,
                     vendor=AcceleratorVendor(device.vendor),
                     kind=AcceleratorKind(device.accelerator_kind),
                     model=device.model,
@@ -331,15 +599,95 @@ class AdmissionRepository:
         normalized_resource = resource_name.strip()
         if not normalized_resource:
             raise ValueError("resource_name must not be blank")
+        worker = await session.get(Worker, worker_id)
+        if worker is None or worker.node_name is None:
+            return 0
+        try:
+            node_name = validate_kubernetes_dns_subdomain(
+                worker.node_name,
+                field_name="worker node_name",
+            )
+        except (TypeError, ValueError):
+            return 0
         usage = await _active_deferred_accelerators(
             session,
             catalog=catalog,
-            worker_ids=frozenset({worker_id}),
+            node_owners={node_name: worker_id},
+            vendors=frozenset({vendor}),
         )
         return usage.for_pool(
             worker_id=worker_id,
             vendor=vendor,
             resource_name=normalized_resource,
+        )
+
+    @staticmethod
+    async def available_batch_accelerators_for_pool(
+        session: AsyncSession,
+        *,
+        catalog: RuntimeProfileCatalog,
+        worker_id: str,
+        vendor: AcceleratorVendor,
+        kind: AcceleratorKind,
+        model: str,
+        profile_id: str,
+        profile_version: str,
+        profile_digest: str,
+        resource_name: str,
+        minimum_memory_mb: int,
+        required_capabilities: frozenset[str] = frozenset(),
+    ) -> int:
+        """Recompute one worker's batch capacity with the shared pool planner."""
+
+        normalized_resource = resource_name.strip()
+        if not normalized_resource:
+            raise ValueError("resource_name must not be blank")
+        try:
+            profile = catalog.load_exact(
+                profile_id=profile_id,
+                profile_version=profile_version,
+                semantic_digest=profile_digest,
+            )
+        except RuntimeProfileCompatibilityError:
+            return 0
+        if (
+            profile.vendor != vendor
+            or profile.kind != kind
+            or profile.kubernetes.resource_name != normalized_resource
+        ):
+            return 0
+        profile_capabilities = frozenset(profile.capabilities.features) | frozenset(
+            profile.capabilities.dtypes
+        )
+        inventory = await AdmissionRepository.list_healthy_inventory_devices(
+            session,
+            vendors=(vendor,),
+            kinds=(kind,),
+            minimum_memory_mb=0,
+            runtime_type=RuntimeType.KUBERNETES,
+            for_update=True,
+            include_unavailable=True,
+        )
+        service_usage = await _active_service_accelerators(session)
+        deferred_usage = await _active_deferred_accelerators(
+            session,
+            catalog=catalog,
+            node_owners=_unique_inventory_node_owners(inventory),
+            vendors=frozenset({vendor}),
+        )
+        return _batch_pool_available_capacity(
+            inventory=inventory,
+            worker_id=worker_id,
+            vendor=vendor,
+            kind=kind,
+            model=model,
+            profile_id=profile_id,
+            resource_name=normalized_resource,
+            service_usage=service_usage,
+            deferred_usage=deferred_usage,
+            required_capabilities=required_capabilities,
+            profile_capabilities=profile_capabilities,
+            minimum_memory_mb=minimum_memory_mb,
         )
 
     @staticmethod
@@ -427,18 +775,26 @@ class AdmissionRepository:
             session,
             vendors=tuple(sorted(request.allowed_vendors, key=lambda item: item.value)),
             kinds=tuple(sorted(request.allowed_kinds, key=lambda item: item.value)),
-            minimum_memory_mb=task.gpu_memory_mb,
+            minimum_memory_mb=0,
             runtime_type=RuntimeType.KUBERNETES,
             for_update=True,
+            include_unavailable=True,
         )
+        candidate_inventory = [
+            device for device in inventory if device.health in {"healthy", "inventory-only"}
+        ]
         if allowed_worker_ids is not None:
-            inventory = [device for device in inventory if device.worker_id in allowed_worker_ids]
+            candidate_inventory = [
+                device for device in candidate_inventory if device.worker_id in allowed_worker_ids
+            ]
 
         active_deferred = await _active_deferred_accelerators(
             session,
             catalog=catalog,
-            worker_ids=frozenset(device.worker_id for device in inventory),
+            node_owners=_unique_inventory_node_owners(inventory),
+            vendors=request.allowed_vendors,
         )
+        active_services = await _active_service_accelerators(session)
 
         candidates: list[AdmissionCandidate] = []
         bindings: dict[str, tuple[InventoryDeviceSnapshot, str, str, str]] = {}
@@ -457,7 +813,7 @@ class AdmissionRepository:
             ) > _profile_version_key(current.profile_version)
             if is_newer:
                 latest_entries[latest_key] = entry
-        for device in inventory:
+        for device in candidate_inventory:
             for entry in latest_entries.values():
                 if (
                     entry.profile_id not in device.runtime_profile_ids
@@ -506,14 +862,28 @@ class AdmissionRepository:
                 profile_version=profile_version,
                 semantic_digest=profile_digest,
             )
+            profile_capabilities = frozenset(profile.capabilities.features) | frozenset(
+                profile.capabilities.dtypes
+            )
+            compatible_devices = _batch_homogeneous_compatible_devices(
+                inventory=inventory,
+                worker_id=worker_id,
+                vendor=vendor,
+                kind=kind,
+                model=model,
+                profile_id=profile_id,
+                resource_name=resource_name,
+                required_capabilities=request.required_capabilities,
+                profile_capabilities=profile_capabilities,
+                minimum_memory_mb=task.gpu_memory_mb,
+            )
             capabilities = (
                 frozenset(
-                    set.intersection(*(set(device.capabilities) for device in devices))
-                    if devices
+                    set.intersection(*(set(device.capabilities) for device in compatible_devices))
+                    if compatible_devices
                     else set()
                 )
-                | frozenset(profile.capabilities.features)
-                | frozenset(profile.capabilities.dtypes)
+                | profile_capabilities
             )
             candidate_id = f"{worker_id}:{profile_id}@{profile_version}:{model}:{index}"
             finite_quota = typed_quota_available(quota, vendor)
@@ -527,14 +897,19 @@ class AdmissionRepository:
                 runtime_profile_digest=profile_digest,
                 model_variant_id=None,
                 allocation_authority=AllocationAuthority.KUBERNETES_DEVICE_PLUGIN,
-                available_capacity=max(
-                    0,
-                    len(devices)
-                    - active_deferred.for_pool(
-                        worker_id=worker_id,
-                        vendor=vendor,
-                        resource_name=resource_name,
-                    ),
+                available_capacity=_batch_pool_available_capacity(
+                    inventory=inventory,
+                    worker_id=worker_id,
+                    vendor=vendor,
+                    kind=kind,
+                    model=model,
+                    profile_id=profile_id,
+                    resource_name=resource_name,
+                    service_usage=active_services,
+                    deferred_usage=active_deferred,
+                    required_capabilities=request.required_capabilities,
+                    profile_capabilities=profile_capabilities,
+                    minimum_memory_mb=task.gpu_memory_mb,
                 ),
                 available_quota=(request.count if finite_quota is None else finite_quota),
                 healthy=True,
@@ -616,6 +991,10 @@ class AdmissionRepository:
     ) -> ServiceAdmissionResult:
         if desired_replicas < 0:
             raise ValueError("desired_replicas must not be negative")
+        # Service creation serializes the project namespace before quota rows.
+        # Match that global lock order here so logical admission cannot deadlock
+        # a concurrent direct service create (Project -> quota/state).
+        await lock_gateway_model_namespace(session, project_id=project_id)
         try:
             quota = await QuotaRepository.get_locked(session, project_id=project_id)
         except QuotaNotFoundError:
@@ -633,15 +1012,17 @@ class AdmissionRepository:
             session,
             vendors=tuple(sorted(request.allowed_vendors, key=lambda item: item.value)),
             kinds=tuple(sorted(request.allowed_kinds, key=lambda item: item.value)),
-            minimum_memory_mb=minimum_memory_mb,
+            minimum_memory_mb=0,
             runtime_type=RuntimeType.KUBERNETES,
             for_update=True,
+            include_unavailable=True,
         )
         service_usage = await _active_service_accelerators(session)
         deferred_usage = await _active_deferred_accelerators(
             session,
             catalog=catalog,
-            worker_ids=frozenset(device.worker_id for device in inventory),
+            node_owners=_unique_inventory_node_owners(inventory),
+            vendors=request.allowed_vendors,
         )
         candidates, bindings = _service_candidates(
             variants=variants,
@@ -653,6 +1034,7 @@ class AdmissionRepository:
             requested_dtype=requested_dtype,
             service_usage=service_usage,
             deferred_usage=deferred_usage,
+            minimum_memory_mb=minimum_memory_mb,
         )
         if candidates:
             decision = choose_admission(request, candidates)
@@ -736,6 +1118,7 @@ class AdmissionRepository:
             artifact_revision=locked_variant.artifact_revision,
             artifact_digest=locked_variant.artifact_digest,
             dtype=locked_variant.dtype,
+            eligible_node_names=binding.eligible_node_names,
         )
         return ServiceAdmissionResult(
             snapshot=snapshot,
@@ -873,9 +1256,10 @@ class AdmissionRepository:
             session,
             vendors=(vendor,),
             kinds=(kind,),
-            minimum_memory_mb=service.gpu_memory_mb,
+            minimum_memory_mb=0,
             runtime_type=RuntimeType.KUBERNETES,
             for_update=True,
+            include_unavailable=True,
         )
         service_usage = await _active_service_accelerators(
             session,
@@ -884,7 +1268,8 @@ class AdmissionRepository:
         deferred_usage = await _active_deferred_accelerators(
             session,
             catalog=catalog,
-            worker_ids=frozenset(device.worker_id for device in inventory),
+            node_owners=_unique_inventory_node_owners(inventory),
+            vendors=frozenset({vendor}),
         )
         candidates, bindings = _service_candidates(
             variants=(variant,),
@@ -897,6 +1282,7 @@ class AdmissionRepository:
             service_usage=service_usage,
             deferred_usage=deferred_usage,
             quota_credit=service.gpu_count * service.desired_replicas,
+            minimum_memory_mb=service.gpu_memory_mb,
         )
         decision = (
             choose_admission(request, candidates)
@@ -1001,6 +1387,7 @@ class AdmissionRepository:
                 artifact_revision=locked_variant.artifact_revision,
                 artifact_digest=locked_variant.artifact_digest,
                 dtype=locked_variant.dtype,
+                eligible_node_names=binding.eligible_node_names,
             ),
             reason=None,
             rejected_vendor=None,
@@ -1020,6 +1407,7 @@ def _service_candidates(
     service_usage: _ServiceAcceleratorUsage | None = None,
     deferred_usage: _DeferredAcceleratorUsage | None = None,
     quota_credit: int = 0,
+    minimum_memory_mb: int = 0,
 ) -> tuple[list[AdmissionCandidate], dict[str, _ServiceCandidateBinding]]:
     if quota_credit < 0:
         raise ValueError("quota_credit must not be negative")
@@ -1056,28 +1444,30 @@ def _service_candidates(
             for device in inventory
             if device.vendor == variant.vendor and device.kind == variant.kind
         ]
-        profiled = [
-            device
-            for device in relevant
-            if variant.runtime_profile_id in device.runtime_profile_ids
-            and runtime_profile is not None
-            and device.kubernetes_resource_name == runtime_profile.kubernetes.resource_name
-        ]
-        groups: dict[
-            tuple[str, str, str, str, tuple[str, ...]],
-            list[InventoryDeviceSnapshot],
-        ] = {}
-        for device in profiled:
-            capabilities_set = set(device.capabilities)
-            capabilities_set.add(variant.dtype)
+        profiled: list[InventoryDeviceSnapshot] = []
+        effective_capabilities: dict[uuid.UUID, frozenset[str]] = {}
+        for device in relevant:
+            capabilities = set(device.capabilities)
+            capabilities.add(variant.dtype)
             if manifest_entry is not None:
-                capabilities_set.update(manifest_entry.features)
+                capabilities.update(manifest_entry.features)
+            frozen_capabilities = frozenset(capabilities)
+            effective_capabilities[device.device_id] = frozen_capabilities
+            if (
+                device.health not in {"healthy", "inventory-only"}
+                or variant.runtime_profile_id not in device.runtime_profile_ids
+                or runtime_profile is None
+                or device.kubernetes_resource_name != runtime_profile.kubernetes.resource_name
+            ):
+                continue
+            if not request.required_capabilities.issubset(frozen_capabilities):
+                continue
+            profiled.append(device)
+        groups: dict[tuple[str, str], list[InventoryDeviceSnapshot]] = {}
+        for device in profiled:
             key = (
-                device.worker_id,
-                device.node_name,
                 device.model,
                 device.kubernetes_resource_name or "",
-                tuple(sorted(capabilities_set)),
             )
             groups.setdefault(key, []).append(device)
 
@@ -1088,15 +1478,85 @@ def _service_candidates(
             request.count if finite_quota is None else finite_quota // commitment_divisor
         )
         for index, (key, devices) in enumerate(sorted(groups.items()), start=1):
-            worker_id, _node_name, model, resource_name, capabilities = key
+            model, resource_name = key
             candidate_id = f"{variant.id}:{index}"
-            occupied = service_usage.for_pool(
+            candidate_node_keys = {(device.worker_id, device.node_name) for device in devices}
+            compatible_node_keys: set[tuple[str, str]] = set()
+            for node_key in candidate_node_keys:
+                pool_devices = [
+                    device
+                    for device in inventory
+                    if (device.worker_id, device.node_name) == node_key
+                    and device.kubernetes_resource_name == resource_name
+                ]
+                if pool_devices and all(
+                    device.vendor == variant.vendor
+                    and device.kind == variant.kind
+                    and device.model == model
+                    and device.memory_total_mb >= minimum_memory_mb
+                    and variant.runtime_profile_id in device.runtime_profile_ids
+                    and request.required_capabilities.issubset(
+                        effective_capabilities[device.device_id]
+                    )
+                    for device in pool_devices
+                ):
+                    compatible_node_keys.add(node_key)
+            workers_by_node_name: dict[str, set[str]] = {}
+            for worker_id, node_name in compatible_node_keys:
+                workers_by_node_name.setdefault(node_name, set()).add(worker_id)
+            ambiguous_node_names = {
+                node_name
+                for node_name, worker_ids in workers_by_node_name.items()
+                if len(worker_ids) != 1
+            }
+            compatible_node_keys = {
+                node_key
+                for node_key in compatible_node_keys
+                if node_key[1] not in ambiguous_node_names
+            }
+            compatible_devices = [
+                device
+                for device in devices
+                if (device.worker_id, device.node_name) in compatible_node_keys
+            ]
+            compatible_counts: dict[tuple[str, str], int] = {}
+            for device in compatible_devices:
+                node_key = (device.worker_id, device.node_name)
+                compatible_counts[node_key] = compatible_counts.get(node_key, 0) + 1
+            remaining = _plan_physical_pool_remaining(
+                inventory=inventory,
                 vendor=variant.vendor,
+                model=model,
                 resource_name=resource_name,
-            ) + deferred_usage.for_pool(
-                worker_id=worker_id,
-                vendor=variant.vendor,
-                resource_name=resource_name,
+                service_usage=service_usage,
+                deferred_usage=deferred_usage,
+            )
+            available_by_node: dict[tuple[str, str], int] = {}
+            for node_key, compatible_count in compatible_counts.items():
+                physical_count = sum(
+                    1
+                    for device in inventory
+                    if (device.worker_id, device.node_name) == node_key
+                    and device.vendor == variant.vendor
+                    and device.kubernetes_resource_name == resource_name
+                )
+                used_count = physical_count - (remaining or {}).get(node_key, 0)
+                available_by_node[node_key] = max(0, compatible_count - used_count)
+            available_replica_slots = sum(
+                count // request.count for count in available_by_node.values()
+            )
+            capabilities = (
+                set.intersection(
+                    *(
+                        set(effective_capabilities[device.device_id])
+                        for device in compatible_devices
+                    )
+                )
+                if compatible_devices
+                else set(request.required_capabilities)
+            )
+            eligible_node_names = tuple(
+                sorted({node_name for _worker_id, node_name in compatible_node_keys})
             )
             candidate = AdmissionCandidate(
                 candidate_id=candidate_id,
@@ -1108,7 +1568,7 @@ def _service_candidates(
                 runtime_profile_digest=variant.runtime_profile_digest,
                 model_variant_id=str(variant.id),
                 allocation_authority=AllocationAuthority.KUBERNETES_DEVICE_PLUGIN,
-                available_capacity=max(0, len(devices) - occupied) // commitment_divisor,
+                available_capacity=(available_replica_slots * request.count) // commitment_divisor,
                 available_quota=available_quota,
                 healthy=True,
                 capabilities=frozenset(capabilities),
@@ -1119,6 +1579,7 @@ def _service_candidates(
             bindings[candidate_id] = _ServiceCandidateBinding(
                 variant=variant,
                 resource_name=resource_name,
+                eligible_node_names=eligible_node_names,
             )
 
         if groups:
@@ -1328,63 +1789,89 @@ async def _active_deferred_accelerators(
     session: AsyncSession,
     *,
     catalog: RuntimeProfileCatalog,
-    worker_ids: frozenset[str],
+    node_owners: Mapping[str, str],
+    vendors: frozenset[AcceleratorVendor],
 ) -> _DeferredAcceleratorUsage:
-    if not worker_ids:
+    if not node_owners or not vendors:
         return _DeferredAcceleratorUsage()
     rows = await session.execute(
         select(
             ResourceReservation.worker_id,
+            ResourceReservation.worker_session_id,
+            Worker.node_name,
+            Worker.worker_session_id,
             ResourceReservation.requested_vendor,
             ResourceReservation.requested_profile_id,
             ResourceReservation.requested_profile_version,
             ResourceReservation.requested_profile_digest,
-            func.coalesce(func.sum(ResourceReservation.gpu_count), 0),
+            ResourceReservation.gpu_count,
+            ResourceReservation.observed_device_ids_json,
         )
+        .join(Worker, Worker.id == ResourceReservation.worker_id)
         .where(
-            ResourceReservation.worker_id.in_(worker_ids),
             ResourceReservation.released_at.is_(None),
             ResourceReservation.allocation_authority
             == AllocationAuthority.KUBERNETES_DEVICE_PLUGIN.value,
             ResourceReservation.requested_vendor.is_not(None),
+            ResourceReservation.requested_vendor.in_(
+                tuple(sorted(vendor.value for vendor in vendors))
+            ),
         )
-        .group_by(
+        .order_by(
             ResourceReservation.worker_id,
+            ResourceReservation.id,
             ResourceReservation.requested_vendor,
-            ResourceReservation.requested_profile_id,
-            ResourceReservation.requested_profile_version,
-            ResourceReservation.requested_profile_digest,
         )
     )
     totals = [
         _DeferredReservationTotal(
             worker_id=worker_id,
+            node_name=node_name,
+            worker_session_matches=(reservation_worker_session_id == current_worker_session_id),
             vendor=vendor,
             profile_id=profile_id,
             profile_version=profile_version,
             profile_digest=profile_digest,
             accelerator_count=int(accelerator_count),
+            observed_device_ids=(
+                tuple(observed_device_ids)
+                if isinstance(observed_device_ids, list)
+                and all(isinstance(value, str) for value in observed_device_ids)
+                else None
+            ),
         )
         for (
             worker_id,
+            reservation_worker_session_id,
+            node_name,
+            current_worker_session_id,
             vendor,
             profile_id,
             profile_version,
             profile_digest,
             accelerator_count,
+            observed_device_ids,
         ) in rows
         if vendor is not None
     ]
-    return _classify_deferred_accelerators(totals, catalog=catalog)
+    return _classify_deferred_accelerators(
+        totals,
+        catalog=catalog,
+        node_owners=node_owners,
+    )
 
 
 def _classify_deferred_accelerators(
     totals: Sequence[_DeferredReservationTotal],
     *,
     catalog: RuntimeProfileCatalog,
+    node_owners: Mapping[str, str] | None = None,
 ) -> _DeferredAcceleratorUsage:
-    by_worker_resource: dict[tuple[str, str, str], int] = {}
+    by_node_resource: dict[tuple[str, str, str, str], int] = {}
+    unknown_by_worker_resource: dict[tuple[str, str, str], int] = {}
     unknown_by_worker_vendor: dict[tuple[str, str], int] = {}
+    unknown_by_vendor_resource: dict[tuple[str, str], int] = {}
+    unknown_by_vendor: dict[str, int] = {}
     for total in totals:
         resource_name: str | None = None
         if (
@@ -1402,20 +1889,82 @@ def _classify_deferred_accelerators(
                     resource_name = profile.kubernetes.resource_name
             except RuntimeProfileCompatibilityError:
                 pass
+        stable_node = total.worker_session_matches and _is_valid_kubernetes_node_name(
+            total.node_name
+        )
+        if node_owners is None:
+            current_owner = total.worker_id if stable_node else None
+        else:
+            current_owner = node_owners.get(total.node_name or "") if stable_node else None
+            if stable_node and current_owner is None:
+                # The reservation belongs to a different physical Kubernetes node.
+                continue
         if resource_name is None:
-            fallback_key = (total.worker_id, total.vendor)
+            if node_owners is not None:
+                if not stable_node or current_owner is None:
+                    unknown_by_vendor[total.vendor] = (
+                        unknown_by_vendor.get(total.vendor, 0) + total.accelerator_count
+                    )
+                    continue
+                fallback_key = (current_owner, total.vendor)
+            else:
+                fallback_key = (total.worker_id, total.vendor)
             unknown_by_worker_vendor[fallback_key] = (
                 unknown_by_worker_vendor.get(fallback_key, 0) + total.accelerator_count
             )
             continue
-        resource_key = (total.worker_id, total.vendor, resource_name)
-        by_worker_resource[resource_key] = (
-            by_worker_resource.get(resource_key, 0) + total.accelerator_count
+        if stable_node and current_owner is not None:
+            assert total.node_name is not None
+            resource_key = (
+                current_owner,
+                total.node_name,
+                total.vendor,
+                resource_name,
+            )
+            by_node_resource[resource_key] = (
+                by_node_resource.get(resource_key, 0) + total.accelerator_count
+            )
+            continue
+        if node_owners is not None:
+            global_resource_key = (total.vendor, resource_name)
+            unknown_by_vendor_resource[global_resource_key] = (
+                unknown_by_vendor_resource.get(global_resource_key, 0) + total.accelerator_count
+            )
+            continue
+        fallback_resource_key = (total.worker_id, total.vendor, resource_name)
+        unknown_by_worker_resource[fallback_resource_key] = (
+            unknown_by_worker_resource.get(fallback_resource_key, 0) + total.accelerator_count
         )
     return _DeferredAcceleratorUsage(
-        by_worker_resource=by_worker_resource,
+        by_node_resource=by_node_resource,
+        unknown_by_worker_resource=unknown_by_worker_resource,
         unknown_by_worker_vendor=unknown_by_worker_vendor,
+        unknown_by_vendor_resource=unknown_by_vendor_resource,
+        unknown_by_vendor=unknown_by_vendor,
     )
+
+
+def _unique_inventory_node_owners(
+    inventory: Sequence[InventoryDeviceSnapshot],
+) -> dict[str, str]:
+    workers_by_node: dict[str, set[str]] = {}
+    for device in inventory:
+        workers_by_node.setdefault(device.node_name, set()).add(device.worker_id)
+    return {
+        node_name: next(iter(worker_ids))
+        for node_name, worker_ids in workers_by_node.items()
+        if len(worker_ids) == 1
+    }
+
+
+def _is_valid_kubernetes_node_name(value: str | None) -> bool:
+    if value is None:
+        return False
+    try:
+        validate_kubernetes_dns_subdomain(value, field_name="worker node_name")
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 async def _active_service_accelerators(
@@ -1423,37 +1972,176 @@ async def _active_service_accelerators(
     *,
     exclude_service_id: uuid.UUID | None = None,
 ) -> _ServiceAcceleratorUsage:
-    query = select(
+    commitments: list[_ServiceReplicaCommitment] = []
+    current_materialized: dict[tuple[uuid.UUID, int], int] = {}
+    replica_query = (
+        select(
+            ServiceReplica.service_id,
+            ServiceReplica.generation,
+            ServiceReplica.ordinal,
+            ServiceReplica.selected_vendor,
+            ServiceReplica.selected_model,
+            ServiceReplica.accelerator_resource_name,
+            ServiceReplica.eligible_node_names,
+            ServiceReplica.assigned_node_name,
+            ServiceReplica.status,
+            ModelService.generation,
+            ModelService.gpu_count,
+            ModelService.tensor_parallel_size,
+        )
+        .join(ModelService, ModelService.id == ServiceReplica.service_id)
+        .where(
+            ModelService.runtime_type == RuntimeType.KUBERNETES,
+            or_(ModelService.gpu_count > 0, ModelService.selected_vendor.is_not(None)),
+            ServiceReplica.status.in_(
+                (
+                    ReplicaStatus.PENDING,
+                    ReplicaStatus.STARTING,
+                    ReplicaStatus.LOADING,
+                    ReplicaStatus.RUNNING,
+                    ReplicaStatus.DRAINING,
+                    ReplicaStatus.STOPPING,
+                )
+            ),
+        )
+    )
+    if exclude_service_id is not None:
+        replica_query = replica_query.where(
+            or_(
+                ServiceReplica.service_id != exclude_service_id,
+                ServiceReplica.generation != ModelService.generation,
+                ServiceReplica.status.in_((ReplicaStatus.DRAINING, ReplicaStatus.STOPPING)),
+            )
+        )
+    replica_rows = await session.execute(
+        replica_query.order_by(
+            ServiceReplica.service_id,
+            ServiceReplica.generation,
+            ServiceReplica.ordinal,
+        )
+    )
+    for (
+        service_id,
+        replica_generation,
+        replica_ordinal,
+        vendor,
+        model,
+        resource_name,
+        eligible_node_names,
+        assigned_node_name,
+        replica_status,
+        service_generation,
+        gpu_count,
+        tensor_parallel_size,
+    ) in replica_rows:
+        accelerators_per_replica = max(int(gpu_count), int(tensor_parallel_size))
+        commitments.append(
+            _service_commitment(
+                service_id=service_id,
+                generation=int(replica_generation),
+                replica_ordinal=int(replica_ordinal),
+                vendor=vendor,
+                model=model,
+                resource_name=resource_name,
+                accelerator_count=accelerators_per_replica,
+                eligible_node_names=eligible_node_names,
+                assigned_node_name=assigned_node_name,
+            )
+        )
+        if int(replica_generation) == int(service_generation) and replica_status in {
+            ReplicaStatus.PENDING,
+            ReplicaStatus.STARTING,
+            ReplicaStatus.LOADING,
+            ReplicaStatus.RUNNING,
+        }:
+            current_key = (service_id, int(service_generation))
+            current_materialized[current_key] = current_materialized.get(current_key, 0) + 1
+
+    service_query = select(
+        ModelService.id,
+        ModelService.generation,
         ModelService.selected_vendor,
+        ModelService.selected_model,
         ModelService.accelerator_resource_name,
+        ModelService.eligible_node_names,
         ModelService.gpu_count,
         ModelService.tensor_parallel_size,
         ModelService.desired_replicas,
     ).where(
         ModelService.runtime_type == RuntimeType.KUBERNETES,
         ModelService.desired_replicas > 0,
-        ModelService.gpu_count > 0,
+        or_(ModelService.gpu_count > 0, ModelService.selected_vendor.is_not(None)),
     )
     if exclude_service_id is not None:
-        query = query.where(ModelService.id != exclude_service_id)
-    rows = await session.execute(query.order_by(ModelService.id))
-    by_resource: dict[tuple[str, str], int] = {}
-    unknown_by_vendor: dict[str, int] = {}
-    unknown_vendor = 0
-    for vendor, resource_name, gpu_count, tensor_parallel_size, desired_replicas in rows:
-        accelerator_count = max(int(gpu_count), int(tensor_parallel_size)) * int(desired_replicas)
-        normalized_resource = (resource_name or "").strip()
-        if vendor is None:
-            unknown_vendor += accelerator_count
-        elif not normalized_resource:
-            unknown_by_vendor[vendor] = unknown_by_vendor.get(vendor, 0) + accelerator_count
-        else:
-            resource_key = (vendor, normalized_resource)
-            by_resource[resource_key] = by_resource.get(resource_key, 0) + accelerator_count
-    return _ServiceAcceleratorUsage(
-        by_resource=by_resource,
-        unknown_by_vendor=unknown_by_vendor,
-        unknown_vendor=unknown_vendor,
+        service_query = service_query.where(ModelService.id != exclude_service_id)
+    service_rows = await session.execute(service_query.order_by(ModelService.id))
+    for (
+        service_id,
+        generation,
+        vendor,
+        model,
+        resource_name,
+        eligible_node_names,
+        gpu_count,
+        tensor_parallel_size,
+        desired_replicas,
+    ) in service_rows:
+        materialized = current_materialized.get((service_id, int(generation)), 0)
+        missing = max(0, int(desired_replicas) - materialized)
+        accelerators_per_replica = max(int(gpu_count), int(tensor_parallel_size))
+        for replica_ordinal in range(materialized, materialized + missing):
+            commitments.append(
+                _service_commitment(
+                    service_id=service_id,
+                    generation=int(generation),
+                    replica_ordinal=replica_ordinal,
+                    vendor=vendor,
+                    model=model,
+                    resource_name=resource_name,
+                    accelerator_count=accelerators_per_replica,
+                    eligible_node_names=eligible_node_names,
+                    assigned_node_name=None,
+                )
+            )
+    return _ServiceAcceleratorUsage(commitments=tuple(commitments))
+
+
+def _service_commitment(
+    *,
+    service_id: uuid.UUID,
+    generation: int,
+    replica_ordinal: int,
+    vendor: object,
+    model: object,
+    resource_name: object,
+    accelerator_count: int,
+    eligible_node_names: object,
+    assigned_node_name: object,
+) -> _ServiceReplicaCommitment:
+    normalized_nodes = (
+        tuple(eligible_node_names)
+        if isinstance(eligible_node_names, list)
+        and eligible_node_names
+        and all(isinstance(value, str) for value in eligible_node_names)
+        and tuple(eligible_node_names) == tuple(sorted(set(eligible_node_names)))
+        else None
+    )
+
+    def normalized(value: object) -> str | None:
+        if isinstance(value, AcceleratorVendor):
+            return value.value
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+    return _ServiceReplicaCommitment(
+        service_id=service_id,
+        generation=generation,
+        replica_ordinal=replica_ordinal,
+        vendor=normalized(vendor),
+        model=normalized(model),
+        resource_name=normalized(resource_name),
+        accelerator_count=accelerator_count,
+        eligible_node_names=normalized_nodes,
+        assigned_node_name=normalized(assigned_node_name),
     )
 
 

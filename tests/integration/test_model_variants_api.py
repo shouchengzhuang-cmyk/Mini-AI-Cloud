@@ -13,10 +13,12 @@ from api.dependencies import get_principal
 from api.errors import register_exception_handlers
 from api.routes import model_variants
 from core.database import Database
-from core.enums import ProjectRole
+from core.enums import ProjectRole, RuntimeType
 from core.rbac import Principal, PrincipalKind
 from core.runtime_profiles import RuntimeProfileCatalog, RuntimeProfileManifestEntry
 from models.identity import Project
+from models.service import ServingRuntime
+from repositories.services import ServiceRepository
 
 pytestmark = pytest.mark.integration
 
@@ -248,6 +250,35 @@ async def test_logical_model_public_name_conflict_is_stable(
     )
     assert duplicate.status_code == 409
     assert duplicate.json()["error"]["code"] == "LOGICAL_MODEL_PUBLIC_NAME_ALREADY_EXISTS"
+
+
+async def test_logical_model_public_name_rejects_existing_service_name(
+    variants_client: AsyncClient,
+    database: Database,
+) -> None:
+    async with database.session() as session, session.begin():
+        await ServiceRepository.create(
+            session,
+            project_id=PROJECT_ID,
+            name="shared-gateway-name",
+            model="org/direct-model",
+            runtime=ServingRuntime.FAKE,
+            runtime_type=RuntimeType.DOCKER,
+            image=None,
+            cpu_millicores=100,
+            memory_mb=128,
+            gpu_count=0,
+            gpu_memory_mb=0,
+            desired_replicas=0,
+        )
+
+    response = await variants_client.post(
+        f"/api/v1/projects/{PROJECT_ID}/logical-models",
+        json={"name": "logical-owner", "public_name": "shared-gateway-name"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "LOGICAL_MODEL_PUBLIC_NAME_ALREADY_EXISTS"
 
 
 async def test_admin_and_owner_update_typed_routing_policy_without_status_event(

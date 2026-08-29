@@ -39,6 +39,7 @@ from repositories.admission import (
     ServiceAdmissionResult,
     ServiceAdmissionSnapshot,
 )
+from repositories.gateway_model_names import GatewayModelNameConflictError
 from repositories.quotas import QuotaExceededError
 from repositories.registry import ImagePolicyRepository, RegisteredModelRepository
 from repositories.services import ServiceCounts, ServiceRepository
@@ -116,6 +117,11 @@ async def create_service(
                 )
     except QuotaExceededError as exc:
         raise _service_quota_conflict(exc) from exc
+    except GatewayModelNameConflictError as exc:
+        raise ConflictError(
+            "SERVICE_NAME_ALREADY_EXISTS",
+            "A gateway model with this name already exists in the project",
+        ) from exc
     except IntegrityError as exc:
         if not _is_service_name_conflict(exc):
             raise
@@ -235,6 +241,7 @@ async def _persist_service_after_admission(
             admission.accelerator_resource_name if admission is not None else None
         ),
         selection_policy=(admission.selection_policy.value if admission is not None else None),
+        eligible_node_names=(admission.eligible_node_names if admission is not None else None),
     )
     await ServiceRepository.reconcile_locked(
         session,
@@ -316,6 +323,7 @@ async def scale_service(
 ) -> ServiceResponse:
     project_id = _principal_project_id(principal)
     admission_rejection: ConflictError | None = None
+    eligible_node_names: tuple[str, ...] | None = None
     try:
         async with database.session() as session, session.begin():
             existing = await ServiceRepository.get(
@@ -354,12 +362,15 @@ async def scale_service(
                 )
                 if not result.allowed or result.snapshot is None:
                     admission_rejection = _vendor_admission_conflict(result)
+                else:
+                    eligible_node_names = result.snapshot.eligible_node_names
             if admission_rejection is None:
                 service = await ServiceRepository.set_desired_replicas(
                     session,
                     service_id=service_id,
                     project_id=project_id,
                     desired_replicas=payload.replicas,
+                    eligible_node_names=eligible_node_names,
                 )
                 if service is None:
                     raise NotFoundError("SERVICE_NOT_FOUND", "Service not found")
@@ -585,6 +596,7 @@ def _service_response(service: ModelService, counts: ServiceCounts) -> ServiceRe
         allocation_authority=service.allocation_authority,
         accelerator_resource_name=service.accelerator_resource_name,
         selection_policy=service.selection_policy,
+        eligible_node_names=service.eligible_node_names,
         tensor_parallel_size=service.tensor_parallel_size,
         dtype=service.dtype,
         gpu_memory_utilization=service.gpu_memory_utilization,

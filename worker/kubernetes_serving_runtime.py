@@ -18,6 +18,7 @@ from kubernetes_asyncio.client.exceptions import ApiException
 
 from core.accelerators import vendor_kind_is_compatible
 from core.enums import AcceleratorKind, AcceleratorVendor
+from core.kubernetes_names import validate_kubernetes_dns_subdomain
 from core.runtime_profiles import HttpProbe, RuntimeProfile
 
 SERVICE_ID_LABEL = "mini-ai-cloud/service-id"
@@ -48,6 +49,7 @@ POD_RESOURCE_KIND = "serving-pod"
 CONTAINER_NAME = "inference"
 TMP_VOLUME_NAME = "tmp"
 HEADLESS_SERVICE_NAME = "mini-ai-cloud-serving-pods"
+KUBERNETES_NODE_NAME_FIELD = "metadata.name"
 
 _DNS_1123_LABEL = re.compile(r"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$")
 _LABEL_VALUE = re.compile(r"^[A-Za-z0-9](?:[-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$")
@@ -93,6 +95,7 @@ class KubernetesServingLaunchSpec:
     tensor_parallel_size: int = 1
     runtime_profile: RuntimeProfile | None = None
     profile_environment: tuple[tuple[str, str], ...] = ()
+    eligible_node_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +131,7 @@ class KubernetesServingHandle:
     uid: str | None = None
     service_name: str | None = None
     service_uid: str | None = None
+    node_name: str | None = None
     native: object | None = None
 
 
@@ -144,6 +148,7 @@ class KubernetesServingState:
     message: str | None
     endpoint_url: str | None
     image_digest: str | None = None
+    node_name: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,6 +346,11 @@ class KubernetesServingRuntimeAdapter:
                 )
             raise self._operation_error("inspect Kubernetes serving Pod", exc) from exc
         self._validate_observed_pod(pod, expected_labels=expected_labels)
+        observed_uid = _optional_uid(pod)
+        if handle.uid is None or observed_uid is None or observed_uid != handle.uid:
+            raise KubernetesServingOwnershipError(
+                "Kubernetes serving Pod UID changed for an active handle"
+            )
 
         status = getattr(pod, "status", None)
         phase = str(getattr(status, "phase", None) or "Unknown")
@@ -361,6 +371,7 @@ class KubernetesServingRuntimeAdapter:
             message=_bounded(message),
             endpoint_url=handle.endpoint_url,
             image_digest=_pod_image_digest(status),
+            node_name=_pod_node_name(pod),
         )
 
     async def request_stop(self, handle: KubernetesServingHandle) -> None:
@@ -728,29 +739,32 @@ class KubernetesServingRuntimeAdapter:
             runtime_class_name = profile.kubernetes.runtime_class_name
             scheduler_name = profile.kubernetes.scheduler_name
             node_selector = dict(profile.kubernetes.node_selector)
-            if profile.kubernetes.node_affinity:
-                affinity = client.V1Affinity(
-                    node_affinity=client.V1NodeAffinity(
-                        required_during_scheduling_ignored_during_execution=client.V1NodeSelector(
-                            node_selector_terms=[
-                                client.V1NodeSelectorTerm(
-                                    match_expressions=[
-                                        client.V1NodeSelectorRequirement(
-                                            key=requirement.key,
-                                            operator=requirement.operator,
-                                            values=(
-                                                list(requirement.values)
-                                                if requirement.values
-                                                else None
-                                            ),
-                                        )
-                                        for requirement in profile.kubernetes.node_affinity
-                                    ]
-                                )
-                            ]
-                        )
+            affinity_requirements = [
+                client.V1NodeSelectorRequirement(
+                    key=requirement.key,
+                    operator=requirement.operator,
+                    values=list(requirement.values) if requirement.values else None,
+                )
+                for requirement in profile.kubernetes.node_affinity
+            ]
+            affinity = client.V1Affinity(
+                node_affinity=client.V1NodeAffinity(
+                    required_during_scheduling_ignored_during_execution=client.V1NodeSelector(
+                        node_selector_terms=[
+                            client.V1NodeSelectorTerm(
+                                match_expressions=affinity_requirements,
+                                match_fields=[
+                                    client.V1NodeSelectorRequirement(
+                                        key=KUBERNETES_NODE_NAME_FIELD,
+                                        operator="In",
+                                        values=list(spec.eligible_node_names),
+                                    )
+                                ],
+                            )
+                        ]
                     )
                 )
+            )
             tolerations = [
                 client.V1Toleration(
                     key=item.key,
@@ -962,6 +976,7 @@ class KubernetesServingRuntimeAdapter:
             uid=_optional_uid(pod),
             service_name=HEADLESS_SERVICE_NAME,
             service_uid=None,
+            node_name=_pod_node_name(pod),
             native=pod,
         )
 
@@ -998,6 +1013,8 @@ class KubernetesServingRuntimeAdapter:
                 raise ValueError("non-accelerator Pods require tensor_parallel_size=1")
             if spec.profile_environment:
                 raise ValueError("profile_environment requires a runtime_profile")
+            if spec.eligible_node_names:
+                raise ValueError("eligible_node_names requires a runtime_profile")
         else:
             _validate_accelerator_launch_spec(spec, profile)
         if (
@@ -1329,10 +1346,20 @@ def _profile_digest_label(digest: str) -> str:
     return encoded.decode("ascii").rstrip("=").lower()
 
 
+def _validate_eligible_node_names(names: tuple[str, ...]) -> None:
+    if not names:
+        raise ValueError("accelerator Pods require a non-empty eligible-node snapshot")
+    if names != tuple(sorted(set(names))):
+        raise ValueError("eligible_node_names must be sorted and unique")
+    for name in names:
+        validate_kubernetes_dns_subdomain(name, field_name="eligible node name")
+
+
 def _validate_accelerator_launch_spec(
     spec: KubernetesServingLaunchSpec,
     profile: RuntimeProfile,
 ) -> None:
+    _validate_eligible_node_names(spec.eligible_node_names)
     if spec.image != profile.image.reference:
         raise ValueError("accelerator Pod image must equal the runtime profile image")
     if spec.accelerator_count < 1:
@@ -1665,6 +1692,20 @@ def _deleting(resource: object) -> bool:
 def _optional_uid(resource: object) -> str | None:
     value = getattr(getattr(resource, "metadata", None), "uid", None)
     return str(value) if value else None
+
+
+def _pod_node_name(pod: object) -> str | None:
+    value = getattr(getattr(pod, "spec", None), "node_name", None)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise KubernetesServingOwnershipError(
+            "Kubernetes serving Pod has an invalid assigned node name"
+        )
+    try:
+        return validate_kubernetes_dns_subdomain(value, field_name="assigned node name")
+    except ValueError as error:
+        raise KubernetesServingOwnershipError(str(error)) from error
 
 
 def _required_uid(item: object, *, resource: str) -> str:

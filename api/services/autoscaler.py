@@ -104,6 +104,7 @@ class ServiceAutoscaler:
                 if target == service.desired_replicas:
                     held += 1
                     continue
+                eligible_node_names: tuple[str, ...] | None = None
                 if (
                     service.runtime_type == RuntimeType.KUBERNETES
                     and target > service.desired_replicas
@@ -125,15 +126,17 @@ class ServiceAutoscaler:
                         service=service,
                         desired_replicas=target,
                     )
-                    if not admission.allowed:
+                    if not admission.allowed or admission.snapshot is None:
                         held += 1
                         continue
+                    eligible_node_names = admission.snapshot.eligible_node_names
                 try:
                     updated = await ServiceRepository.set_desired_replicas(
                         session,
                         service_id=service.id,
                         project_id=service.project_id,
                         desired_replicas=target,
+                        eligible_node_names=eligible_node_names,
                     )
                 except QuotaExceededError:
                     held += 1

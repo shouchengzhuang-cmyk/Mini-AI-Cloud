@@ -293,6 +293,7 @@ async def _create_logical_kubernetes_service(
             allocation_authority="kubernetes_device_plugin",
             accelerator_resource_name=profile.kubernetes.resource_name,
             selection_policy=AcceleratorSelectionPolicy.NVIDIA_ONLY.value,
+            eligible_node_names=("logical-service-node",),
         )
         await ServiceRepository.reconcile_locked(session, service)
         return service.id, variant_id, catalog
@@ -319,11 +320,17 @@ async def test_services_api_create_list_duplicate_and_stop(
     assert created_body["max_model_len"] == 8192
     assert created_body["scheduling_reason"] is None
     assert created_body["scheduling_details"] == {}
+    assert created_body["eligible_node_names"] is None
 
     listed = await services_client.get("/api/v1/services")
     assert listed.status_code == 200
     assert listed.json()["pagination"]["total"] == 1
     assert listed.json()["items"][0]["id"] == str(service_id)
+    assert listed.json()["items"][0]["eligible_node_names"] is None
+
+    fetched = await services_client.get(f"/api/v1/services/{service_id}")
+    assert fetched.status_code == 200
+    assert fetched.json()["eligible_node_names"] is None
 
     duplicate = await services_client.post("/api/v1/services", json=_payload())
     assert duplicate.status_code == 409
@@ -340,6 +347,28 @@ async def test_services_api_create_list_duplicate_and_stop(
         "stopped",
         "stopped",
     ]
+    assert all(item["eligible_node_names"] is None for item in replicas.json()["items"])
+    assert all(item["assigned_node_name"] is None for item in replicas.json()["items"])
+
+
+async def test_service_name_rejects_existing_logical_public_name(
+    services_client: AsyncClient,
+    database: Database,
+) -> None:
+    async with database.session() as session, session.begin():
+        session.add(
+            LogicalModel(
+                project_id=PROJECT_ID,
+                name="logical-owner",
+                public_name="chat-main",
+                status=ModelAvailabilityStatus.DISABLED,
+            )
+        )
+
+    response = await services_client.post("/api/v1/services", json=_payload())
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "SERVICE_NAME_ALREADY_EXISTS"
 
 
 async def test_services_api_maps_nvidia_accelerator_and_rejects_ascend_until_later(
@@ -735,6 +764,14 @@ async def test_logical_service_scale_up_revalidates_capacity_and_credits_current
 
     assert response.status_code == 200
     assert response.json()["desired_replicas"] == 2
+    assert response.json()["eligible_node_names"] == ["logical-service-node"]
+    replicas = await services_client.get(f"/api/v1/services/{service_id}/replicas")
+    assert replicas.status_code == 200
+    assert all(
+        item["eligible_node_names"] == ["logical-service-node"]
+        and item["assigned_node_name"] is None
+        for item in replicas.json()["items"]
+    )
     async with database.session() as session:
         state = await session.get(ProjectQuotaState, PROJECT_ID)
         events = list(
@@ -792,6 +829,7 @@ async def test_logical_service_scale_subtracts_existing_service_commitments(
             allocation_authority=service.allocation_authority,
             accelerator_resource_name=service.accelerator_resource_name,
             selection_policy=service.selection_policy,
+            eligible_node_names=service.eligible_node_names,
         )
 
     response = await services_client.post(
@@ -932,6 +970,7 @@ async def test_logical_service_scale_fails_closed_for_legacy_invalid_snapshot(
         assert service is not None
         service.allocation_authority = "control_plane_exact_device"
         service.accelerator_resource_name = None
+        service.eligible_node_names = []
 
     response = await services_client.post(
         f"/api/v1/services/{service_id}/scale",
@@ -1005,6 +1044,7 @@ async def test_logical_service_autoscaler_holds_legacy_invalid_snapshot(
         assert service is not None
         service.allocation_authority = "control_plane_exact_device"
         service.accelerator_resource_name = None
+        service.eligible_node_names = []
     metrics = _StaticServiceMetrics()
     metrics.loads[service_id] = ServiceLoad(
         active_requests=2,

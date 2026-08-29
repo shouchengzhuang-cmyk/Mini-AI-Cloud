@@ -2937,7 +2937,7 @@
           "description": "The stable routing fields plus passthrough OpenAI request options.",
           "properties": {
             "model": {
-              "maxLength": 128,
+              "maxLength": 255,
               "minLength": 1,
               "title": "Model",
               "type": "string"
@@ -4827,6 +4827,17 @@
                 }
               ]
             },
+            "assigned_node_name": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Assigned Node Name"
+            },
             "container_started_at": {
               "anyOf": [
                 {
@@ -4867,6 +4878,20 @@
                 }
               ],
               "title": "Drain Started At"
+            },
+            "eligible_node_names": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Eligible Node Names"
             },
             "endpoint_url": {
               "anyOf": [
@@ -5175,6 +5200,8 @@
             "allocation_authority",
             "accelerator_resource_name",
             "selection_policy",
+            "eligible_node_names",
+            "assigned_node_name",
             "model_revision",
             "image_digest",
             "error_code",
@@ -5250,6 +5277,20 @@
               ],
               "title": "Dtype",
               "type": "string"
+            },
+            "eligible_node_names": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Eligible Node Names"
             },
             "error_message": {
               "anyOf": [
@@ -5557,6 +5598,7 @@
             "allocation_authority",
             "accelerator_resource_name",
             "selection_policy",
+            "eligible_node_names",
             "tensor_parallel_size",
             "dtype",
             "gpu_memory_utilization",

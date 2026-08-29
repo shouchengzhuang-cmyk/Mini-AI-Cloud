@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from urllib.parse import urlsplit
@@ -10,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.pagination import CursorKey
 from core.enums import AcceleratorVendor, RuntimeType
+from core.kubernetes_names import validate_kubernetes_dns_subdomain
 from models.service import (
     ModelService,
     ReplicaHealth,
@@ -20,6 +22,10 @@ from models.service import (
 )
 from models.worker import Worker
 from repositories.clock import database_utcnow
+from repositories.gateway_model_names import (
+    check_service_name_available,
+    lock_gateway_model_namespace,
+)
 from repositories.outbox import OutboxRepository
 from repositories.quotas import QuotaRepository
 
@@ -117,11 +123,23 @@ class ServiceRepository:
         allocation_authority: str | None = None,
         accelerator_resource_name: str | None = None,
         selection_policy: str | None = None,
+        eligible_node_names: Sequence[str] | None = None,
     ) -> ModelService:
         vendor_value = (
             selected_vendor.value
             if isinstance(selected_vendor, AcceleratorVendor)
             else selected_vendor
+        )
+        normalized_eligible_nodes = _eligible_node_snapshot(
+            eligible_node_names,
+            logical_model_id=logical_model_id,
+        )
+        await lock_gateway_model_namespace(session, project_id=project_id)
+        await check_service_name_available(
+            session,
+            project_id=project_id,
+            service_name=name,
+            logical_model_id=logical_model_id,
         )
         await QuotaRepository.replace_service_commitment(
             session,
@@ -160,6 +178,7 @@ class ServiceRepository:
             allocation_authority=allocation_authority,
             accelerator_resource_name=accelerator_resource_name,
             selection_policy=selection_policy,
+            eligible_node_names=normalized_eligible_nodes,
             tensor_parallel_size=(
                 tensor_parallel_size if tensor_parallel_size is not None else max(1, gpu_count)
             ),
@@ -325,6 +344,7 @@ class ServiceRepository:
         service_id: uuid.UUID,
         project_id: uuid.UUID,
         desired_replicas: int,
+        eligible_node_names: Sequence[str] | None = None,
     ) -> ModelService | None:
         service = await ServiceRepository.get(
             session, service_id, project_id=project_id, for_update=True
@@ -333,6 +353,15 @@ class ServiceRepository:
             return None
         if service.desired_replicas == desired_replicas:
             return service
+
+        normalized_eligible_nodes: list[str] | None = None
+        if desired_replicas > service.desired_replicas and service.logical_model_id is not None:
+            normalized_eligible_nodes = _eligible_node_snapshot(
+                eligible_node_names,
+                logical_model_id=service.logical_model_id,
+            )
+        elif eligible_node_names is not None:
+            raise ValueError("eligible_node_names requires a logical-service scale-up")
 
         await QuotaRepository.replace_service_commitment(
             session,
@@ -346,6 +375,8 @@ class ServiceRepository:
         )
         now = await database_utcnow(session)
         service.desired_replicas = desired_replicas
+        if normalized_eligible_nodes is not None:
+            service.eligible_node_names = normalized_eligible_nodes
         service.status = ServiceStatus.STOPPING if desired_replicas == 0 else ServiceStatus.PENDING
         if desired_replicas == 0:
             service.scheduling_reason = None
@@ -642,6 +673,11 @@ class ServiceRepository:
                 allocation_authority=service.allocation_authority,
                 accelerator_resource_name=service.accelerator_resource_name,
                 selection_policy=service.selection_policy,
+                eligible_node_names=(
+                    list(service.eligible_node_names)
+                    if service.eligible_node_names is not None
+                    else None
+                ),
                 model_revision=service.model_revision,
                 image_digest=_image_digest(service.image),
                 created_at=changed_at,
@@ -776,6 +812,100 @@ class ServiceRepository:
         replica.lease_expires_at = lease_expires_at
         replica.updated_at = now
         replica.version += 1
+        return True
+
+    @staticmethod
+    async def record_replica_assignment(
+        session: AsyncSession,
+        *,
+        replica_id: uuid.UUID,
+        generation: int,
+        execution_id: uuid.UUID,
+        node_name: str,
+        worker_id: str,
+        worker_session_id: uuid.UUID | None = None,
+    ) -> bool:
+        """Persist the immutable Kubernetes scheduler placement under execution fencing."""
+
+        normalized_node_name = validate_kubernetes_dns_subdomain(
+            node_name,
+            field_name="assigned_node_name",
+        )
+        if not await _worker_session_matches(
+            session,
+            worker_id=worker_id,
+            worker_session_id=worker_session_id,
+        ):
+            return False
+        service, replica = await _lock_service_and_replica(session, replica_id)
+        if (
+            service is None
+            or replica is None
+            or replica.generation != generation
+            or replica.execution_id != execution_id
+            or replica.worker_id != worker_id
+            or replica.status not in NONTERMINAL_REPLICA_STATUSES
+        ):
+            return False
+        eligible_node_names = replica.eligible_node_names
+        if (
+            not isinstance(eligible_node_names, list)
+            or normalized_node_name not in eligible_node_names
+        ):
+            raise ValueError("assigned Kubernetes node is outside the immutable eligible set")
+        if replica.assigned_node_name is not None:
+            if replica.assigned_node_name != normalized_node_name:
+                raise ValueError("assigned Kubernetes node changed for an active execution")
+            return True
+        now = await database_utcnow(session)
+        replica.assigned_node_name = normalized_node_name
+        replica.updated_at = now
+        replica.version += 1
+        return True
+
+    @staticmethod
+    async def quarantine_replica_runtime(
+        session: AsyncSession,
+        *,
+        replica_id: uuid.UUID,
+        generation: int,
+        execution_id: uuid.UUID,
+        error_code: str,
+        error_message: str,
+        worker_id: str,
+        worker_session_id: uuid.UUID | None = None,
+    ) -> bool:
+        """Remove a drifted execution from routing without releasing its capacity."""
+
+        if not await _worker_session_matches(
+            session,
+            worker_id=worker_id,
+            worker_session_id=worker_session_id,
+        ):
+            return False
+        service, replica = await _lock_service_and_replica(session, replica_id)
+        if (
+            service is None
+            or replica is None
+            or replica.generation != generation
+            or replica.execution_id != execution_id
+            or replica.worker_id != worker_id
+            or replica.status not in NONTERMINAL_REPLICA_STATUSES
+        ):
+            return False
+        now = await database_utcnow(session)
+        replica.health = ReplicaHealth.UNHEALTHY
+        replica.health_failure_count += 1
+        replica.endpoint_url = None
+        # A quarantined runtime may still own accelerator capacity after this
+        # controller process dies. Disable lease reaping so only a fenced,
+        # successful cleanup can release the nonterminal commitment.
+        replica.lease_expires_at = None
+        replica.error_code = error_code
+        replica.error_message = error_message
+        replica.updated_at = now
+        replica.version += 1
+        await _refresh_service_status(session, service, now)
         return True
 
     @staticmethod
@@ -1263,6 +1393,28 @@ def _validate_endpoint_url(endpoint_url: str) -> None:
             "endpoint_url must be an absolute HTTP(S) origin without path, credentials, "
             "query or fragment"
         )
+
+
+def _eligible_node_snapshot(
+    values: Sequence[str] | None,
+    *,
+    logical_model_id: uuid.UUID | None,
+) -> list[str] | None:
+    if logical_model_id is None:
+        if values is not None:
+            raise ValueError("eligible_node_names requires a logical model")
+        return None
+    if values is None or isinstance(values, (str, bytes)):
+        raise ValueError("logical services require an eligible-node snapshot")
+    names: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError("eligible node names must be strings")
+        names.append(validate_kubernetes_dns_subdomain(value, field_name="eligible node name"))
+    canonical = sorted(set(names))
+    if not canonical:
+        raise ValueError("logical services require a non-empty eligible-node snapshot")
+    return canonical
 
 
 def _image_digest(image: str | None) -> str | None:

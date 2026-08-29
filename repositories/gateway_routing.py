@@ -14,9 +14,16 @@ from sqlalchemy.orm.attributes import set_committed_value
 from core.enums import GatewayRoutingPolicy, ModelAvailabilityStatus
 from models.model_variant import LogicalModel, ModelVariant
 from models.routing import VendorCircuitState
-from models.service import ModelService, ServiceStatus
+from models.service import (
+    ModelService,
+    ReplicaHealth,
+    ReplicaStatus,
+    ServiceReplica,
+    ServiceStatus,
+)
 from models.usage import AuditEvent
 from repositories.clock import database_utcnow
+from repositories.gateway_model_names import GatewayModelNameConflictError
 from repositories.services import EndpointSelection, ServiceRepository
 
 _MAX_ROUTING_CURSOR = 2**63 - 1
@@ -29,6 +36,12 @@ class GatewayPreflightSkip:
     model_variant_id: uuid.UUID | None
     selected_vendor: str | None
     reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class GatewayModelCatalogEntry:
+    model_id: str
+    created_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +69,143 @@ class GatewayRoute:
 
 class GatewayRoutingRepository:
     @staticmethod
+    async def list_available_models(
+        session: AsyncSession,
+        *,
+        project_id: uuid.UUID,
+    ) -> list[GatewayModelCatalogEntry]:
+        services = list(
+            await session.scalars(
+                select(ModelService)
+                .where(ModelService.project_id == project_id)
+                .order_by(ModelService.created_at.desc(), ModelService.id.desc())
+            )
+        )
+        routable_service_ids = set(
+            await session.scalars(
+                select(ServiceReplica.service_id)
+                .join(ModelService, ModelService.id == ServiceReplica.service_id)
+                .where(
+                    ModelService.project_id == project_id,
+                    ServiceReplica.generation == ModelService.generation,
+                    ServiceReplica.status == ReplicaStatus.RUNNING,
+                    ServiceReplica.health == ReplicaHealth.HEALTHY,
+                    ServiceReplica.endpoint_url.is_not(None),
+                    ServiceReplica.endpoint_url != "",
+                    ServiceReplica.execution_id.is_not(None),
+                )
+                .distinct()
+            )
+        )
+        logical_models = list(
+            await session.scalars(select(LogicalModel).where(LogicalModel.project_id == project_id))
+        )
+        logical_by_id = {model.id: model for model in logical_models}
+        logical_ids = set(logical_by_id)
+        variants = (
+            list(
+                await session.scalars(
+                    select(ModelVariant).where(ModelVariant.logical_model_id.in_(logical_ids))
+                )
+            )
+            if logical_ids
+            else []
+        )
+        variants_by_id = {variant.id: variant for variant in variants}
+        circuits = (
+            list(
+                await session.scalars(
+                    select(VendorCircuitState).where(
+                        VendorCircuitState.project_id == project_id,
+                        VendorCircuitState.logical_model_id.in_(logical_ids),
+                    )
+                )
+            )
+            if logical_ids
+            else []
+        )
+        circuits_by_model_vendor = {
+            (circuit.logical_model_id, circuit.vendor): circuit for circuit in circuits
+        }
+        service_by_name = {service.name: service for service in services}
+        ambiguous_names = {
+            model.public_name
+            for model in logical_models
+            if (owner := service_by_name.get(model.public_name)) is not None
+            and owner.logical_model_id != model.id
+        }
+
+        entries = [
+            GatewayModelCatalogEntry(
+                model_id=service.name,
+                created_at=service.created_at,
+            )
+            for service in services
+            if service.logical_model_id is None
+            and service.name not in ambiguous_names
+            and service.desired_replicas > 0
+            and service.id in routable_service_ids
+        ]
+        now = await database_utcnow(session)
+        available_logical_ids: set[uuid.UUID] = set()
+        for service in services:
+            logical_model = (
+                logical_by_id.get(service.logical_model_id)
+                if service.logical_model_id is not None
+                else None
+            )
+            if (
+                logical_model is None
+                or logical_model.id in available_logical_ids
+                or logical_model.public_name in ambiguous_names
+                or logical_model.status != ModelAvailabilityStatus.READY
+                or service.desired_replicas <= 0
+                or service.status not in {ServiceStatus.RUNNING, ServiceStatus.DEGRADED}
+                or service.id not in routable_service_ids
+            ):
+                continue
+            vendor = service.selected_vendor
+            policy = _candidate_policy(logical_model.routing_policy)
+            if vendor not in policy.allowed_vendors:
+                continue
+            variant = (
+                variants_by_id.get(service.model_variant_id)
+                if service.model_variant_id is not None
+                else None
+            )
+            if (
+                variant is None
+                or variant.logical_model_id != logical_model.id
+                or variant.status != ModelAvailabilityStatus.READY
+                or vendor != variant.vendor.value
+                or service.selected_kind != variant.kind.value
+            ):
+                continue
+            circuit = circuits_by_model_vendor.get((logical_model.id, vendor))
+            if (
+                circuit is not None
+                and circuit.state == "open"
+                and circuit.opened_until is not None
+                and _as_utc(circuit.opened_until) > now
+            ):
+                continue
+            available_logical_ids.add(logical_model.id)
+
+        entries.extend(
+            GatewayModelCatalogEntry(
+                model_id=model.public_name,
+                created_at=model.created_at,
+            )
+            for model in logical_models
+            if model.id in available_logical_ids
+        )
+        return sorted(
+            entries,
+            key=lambda entry: (_as_utc(entry.created_at), entry.model_id),
+            reverse=True,
+        )
+
+    @staticmethod
     async def choose_route(
         session: AsyncSession,
         *,
@@ -70,36 +220,45 @@ class GatewayRoutingRepository:
             name=public_model,
             for_update=False,
         )
-        logical_model: LogicalModel | None = None
-        if anchor is None:
-            logical_model = await session.scalar(
-                select(LogicalModel)
-                .where(
-                    LogicalModel.project_id == project_id,
-                    LogicalModel.public_name == public_model,
-                    LogicalModel.status == ModelAvailabilityStatus.READY,
-                )
-                .order_by(LogicalModel.created_at, LogicalModel.id)
-                .limit(1)
-                .with_for_update()
+        public_logical_model = await session.scalar(
+            select(LogicalModel)
+            .where(
+                LogicalModel.project_id == project_id,
+                LogicalModel.public_name == public_model,
             )
-            if logical_model is None:
-                return None, None
-            anchor = await session.scalar(
-                select(ModelService)
-                .where(
-                    ModelService.project_id == project_id,
-                    ModelService.logical_model_id == logical_model.id,
-                )
-                .order_by(
-                    case((ModelService.name == logical_model.name, 0), else_=1),
-                    ModelService.created_at,
-                    ModelService.id,
-                )
-                .limit(1)
-            )
+            .order_by(LogicalModel.created_at, LogicalModel.id)
+            .limit(1)
+            .with_for_update()
+        )
+        if (
+            anchor is not None
+            and public_logical_model is not None
+            and anchor.logical_model_id != public_logical_model.id
+        ):
+            raise GatewayModelNameConflictError(public_model)
+
+        logical_model: LogicalModel | None = public_logical_model
+        if logical_model is not None:
+            if logical_model.status != ModelAvailabilityStatus.READY:
+                return anchor, None
             if anchor is None:
-                return None, None
+                anchor = await session.scalar(
+                    select(ModelService)
+                    .where(
+                        ModelService.project_id == project_id,
+                        ModelService.logical_model_id == logical_model.id,
+                    )
+                    .order_by(
+                        case((ModelService.name == logical_model.name, 0), else_=1),
+                        ModelService.created_at,
+                        ModelService.id,
+                    )
+                    .limit(1)
+                )
+                if anchor is None:
+                    return None, None
+        elif anchor is None:
+            return None, None
         elif anchor.logical_model_id is None:
             anchor = await ServiceRepository.get_by_name(
                 session,

@@ -33,6 +33,7 @@ from core.metrics import (
     SERVICE_REQUESTS,
 )
 from repositories.audit import AuditRepository
+from repositories.gateway_model_names import GatewayModelNameConflictError
 from repositories.gateway_routing import GatewayRoute, GatewayRoutingRepository
 from repositories.services import EndpointSelection, ServiceRepository
 from repositories.usage import UsageRepository
@@ -289,25 +290,18 @@ class GatewayService:
 
     async def list_models(self, *, project_id: uuid.UUID) -> OpenAIModelList:
         async with self.database.session() as session:
-            services = await ServiceRepository.list_services(
+            models = await GatewayRoutingRepository.list_available_models(
                 session,
                 project_id=project_id,
-                status=None,
-                limit=1000,
-                offset=0,
-            )
-            counts = await ServiceRepository.counts_for_service_ids(
-                session, [service.id for service in services]
             )
         return OpenAIModelList(
             data=[
                 OpenAIModelObject(
-                    id=service.name,
-                    created=int(_as_utc(service.created_at).timestamp()),
+                    id=model.model_id,
+                    created=int(_as_utc(model.created_at).timestamp()),
                     owned_by=f"project:{project_id}",
                 )
-                for service in services
-                if service.desired_replicas > 0 and counts[service.id].healthy_replicas > 0
+                for model in models
             ]
         )
 
@@ -328,13 +322,27 @@ class GatewayService:
         excluded_vendors: set[str] = set()
         fallback: _FallbackAttempt | None = None
         for attempt in range(self.fallback_attempts + 1):
-            async with self.database.session() as session, session.begin():
-                anchor, route = await GatewayRoutingRepository.choose_route(
-                    session,
-                    project_id=project_id,
-                    public_model=public_model,
-                    excluded_vendors=frozenset(excluded_vendors),
-                )
+            try:
+                async with self.database.session() as session, session.begin():
+                    anchor, route = await GatewayRoutingRepository.choose_route(
+                        session,
+                        project_id=project_id,
+                        public_model=public_model,
+                        excluded_vendors=frozenset(excluded_vendors),
+                    )
+            except GatewayModelNameConflictError as exc:
+                if fallback is not None:
+                    await self._finalize_predispatch_failure(fallback.failure)
+                    await self._record_fallback_without_route(
+                        fallback=fallback,
+                        error_code="GATEWAY_MODEL_NAME_CONFLICT",
+                    )
+                _observe_gateway_error("GATEWAY_MODEL_NAME_CONFLICT")
+                raise APIError(
+                    409,
+                    "GATEWAY_MODEL_NAME_CONFLICT",
+                    "The requested model name is owned by conflicting gateway resources",
+                ) from exc
             if anchor is None:
                 if fallback is not None:
                     await self._finalize_predispatch_failure(fallback.failure)

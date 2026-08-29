@@ -60,6 +60,7 @@ def _spec(profile: RuntimeProfile) -> KubernetesServingLaunchSpec:
         accelerator_count=2,
         tensor_parallel_size=2,
         runtime_profile=profile,
+        eligible_node_names=("ascend-node-a", "ascend-node-b"),
         profile_environment=(("VLLM_LOGGING_LEVEL", "INFO"),),
     )
 
@@ -137,7 +138,11 @@ def test_ascend_profile_renders_volcano_visibility_and_extended_resource() -> No
     assert container.resources.requests == container.resources.limits
     assert pod.spec.runtime_class_name == "ascend"
     assert pod.spec.scheduler_name == "volcano"
-    assert pod.spec.affinity is None
+    required = pod.spec.affinity.node_affinity.required_during_scheduling_ignored_during_execution
+    fields = required.node_selector_terms[0].match_fields
+    assert [(item.key, item.operator, tuple(item.values or ())) for item in fields] == [
+        ("metadata.name", "In", ("ascend-node-a", "ascend-node-b"))
+    ]
     visibility = next(item for item in container.env if item.name == "ASCEND_VISIBLE_DEVICES")
     assert visibility.value is None
     assert visibility.value_from.field_ref.api_version == "v1"

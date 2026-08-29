@@ -621,6 +621,7 @@ async def test_logical_service_admission_pins_variant_and_replica_snapshot(
             allocation_authority=snapshot.allocation_authority.value,
             accelerator_resource_name=snapshot.accelerator_resource_name,
             selection_policy=snapshot.selection_policy.value,
+            eligible_node_names=snapshot.eligible_node_names,
         )
         await ServiceRepository.reconcile_locked(session, service)
 

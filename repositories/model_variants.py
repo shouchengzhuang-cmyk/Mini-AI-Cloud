@@ -13,9 +13,13 @@ from core.enums import (
     ModelAvailabilityStatus,
 )
 from core.rbac import ProjectStatus
-from models.identity import Project
 from models.model_variant import LogicalModel, LogicalModelStatusEvent, ModelVariant
 from repositories.clock import database_utcnow
+from repositories.gateway_model_names import (
+    GatewayModelNameConflictError,
+    check_logical_public_name_available,
+    lock_gateway_model_namespace,
+)
 
 _RESOURCE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _PROFILE_ID = re.compile(r"^[a-z][a-z0-9-]{2,63}$")
@@ -64,13 +68,19 @@ class LogicalModelRepository:
         created_by_user_id: uuid.UUID | None,
         routing_policy: GatewayRoutingPolicy = GatewayRoutingPolicy.BALANCED,
     ) -> LogicalModel:
-        project = await session.scalar(
-            select(Project).where(Project.id == project_id).with_for_update()
-        )
+        project = await lock_gateway_model_namespace(session, project_id=project_id)
         if project is None or project.status is not ProjectStatus.ACTIVE:
             raise LogicalModelNotFoundError("active project does not exist")
         normalized_name = _normalize_resource_name(name, "logical model name")
         normalized_public_name = _normalize_display_text(public_name, "public_name", 255)
+        try:
+            await check_logical_public_name_available(
+                session,
+                project_id=project_id,
+                public_name=normalized_public_name,
+            )
+        except GatewayModelNameConflictError as error:
+            raise LogicalModelConflictError("public_name") from error
         existing_name = await session.scalar(
             select(LogicalModel.id).where(
                 LogicalModel.project_id == project_id,

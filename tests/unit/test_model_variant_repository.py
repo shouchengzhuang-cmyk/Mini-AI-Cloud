@@ -17,8 +17,11 @@ from core.rbac import ProjectStatus
 from models.base import Base
 from models.identity import Project, User
 from models.model_variant import LogicalModel, LogicalModelStatusEvent, ModelVariant
+from models.registry import RegisteredModel
+from models.service import ModelService
 from repositories.model_variants import (
     LogicalModelConflictError,
+    LogicalModelNotFoundError,
     LogicalModelRepository,
     ModelVariantInvariantError,
     ModelVariantRepository,
@@ -45,6 +48,8 @@ async def variant_database(tmp_path: Any) -> AsyncIterator[Database]:
                 cast(Table, LogicalModel.__table__),
                 cast(Table, ModelVariant.__table__),
                 cast(Table, LogicalModelStatusEvent.__table__),
+                cast(Table, RegisteredModel.__table__),
+                cast(Table, ModelService.__table__),
             ],
         )
     try:
@@ -104,6 +109,22 @@ async def _variant(
             created_by_user_id=None,
         )
         return variant.id
+
+
+async def test_logical_model_create_missing_project_preserves_not_found_precedence(
+    variant_database: Database,
+) -> None:
+    async with variant_database.session() as session, session.begin():
+        with pytest.raises(LogicalModelNotFoundError, match="active project does not exist"):
+            await LogicalModelRepository.create(
+                session,
+                project_id=uuid.uuid4(),
+                name=" invalid name ",
+                public_name=" ",
+                description=None,
+                metadata={},
+                created_by_user_id=None,
+            )
 
 
 async def test_logical_model_routing_policy_updates_without_status_event(

@@ -344,6 +344,7 @@ class WorkerService:
                         "runtime_profile_ids": list(item.runtime_profile_ids),
                         "capabilities": list(item.capabilities),
                         "kubernetes_resource_name": item.kubernetes_resource_name,
+                        "health": item.health,
                         "fake": item.fake,
                     }
                     for item in self.gpu_devices

@@ -89,12 +89,13 @@ class ModelService(Base):
             "AND selected_model IS NULL AND runtime_profile_id IS NULL "
             "AND runtime_profile_version IS NULL AND runtime_profile_digest IS NULL "
             "AND allocation_authority IS NULL AND accelerator_resource_name IS NULL "
-            "AND selection_policy IS NULL) OR "
+            "AND selection_policy IS NULL AND eligible_node_names IS NULL) OR "
             "(logical_model_id IS NOT NULL AND model_variant_id IS NOT NULL "
             "AND selected_vendor IS NOT NULL AND selected_kind IS NOT NULL "
             "AND selected_model IS NOT NULL AND runtime_profile_id IS NOT NULL "
             "AND runtime_profile_version IS NOT NULL AND runtime_profile_digest IS NOT NULL "
-            "AND allocation_authority IS NOT NULL AND selection_policy IS NOT NULL)",
+            "AND allocation_authority IS NOT NULL AND selection_policy IS NOT NULL "
+            "AND eligible_node_names IS NOT NULL)",
             name="admission_snapshot",
         ),
         CheckConstraint(
@@ -221,6 +222,7 @@ class ModelService(Base):
     allocation_authority: Mapped[str | None] = mapped_column(String(64))
     accelerator_resource_name: Mapped[str | None] = mapped_column(String(255))
     selection_policy: Mapped[str | None] = mapped_column(String(32))
+    eligible_node_names: Mapped[list[str] | None] = mapped_column(JSON(none_as_null=True))
     tensor_parallel_size: Mapped[int] = mapped_column(Integer, default=1)
     dtype: Mapped[str] = mapped_column(String(32), default="auto")
     gpu_memory_utilization: Mapped[float] = mapped_column(Float, default=0.9)
@@ -292,12 +294,13 @@ class ServiceReplica(Base):
             "AND selected_model IS NULL AND runtime_profile_id IS NULL "
             "AND runtime_profile_version IS NULL AND runtime_profile_digest IS NULL "
             "AND allocation_authority IS NULL AND accelerator_resource_name IS NULL "
-            "AND selection_policy IS NULL) OR "
+            "AND selection_policy IS NULL AND eligible_node_names IS NULL) OR "
             "(logical_model_id IS NOT NULL AND model_variant_id IS NOT NULL "
             "AND selected_vendor IS NOT NULL AND selected_kind IS NOT NULL "
             "AND selected_model IS NOT NULL AND runtime_profile_id IS NOT NULL "
             "AND runtime_profile_version IS NOT NULL AND runtime_profile_digest IS NOT NULL "
-            "AND allocation_authority IS NOT NULL AND selection_policy IS NOT NULL)",
+            "AND allocation_authority IS NOT NULL AND selection_policy IS NOT NULL "
+            "AND eligible_node_names IS NOT NULL)",
             name="admission_snapshot",
         ),
         CheckConstraint(
@@ -420,6 +423,8 @@ class ServiceReplica(Base):
     allocation_authority: Mapped[str | None] = mapped_column(String(64))
     accelerator_resource_name: Mapped[str | None] = mapped_column(String(255))
     selection_policy: Mapped[str | None] = mapped_column(String(32))
+    eligible_node_names: Mapped[list[str] | None] = mapped_column(JSON(none_as_null=True))
+    assigned_node_name: Mapped[str | None] = mapped_column(String(253))
     model_revision: Mapped[str | None] = mapped_column(String(255))
     image_digest: Mapped[str | None] = mapped_column(String(255))
     error_code: Mapped[str | None] = mapped_column(String(128))
