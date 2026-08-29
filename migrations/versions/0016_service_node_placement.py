@@ -17,7 +17,14 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 _TABLE_NAMES = ("model_services", "service_replicas")
-_INFLIGHT_SERVICE_STATUSES = ("pending", "deploying")
+_NONTERMINAL_REPLICA_STATUSES = (
+    "pending",
+    "starting",
+    "loading",
+    "running",
+    "draining",
+    "stopping",
+)
 
 
 @contextmanager
@@ -55,7 +62,7 @@ def _snapshot_sql(*, include_eligible_nodes: bool) -> str:
 
 
 def _reject_unrecoverable_legacy_services() -> None:
-    """Do not migrate a service before Kubernetes has observable placement."""
+    """Require logical Kubernetes services to be fully stopped before upgrading."""
 
     context = op.get_context()
     if context.as_sql:
@@ -64,11 +71,14 @@ def _reject_unrecoverable_legacy_services() -> None:
         op.execute(
             sa.text(
                 "DO $$ BEGIN "
-                "IF EXISTS (SELECT 1 FROM model_services "
-                "WHERE logical_model_id IS NOT NULL "
-                "AND runtime_type = 'kubernetes' "
-                "AND (status IN ('pending', 'deploying') "
-                "OR (status IN ('degraded', 'failed') AND desired_replicas > 0))) THEN "
+                "IF EXISTS (SELECT 1 FROM model_services AS service "
+                "WHERE service.logical_model_id IS NOT NULL "
+                "AND service.runtime_type = 'kubernetes' "
+                "AND (service.desired_replicas > 0 OR EXISTS ("
+                "SELECT 1 FROM service_replicas AS replica "
+                "WHERE replica.service_id = service.id "
+                "AND replica.status IN ('pending', 'starting', 'loading', 'running', "
+                "'draining', 'stopping')))) THEN "
                 "RAISE EXCEPTION '0016 cannot migrate unrecoverable logical Kubernetes "
                 "services'; "
                 "END IF; END $$"
@@ -77,10 +87,15 @@ def _reject_unrecoverable_legacy_services() -> None:
         return
     services = sa.table(
         "model_services",
+        sa.column("id", sa.Uuid()),
         sa.column("logical_model_id", sa.Uuid()),
         sa.column("runtime_type", sa.String(32)),
-        sa.column("status", sa.String(32)),
         sa.column("desired_replicas", sa.Integer()),
+    )
+    replicas = sa.table(
+        "service_replicas",
+        sa.column("service_id", sa.Uuid()),
+        sa.column("status", sa.String(32)),
     )
     count = op.get_bind().scalar(
         sa.select(sa.func.count())
@@ -89,19 +104,22 @@ def _reject_unrecoverable_legacy_services() -> None:
             services.c.logical_model_id.is_not(None),
             services.c.runtime_type == "kubernetes",
             sa.or_(
-                services.c.status.in_(_INFLIGHT_SERVICE_STATUSES),
-                sa.and_(
-                    services.c.status.in_(("degraded", "failed")),
-                    services.c.desired_replicas > 0,
+                services.c.desired_replicas > 0,
+                sa.exists(
+                    sa.select(1).where(
+                        replicas.c.service_id == services.c.id,
+                        replicas.c.status.in_(_NONTERMINAL_REPLICA_STATUSES),
+                    )
                 ),
             ),
         )
     )
     if count:
         raise RuntimeError(
-            "0016 cannot reconstruct immutable node placement for pending, deploying, "
-            "or degraded/failed positive-replica logical Kubernetes services; wait for "
-            "active services to stabilize or stop degraded/failed services before upgrading"
+            "0016 cannot reconstruct the full immutable eligible-node set for active logical "
+            "Kubernetes services; scale them to zero and wait for every replica to reach a "
+            "terminal state before upgrading, then use the normal positive scale path to "
+            "re-admit against the current complete inventory"
         )
 
 
@@ -115,9 +133,10 @@ def upgrade() -> None:
                 )
 
             json_empty = "'[]'::json" if op.get_bind().dialect.name == "postgresql" else "'[]'"
-            # Pre-0016 schemas did not persist the immutable eligible set. For stable
-            # services, [] is a one-time recovery marker: the controller may replace it
-            # only after matching an owned Pod and observing its actual Kubernetes node.
+            # Pre-0016 schemas did not persist the immutable eligible set. The preflight
+            # permits only fully stopped logical Kubernetes services, so [] records that
+            # no capacity is currently committed. A later positive scale must re-admit
+            # against current inventory and replace this marker with the complete set.
             op.execute(
                 sa.text(
                     f"UPDATE {table_name} SET eligible_node_names = {json_empty} "

@@ -49,13 +49,16 @@ def _table(metadata: sa.MetaData, name: str) -> sa.Table:
             ]
         )
     if name == "service_replicas":
-        columns.append(
-            sa.Column(
-                "service_id",
-                sa.Uuid(),
-                sa.ForeignKey("model_services.id", ondelete="CASCADE"),
-                nullable=False,
-            )
+        columns.extend(
+            [
+                sa.Column(
+                    "service_id",
+                    sa.Uuid(),
+                    sa.ForeignKey("model_services.id", ondelete="CASCADE"),
+                    nullable=False,
+                ),
+                sa.Column("status", sa.String(32), nullable=False),
+            ]
         )
     columns.extend(
         [
@@ -101,6 +104,8 @@ def _logical_snapshot(
     }
     if service:
         values.update(runtime_type="kubernetes", status="running", desired_replicas=1)
+    else:
+        values.update(status="stopped")
     values.update(overrides)
     return values
 
@@ -127,7 +132,11 @@ def test_service_node_placement_migration_backfills_and_downgrades(
     migration = _load_migration()
     with engine.connect() as connection:
         connection.exec_driver_sql("PRAGMA foreign_keys=ON")
-        connection.execute(services.insert().values(_logical_snapshot(service_id, service=True)))
+        connection.execute(
+            services.insert().values(
+                _logical_snapshot(service_id, service=True, desired_replicas=0)
+            )
+        )
         connection.execute(
             replicas.insert().values(_logical_snapshot(replica_id, service_id=service_id))
         )
@@ -205,7 +214,13 @@ def test_service_node_placement_migration_backfills_and_downgrades(
 
 @pytest.mark.parametrize(
     ("status", "desired_replicas"),
-    [("pending", 1), ("deploying", 1), ("degraded", 1), ("failed", 1)],
+    [
+        ("pending", 1),
+        ("deploying", 1),
+        ("running", 1),
+        ("degraded", 1),
+        ("failed", 1),
+    ],
 )
 def test_service_node_placement_migration_rejects_unrecoverable_service_before_ddl(
     tmp_path: Path,
@@ -240,7 +255,10 @@ def test_service_node_placement_migration_rejects_unrecoverable_service_before_d
         context = MigrationContext.configure(connection)
         migration.op = Operations(context)
 
-        with pytest.raises(RuntimeError, match="cannot reconstruct immutable node placement"):
+        with pytest.raises(
+            RuntimeError,
+            match="cannot reconstruct the full immutable eligible-node set",
+        ):
             with context.begin_transaction(_per_migration=True):
                 migration.upgrade()
 
@@ -254,6 +272,46 @@ def test_service_node_placement_migration_rejects_unrecoverable_service_before_d
             connection.execute(sa.select(sa.func.count()).select_from(replicas)).scalar_one() == 1
         )
         assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+    engine.dispose()
+
+
+def test_service_node_placement_migration_rejects_nonterminal_replica_at_zero_scale(
+    tmp_path: Path,
+) -> None:
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'draining-service.sqlite3'}")
+    metadata = sa.MetaData()
+    services = _table(metadata, "model_services")
+    replicas = _table(metadata, "service_replicas")
+    metadata.create_all(engine)
+    service_id = uuid.uuid4()
+
+    migration = _load_migration()
+    with engine.connect() as connection:
+        connection.execute(
+            services.insert().values(
+                _logical_snapshot(service_id, service=True, desired_replicas=0)
+            )
+        )
+        connection.execute(
+            replicas.insert().values(
+                _logical_snapshot(
+                    uuid.uuid4(),
+                    service_id=service_id,
+                    status="draining",
+                )
+            )
+        )
+        connection.commit()
+        context = MigrationContext.configure(connection)
+        migration.op = Operations(context)
+
+        with pytest.raises(RuntimeError, match="wait for every replica"):
+            with context.begin_transaction(_per_migration=True):
+                migration.upgrade()
+
+        assert "eligible_node_names" not in {
+            column["name"] for column in sa.inspect(connection).get_columns("model_services")
+        }
     engine.dispose()
 
 
@@ -315,7 +373,8 @@ def test_service_node_placement_migration_compiles_postgresql_offline_sql() -> N
     rendered = output.getvalue()
     assert "'[]'::json" in rendered
     assert "assigned_node_name" in rendered
-    assert "status IN ('degraded', 'failed') AND desired_replicas > 0" in rendered
+    assert "service.desired_replicas > 0" in rendered
+    assert "replica.status IN ('pending', 'starting', 'loading', 'running'" in rendered
 
 
 def test_sqlite_foreign_keys_are_restored_when_migration_body_fails() -> None:

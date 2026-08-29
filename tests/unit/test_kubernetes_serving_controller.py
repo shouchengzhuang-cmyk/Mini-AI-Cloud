@@ -1020,7 +1020,7 @@ async def test_recovery_isolates_legacy_replica_and_adopts_valid_sibling(
     await replacement.close()
 
 
-async def test_recovery_reconstructs_pre_0016_placement_from_owned_pods(
+async def test_recovery_rejects_active_pre_0016_placement_without_full_snapshot(
     kubernetes_controller_database: Database,
 ) -> None:
     service_id, catalog = await _create_profile_service(
@@ -1064,12 +1064,13 @@ async def test_recovery_reconstructs_pre_0016_placement_from_owned_pods(
         service = await session.get(ModelService, service_id)
         assert service is not None
         replicas = await ServiceRepository.list_replicas(session, service_id)
-    assert startup.recovered == 2
-    assert startup.orphans_cleaned == 0
-    assert service.eligible_node_names == ["gpu-node-a"]
-    assert all(replica.eligible_node_names == ["gpu-node-a"] for replica in replicas)
-    assert all(replica.assigned_node_name == "gpu-node-a" for replica in replicas)
-    assert runtime.force_cleaned == []
+    assert startup.recovered == 0
+    assert startup.orphans_cleaned == 2
+    assert service.eligible_node_names == []
+    assert all(replica.eligible_node_names == [] for replica in replicas)
+    assert all(replica.assigned_node_name is None for replica in replicas)
+    assert all(replica.status == ReplicaStatus.FAILED for replica in replicas)
+    assert len(runtime.force_cleaned) == 2
     await replacement.close()
 
 

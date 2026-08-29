@@ -26,6 +26,7 @@ from repositories.reservations import (
     AllocationObservationConflict,
     ReservationRepository,
 )
+from repositories.tasks import TaskRepository
 from repositories.workers import WorkerRepository
 from worker.capabilities import detect_capabilities
 from worker.gpu_inventory import (
@@ -34,7 +35,7 @@ from worker.gpu_inventory import (
     InventoryStatus,
     NoGPUInventoryProvider,
 )
-from worker.heartbeat import Heartbeat
+from worker.heartbeat import ActiveExecution, Heartbeat
 from worker.main import WorkerService
 
 pytestmark = pytest.mark.integration
@@ -284,6 +285,35 @@ async def test_heartbeat_refreshes_dynamic_inventory_after_worker_liveness(
     await heartbeat.beat_once()
 
     refresh_inventory.assert_awaited_once_with()
+
+
+async def test_inventory_refresh_failure_does_not_fence_valid_task_leases(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution = ActiveExecution(task_id=uuid.uuid4(), execution_id=uuid.uuid4())
+    renew_lease = AsyncMock(return_value=True)
+    heartbeat_worker = AsyncMock(return_value=Mock())
+    refresh_inventory = AsyncMock(side_effect=RuntimeError("inventory persistence unavailable"))
+    monkeypatch.setattr(TaskRepository, "renew_lease", renew_lease)
+    monkeypatch.setattr(WorkerRepository, "heartbeat", heartbeat_worker)
+    heartbeat = Heartbeat(
+        database,
+        worker_id="inventory-failure-worker",
+        active={execution.task_id: execution},
+        settings=Settings(_env_file=None),
+        worker_session_id=uuid.uuid4(),
+        refresh_inventory=refresh_inventory,
+    )
+    heartbeat.logger = Mock()
+
+    await heartbeat.beat_once()
+
+    renew_lease.assert_awaited_once()
+    heartbeat_worker.assert_awaited_once()
+    refresh_inventory.assert_awaited_once_with()
+    heartbeat.logger.exception.assert_called_once()
+    assert execution.ownership_lost.is_set() is False
 
 
 async def test_dynamic_inventory_refresh_replaces_changed_capacity_and_invalidates_failures(

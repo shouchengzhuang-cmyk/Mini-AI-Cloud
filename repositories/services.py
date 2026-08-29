@@ -864,59 +864,6 @@ class ServiceRepository:
         return True
 
     @staticmethod
-    async def recover_legacy_replica_placement(
-        session: AsyncSession,
-        *,
-        replica_id: uuid.UUID,
-        generation: int,
-        execution_id: uuid.UUID,
-        node_name: str,
-        worker_id: str,
-        worker_session_id: uuid.UUID | None = None,
-    ) -> bool:
-        """Grandfather one pre-0016 Pod from its verified actual node.
-
-        The caller must first match the managed Pod ownership labels and establish that
-        every active Replica for the service carries the migration's empty snapshot.
-        Ordinary empty/corrupt Replica snapshots are intentionally rejected elsewhere.
-        """
-
-        normalized_node_name = validate_kubernetes_dns_subdomain(
-            node_name,
-            field_name="assigned_node_name",
-        )
-        if not await _worker_session_matches(
-            session,
-            worker_id=worker_id,
-            worker_session_id=worker_session_id,
-        ):
-            return False
-        service, replica = await _lock_service_and_replica(session, replica_id)
-        if (
-            service is None
-            or replica is None
-            or replica.generation != generation
-            or replica.execution_id != execution_id
-            or replica.worker_id != worker_id
-            or replica.status not in NONTERMINAL_REPLICA_STATUSES
-            or service.logical_model_id is None
-            or replica.logical_model_id is None
-            or replica.eligible_node_names != []
-            or replica.assigned_node_name is not None
-            or not isinstance(service.eligible_node_names, list)
-        ):
-            return False
-        now = await database_utcnow(session)
-        service.eligible_node_names = sorted({*service.eligible_node_names, normalized_node_name})
-        service.updated_at = now
-        service.version += 1
-        replica.eligible_node_names = [normalized_node_name]
-        replica.assigned_node_name = normalized_node_name
-        replica.updated_at = now
-        replica.version += 1
-        return True
-
-    @staticmethod
     async def quarantine_replica_runtime(
         session: AsyncSession,
         *,

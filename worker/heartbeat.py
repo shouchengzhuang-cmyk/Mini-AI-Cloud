@@ -89,4 +89,14 @@ class Heartbeat:
                 execution.ownership_lost.set()
             return
         if self.refresh_inventory is not None:
-            await self.refresh_inventory()
+            try:
+                await self.refresh_inventory()
+            except Exception as exc:
+                # Inventory persistence is capacity evidence, not an execution-ownership
+                # fence. The lease and worker heartbeat above have already succeeded, so
+                # a transient refresh failure must not stop otherwise valid workloads.
+                self.logger.exception(
+                    "accelerator inventory refresh failed; active task leases remain valid",
+                    worker_id=self.worker_id,
+                    error=str(exc),
+                )
