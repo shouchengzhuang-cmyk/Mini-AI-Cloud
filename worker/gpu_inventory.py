@@ -1,13 +1,16 @@
+import asyncio
 import csv
 import io
-import json
 import re
 import subprocess
 import uuid
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from inspect import isawaitable
 from typing import Any, Protocol
+
+from kubernetes_asyncio import client, config
 
 from core.accelerators import AcceleratorDevice, kind_for_vendor
 from core.config import Settings
@@ -60,6 +63,17 @@ class AcceleratorInventoryProvider(DeviceInventory, Protocol):
     def discover(self) -> InventoryProviderResult: ...
 
     def list_devices(self) -> tuple[AcceleratorDevice, ...]: ...
+
+
+class KubernetesNodeReader(Protocol):
+    def __call__(
+        self,
+        *,
+        node_name: str,
+        kubeconfig: str | None,
+        in_cluster: bool,
+        request_timeout: float,
+    ) -> Awaitable[Mapping[str, object]]: ...
 
 
 Runner = Callable[..., subprocess.CompletedProcess[Any]]
@@ -570,41 +584,46 @@ class KubernetesNodeAcceleratorProvider(_InventoryProviderBase):
         self,
         *,
         node_name: str | None,
-        runner: Runner | None = None,
+        kubeconfig: str | None = None,
+        in_cluster: bool = False,
+        node_reader: KubernetesNodeReader | None = None,
         timeout: float = 5.0,
     ) -> None:
         if timeout <= 0:
             raise ValueError("timeout must be greater than zero")
         self.node_name = node_name.strip() if node_name is not None else None
-        self._runner = runner or subprocess.run
+        self.kubeconfig = kubeconfig
+        self.in_cluster = in_cluster
+        self._node_reader = node_reader or _read_kubernetes_node
         self.timeout = timeout
 
     def discover(self) -> InventoryProviderResult:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.discover_async())
+        raise RuntimeError("Kubernetes inventory discovery must be awaited inside an event loop")
+
+    async def discover_async(self) -> InventoryProviderResult:
         if not self.node_name:
             return InventoryProviderResult(
                 provider=self.name,
                 status=InventoryStatus.UNAVAILABLE,
                 message="worker_node_name_required",
             )
-        command_result = _run_text_command(
-            self._runner,
-            ["kubectl", "get", "node", self.node_name, "-o", "json"],
-            timeout=self.timeout,
-        )
-        if command_result.error is not None:
+        try:
+            async with asyncio.timeout(self.timeout):
+                node = await self._node_reader(
+                    node_name=self.node_name,
+                    kubeconfig=self.kubeconfig,
+                    in_cluster=self.in_cluster,
+                    request_timeout=self.timeout,
+                )
+        except Exception:
             return InventoryProviderResult(
                 provider=self.name,
                 status=InventoryStatus.UNAVAILABLE,
-                message=command_result.error,
-            )
-        try:
-            node = json.loads(command_result.output or "")
-        except (TypeError, json.JSONDecodeError):
-            return InventoryProviderResult(
-                provider=self.name,
-                status=InventoryStatus.DEGRADED,
-                message="invalid_node_json",
-                rejected_rows=1,
+                message="kubernetes_api_request_failed",
             )
         if not isinstance(node, Mapping):
             return InventoryProviderResult(
@@ -627,6 +646,38 @@ class KubernetesNodeAcceleratorProvider(_InventoryProviderBase):
             ),
             rejected_rows=parsed.rejected_rows,
         )
+
+
+async def _read_kubernetes_node(
+    *,
+    node_name: str,
+    kubeconfig: str | None,
+    in_cluster: bool,
+    request_timeout: float,
+) -> Mapping[str, object]:
+    configuration = client.Configuration()
+    api_client: client.ApiClient | None = None
+    try:
+        if in_cluster:
+            loaded = config.load_incluster_config(client_configuration=configuration)
+            if isawaitable(loaded):
+                await loaded
+        else:
+            await config.load_kube_config(
+                config_file=kubeconfig,
+                client_configuration=configuration,
+                persist_config=False,
+            )
+        api_client = client.ApiClient(configuration=configuration)
+        api = client.CoreV1Api(api_client=api_client)
+        node = await api.read_node(name=node_name, _request_timeout=request_timeout)
+        serialized = api_client.sanitize_for_serialization(node)
+        if not isinstance(serialized, Mapping):
+            raise TypeError("Kubernetes Node response must be an object")
+        return serialized
+    finally:
+        if api_client is not None:
+            await api_client.close()
 
 
 class FakeAcceleratorInventoryProvider(_InventoryProviderBase):
@@ -713,6 +764,21 @@ class InventoryProviderRegistry(_InventoryProviderBase):
 
     def snapshot(self) -> InventorySnapshot:
         results = tuple(provider.discover() for provider in self.providers)
+        return self._snapshot_from_results(results)
+
+    async def snapshot_async(self) -> InventorySnapshot:
+        results: list[InventoryProviderResult] = []
+        for provider in self.providers:
+            if isinstance(provider, KubernetesNodeAcceleratorProvider):
+                results.append(await provider.discover_async())
+            else:
+                results.append(await asyncio.to_thread(provider.discover))
+        return self._snapshot_from_results(tuple(results))
+
+    @staticmethod
+    def _snapshot_from_results(
+        results: tuple[InventoryProviderResult, ...],
+    ) -> InventorySnapshot:
         devices = tuple(
             sorted(
                 (device for result in results for device in result.devices),
@@ -842,7 +908,13 @@ def build_accelerator_inventory_registry(
         elif name == "ascend-npu-smi":
             providers.append(AscendNpuSMIInventoryProvider())
         elif name == "kubernetes-node":
-            providers.append(KubernetesNodeAcceleratorProvider(node_name=settings.worker_node_name))
+            providers.append(
+                KubernetesNodeAcceleratorProvider(
+                    node_name=settings.worker_node_name,
+                    kubeconfig=settings.kubernetes_kubeconfig,
+                    in_cluster=settings.kubernetes_in_cluster,
+                )
+            )
         elif name == "fake":
             if settings.app_env == "production":
                 raise ValueError("fake accelerator inventory is forbidden in production")

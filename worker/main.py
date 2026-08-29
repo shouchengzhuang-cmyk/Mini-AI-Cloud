@@ -92,22 +92,8 @@ class WorkerService:
         self.inventory_refresh_enabled = any(
             provider.name == "kubernetes-node" for provider in self.inventory_registry.providers
         )
-        inventory_snapshot = self.inventory_registry.snapshot()
-        self.inventory_provider_results = inventory_snapshot.provider_results
-        self.gpu_devices = (
-            bind_kubernetes_runtime_profiles(
-                inventory_snapshot.devices,
-                runtime_profile_catalog,
-            )
-            if runtime_profile_catalog is not None
-            else inventory_snapshot.devices
-        )
-        self.capabilities = replace(
-            self.capabilities,
-            gpu_count=len(self.gpu_devices),
-            gpu_model=", ".join(dict.fromkeys(item.model for item in self.gpu_devices)) or None,
-            gpu_memory_mb=sum(item.memory_total_mb for item in self.gpu_devices),
-        )
+        self.inventory_provider_results: tuple[InventoryProviderResult, ...] = ()
+        self.gpu_devices: tuple[AcceleratorDevice, ...] = ()
         if settings.fake_gpu_count and "fake" not in runtime_types:
             raise ValueError("fake GPU inventory requires the fake compute runtime")
         runtimes: dict[str, ComputeRuntime] = {}
@@ -166,6 +152,8 @@ class WorkerService:
         self.next_orphan_reconcile = 0.0
 
     async def run(self) -> None:
+        inventory_snapshot, devices = await self._take_accelerator_inventory_snapshot()
+        self._apply_accelerator_inventory(inventory_snapshot, devices)
         for result in self.inventory_provider_results:
             log = (
                 self.logger.info
@@ -367,8 +355,31 @@ class WorkerService:
             )
 
     async def _refresh_accelerator_inventory(self) -> None:
+        snapshot, devices = await self._take_accelerator_inventory_snapshot()
+        async with self.database.session() as session, session.begin():
+            await WorkerRepository.replace_gpu_inventory(
+                session,
+                worker_id=self.worker_id,
+                worker_session_id=self.worker_session_id,
+                devices=_inventory_payload(devices),
+            )
+        self._apply_accelerator_inventory(snapshot, devices)
+        for result in snapshot.provider_results:
+            if result.status != InventoryStatus.AVAILABLE:
+                self.logger.warning(
+                    "accelerator inventory refresh degraded",
+                    worker_id=self.worker_id,
+                    provider=result.provider,
+                    status=result.status.value,
+                    rejected_rows=result.rejected_rows,
+                    reason=result.message,
+                )
+
+    async def _take_accelerator_inventory_snapshot(
+        self,
+    ) -> tuple[InventorySnapshot, tuple[AcceleratorDevice, ...]]:
         try:
-            snapshot = await asyncio.to_thread(self.inventory_registry.snapshot)
+            snapshot = await self.inventory_registry.snapshot_async()
             devices = (
                 bind_kubernetes_runtime_profiles(snapshot.devices, self.runtime_profile_catalog)
                 if self.runtime_profile_catalog is not None
@@ -391,14 +402,13 @@ class WorkerService:
                 ),
             )
             devices = ()
+        return snapshot, devices
 
-        async with self.database.session() as session, session.begin():
-            await WorkerRepository.replace_gpu_inventory(
-                session,
-                worker_id=self.worker_id,
-                worker_session_id=self.worker_session_id,
-                devices=_inventory_payload(devices),
-            )
+    def _apply_accelerator_inventory(
+        self,
+        snapshot: InventorySnapshot,
+        devices: tuple[AcceleratorDevice, ...],
+    ) -> None:
         self.inventory_provider_results = snapshot.provider_results
         self.gpu_devices = devices
         self.capabilities = replace(
@@ -407,16 +417,6 @@ class WorkerService:
             gpu_model=", ".join(dict.fromkeys(item.model for item in devices)) or None,
             gpu_memory_mb=sum(item.memory_total_mb for item in devices),
         )
-        for result in snapshot.provider_results:
-            if result.status != InventoryStatus.AVAILABLE:
-                self.logger.warning(
-                    "accelerator inventory refresh degraded",
-                    worker_id=self.worker_id,
-                    provider=result.provider,
-                    status=result.status.value,
-                    rejected_rows=result.rejected_rows,
-                    reason=result.message,
-                )
 
     async def _maybe_reconcile_orphans(self) -> None:
         if self.docker_runtime is None:

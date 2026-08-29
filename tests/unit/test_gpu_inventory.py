@@ -1,11 +1,13 @@
+import asyncio
 import json
 import subprocess
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from pydantic import ValidationError
 
+import worker.gpu_inventory as gpu_inventory
 from core.config import Settings
 from core.enums import AcceleratorKind, AcceleratorVendor
 from core.runtime_profiles import RuntimeProfileCatalog
@@ -167,16 +169,24 @@ def test_ascend_provider_keeps_partial_devices_when_one_memory_query_fails() -> 
     assert result.message is not None and "memory query" in result.message
 
 
-def test_kubernetes_provider_reads_allocatable_labels_and_plugin_resources() -> None:
-    node_json = _fixture("kubernetes-node.json")
-    runner = Mock(
-        return_value=subprocess.CompletedProcess(args=["kubectl"], returncode=0, stdout=node_json)
+async def test_kubernetes_provider_reads_configured_cluster_without_kubectl() -> None:
+    node_reader = AsyncMock(return_value=json.loads(_fixture("kubernetes-node.json")))
+
+    provider = KubernetesNodeAcceleratorProvider(
+        node_name="dual-stack-node",
+        kubeconfig="/var/run/mini-ai/worker.kubeconfig",
+        node_reader=node_reader,
     )
 
-    result = KubernetesNodeAcceleratorProvider(
-        node_name="dual-stack-node", runner=runner
-    ).discover()
+    snapshot = await InventoryProviderRegistry((provider,)).snapshot_async()
+    result = snapshot.provider_results[0]
 
+    node_reader.assert_awaited_once_with(
+        node_name="dual-stack-node",
+        kubeconfig="/var/run/mini-ai/worker.kubeconfig",
+        in_cluster=False,
+        request_timeout=5.0,
+    )
     assert result.status == InventoryStatus.AVAILABLE
     assert len(result.devices) == 6
     assert sum(device.vendor == AcceleratorVendor.NVIDIA for device in result.devices) == 2
@@ -188,6 +198,121 @@ def test_kubernetes_provider_reads_allocatable_labels_and_plugin_resources() -> 
     assert all("kubernetes-capacity-slot" in device.capabilities for device in result.devices)
     assert all(device.health == "inventory-only" for device in result.devices)
     assert all(device.device_id.startswith("k8s-capacity:node-uid-1:") for device in result.devices)
+
+
+async def test_kubernetes_provider_reads_node_via_real_python_client(
+    tmp_path: Path,
+) -> None:
+    request_lines: list[str] = []
+
+    async def serve_node(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        request = await reader.readuntil(b"\r\n\r\n")
+        request_lines.append(request.split(b"\r\n", 1)[0].decode("ascii"))
+        node = json.loads(_fixture("kubernetes-node.json"))
+        node.update({"apiVersion": "v1", "kind": "Node"})
+        body = json.dumps(node).encode()
+        writer.write(
+            b"HTTP/1.1 200 OK\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode()
+            + b"Content-Type: application/json\r\nConnection: close\r\n\r\n"
+            + body
+        )
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(serve_node, "127.0.0.1", 0)
+    socket = server.sockets[0]
+    port = int(socket.getsockname()[1])
+    kubeconfig = tmp_path / "worker.kubeconfig"
+    kubeconfig.write_text(
+        json.dumps(
+            {
+                "apiVersion": "v1",
+                "kind": "Config",
+                "clusters": [
+                    {
+                        "name": "test-cluster",
+                        "cluster": {"server": f"http://127.0.0.1:{port}"},
+                    }
+                ],
+                "contexts": [
+                    {
+                        "name": "test-context",
+                        "context": {"cluster": "test-cluster", "user": "test-user"},
+                    }
+                ],
+                "current-context": "test-context",
+                "users": [{"name": "test-user", "user": {}}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    try:
+        result = await KubernetesNodeAcceleratorProvider(
+            node_name="dual-stack-node",
+            kubeconfig=str(kubeconfig),
+        ).discover_async()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert result.status == InventoryStatus.AVAILABLE
+    assert len(result.devices) == 6
+    assert request_lines == ["GET /api/v1/nodes/dual-stack-node HTTP/1.1"]
+
+
+async def test_kubernetes_provider_fails_closed_when_api_read_fails() -> None:
+    result = await KubernetesNodeAcceleratorProvider(
+        node_name="gpu-node-a",
+        kubeconfig="/var/run/mini-ai/worker.kubeconfig",
+        node_reader=AsyncMock(side_effect=TimeoutError("Kubernetes API unavailable")),
+    ).discover_async()
+
+    assert result.status == InventoryStatus.UNAVAILABLE
+    assert result.devices == ()
+    assert result.message == "kubernetes_api_request_failed"
+
+
+async def test_kubernetes_api_reader_uses_explicit_kubeconfig_and_closes_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    node = json.loads(_fixture("kubernetes-node.json"))
+    configuration = Mock()
+    api_client = Mock()
+    api_client.sanitize_for_serialization.return_value = node
+    api_client.close = AsyncMock()
+    api = Mock()
+    api.read_node = AsyncMock(return_value=Mock())
+    load_kube_config = AsyncMock()
+    configuration_factory = Mock(return_value=configuration)
+    api_client_factory = Mock(return_value=api_client)
+    core_api_factory = Mock(return_value=api)
+    monkeypatch.setattr(gpu_inventory.client, "Configuration", configuration_factory)
+    monkeypatch.setattr(gpu_inventory.client, "ApiClient", api_client_factory)
+    monkeypatch.setattr(gpu_inventory.client, "CoreV1Api", core_api_factory)
+    monkeypatch.setattr(gpu_inventory.config, "load_kube_config", load_kube_config)
+
+    discovered = await gpu_inventory._read_kubernetes_node(
+        node_name="gpu-node-a",
+        kubeconfig="/var/run/mini-ai/worker.kubeconfig",
+        in_cluster=False,
+        request_timeout=3.0,
+    )
+
+    assert discovered == node
+    load_kube_config.assert_awaited_once_with(
+        config_file="/var/run/mini-ai/worker.kubeconfig",
+        client_configuration=configuration,
+        persist_config=False,
+    )
+    api_client_factory.assert_called_once_with(configuration=configuration)
+    core_api_factory.assert_called_once_with(api_client=api_client)
+    api.read_node.assert_awaited_once_with(name="gpu-node-a", _request_timeout=3.0)
+    api_client.close.assert_awaited_once_with()
 
 
 @pytest.mark.parametrize(
@@ -213,20 +338,24 @@ def test_kubernetes_capacity_rejects_unschedulable_or_unready_nodes(
     assert parsed.rejected_rows == 1
 
 
-def test_kubernetes_capacity_binds_only_exact_catalog_resource_contracts() -> None:
-    node_json = _fixture("kubernetes-node.json")
+async def test_kubernetes_capacity_binds_only_exact_catalog_resource_contracts() -> None:
+    node_reader = AsyncMock(return_value=json.loads(_fixture("kubernetes-node.json")))
     provider = KubernetesNodeAcceleratorProvider(
         node_name="dual-stack-node",
-        runner=Mock(
-            return_value=subprocess.CompletedProcess(
-                args=["kubectl"], returncode=0, stdout=node_json
-            )
-        ),
+        in_cluster=True,
+        node_reader=node_reader,
     )
     catalog = RuntimeProfileCatalog.from_path(REPOSITORY_ROOT / "runtime_profiles/manifest.json")
 
-    bound = bind_kubernetes_runtime_profiles(provider.list_devices(), catalog)
+    result = await provider.discover_async()
+    bound = bind_kubernetes_runtime_profiles(result.devices, catalog)
 
+    node_reader.assert_awaited_once_with(
+        node_name="dual-stack-node",
+        kubeconfig=None,
+        in_cluster=True,
+        request_timeout=5.0,
+    )
     nvidia = [device for device in bound if device.vendor == AcceleratorVendor.NVIDIA]
     ascend = [device for device in bound if device.vendor == AcceleratorVendor.HUAWEI_ASCEND]
     assert {device.runtime_profile_ids for device in nvidia} == {("nvidia-vllm-k8s",)}
@@ -372,6 +501,25 @@ def test_registry_factory_preserves_explicit_provider_order() -> None:
         "ascend-npu-smi",
         "nvidia-smi",
     ]
+
+
+def test_kubernetes_provider_factory_preserves_runtime_cluster_configuration() -> None:
+    settings = Settings(
+        _env_file=None,
+        app_env="test",
+        accelerator_inventory_providers="kubernetes-node",
+        worker_node_name="gpu-node-a",
+        kubernetes_kubeconfig="/var/run/mini-ai/worker.kubeconfig",
+        kubernetes_in_cluster=False,
+    )
+
+    registry = build_accelerator_inventory_registry(settings, worker_id="worker-test")
+
+    provider = registry.providers[0]
+    assert isinstance(provider, KubernetesNodeAcceleratorProvider)
+    assert provider.node_name == "gpu-node-a"
+    assert provider.kubeconfig == "/var/run/mini-ai/worker.kubeconfig"
+    assert provider.in_cluster is False
 
 
 def test_settings_reject_fake_gpu_inventory_in_production() -> None:

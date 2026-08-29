@@ -350,10 +350,12 @@ async def test_dynamic_inventory_refresh_replaces_changed_capacity_and_invalidat
     service.worker_id = worker_id
     service.worker_session_id = worker_session_id
     service.inventory_registry = Mock()
-    service.inventory_registry.snapshot.side_effect = [
-        InventorySnapshot(devices=(initial_devices[0],), provider_results=(available,)),
-        RuntimeError("kubectl response changed unexpectedly"),
-    ]
+    service.inventory_registry.snapshot_async = AsyncMock(
+        side_effect=[
+            InventorySnapshot(devices=(initial_devices[0],), provider_results=(available,)),
+            RuntimeError("Kubernetes API response changed unexpectedly"),
+        ]
+    )
     service.runtime_profile_catalog = None
     service.inventory_provider_results = (available,)
     service.gpu_devices = initial_devices
