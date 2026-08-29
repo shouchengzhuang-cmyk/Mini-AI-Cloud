@@ -549,7 +549,7 @@ def test_registry_rejects_same_vendor_device_index_from_multiple_providers() -> 
         InventoryProviderRegistry((real, fake)).snapshot()
 
 
-async def test_registry_merges_host_and_kubernetes_capacity_index_namespaces() -> None:
+def test_registry_rejects_overlapping_host_and_kubernetes_capacity_sources() -> None:
     node = json.loads(_fixture("kubernetes-node.json"))
     node["status"]["allocatable"] = {
         "cpu": "64",
@@ -570,24 +570,20 @@ async def test_registry_merges_host_and_kubernetes_capacity_index_namespaces() -
         node_reader=AsyncMock(return_value=node),
     )
 
-    snapshot = await InventoryProviderRegistry((host, kubernetes)).snapshot_async()
+    with pytest.raises(ValueError, match="cross-authority physical-device aliasing"):
+        InventoryProviderRegistry((host, kubernetes))
 
-    overlapping = [
-        device
-        for device in snapshot.devices
-        if device.vendor == AcceleratorVendor.NVIDIA
-        and device.device_index in {0, gpu_inventory.KUBERNETES_CAPACITY_INDEX_BASE}
-    ]
-    assert len(overlapping) == 2
-    assert {device.kubernetes_resource_name for device in overlapping} == {
-        None,
-        "nvidia.com/gpu",
-    }
-    assert {device.device_index for device in overlapping} == {
-        0,
-        gpu_inventory.KUBERNETES_CAPACITY_INDEX_BASE,
-    }
-    assert len(snapshot.devices) == 3
+
+def test_registry_factory_rejects_mixed_host_and_kubernetes_inventory() -> None:
+    settings = Settings(
+        _env_file=None,
+        app_env="test",
+        accelerator_inventory_providers="nvidia-smi,kubernetes-node",
+        worker_node_name="gpu-node-a",
+    )
+
+    with pytest.raises(ValueError, match="kubernetes-node must be the only"):
+        build_accelerator_inventory_registry(settings, worker_id="worker-test")
 
 
 def test_provider_factory_uses_fake_override_only_in_non_production() -> None:

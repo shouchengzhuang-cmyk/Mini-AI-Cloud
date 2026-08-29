@@ -54,7 +54,7 @@ def _snapshot_sql(*, include_eligible_nodes: bool) -> str:
     )
 
 
-def _reject_inflight_legacy_services() -> None:
+def _reject_unrecoverable_legacy_services() -> None:
     """Do not migrate a service before Kubernetes has observable placement."""
 
     context = op.get_context()
@@ -67,9 +67,10 @@ def _reject_inflight_legacy_services() -> None:
                 "IF EXISTS (SELECT 1 FROM model_services "
                 "WHERE logical_model_id IS NOT NULL "
                 "AND runtime_type = 'kubernetes' "
-                "AND status IN ('pending', 'deploying')) THEN "
-                "RAISE EXCEPTION '0016 cannot migrate pending or deploying logical "
-                "Kubernetes services'; "
+                "AND (status IN ('pending', 'deploying') "
+                "OR (status = 'failed' AND desired_replicas > 0))) THEN "
+                "RAISE EXCEPTION '0016 cannot migrate unrecoverable logical Kubernetes "
+                "services'; "
                 "END IF; END $$"
             )
         )
@@ -79,6 +80,7 @@ def _reject_inflight_legacy_services() -> None:
         sa.column("logical_model_id", sa.Uuid()),
         sa.column("runtime_type", sa.String(32)),
         sa.column("status", sa.String(32)),
+        sa.column("desired_replicas", sa.Integer()),
     )
     count = op.get_bind().scalar(
         sa.select(sa.func.count())
@@ -86,19 +88,25 @@ def _reject_inflight_legacy_services() -> None:
         .where(
             services.c.logical_model_id.is_not(None),
             services.c.runtime_type == "kubernetes",
-            services.c.status.in_(_INFLIGHT_SERVICE_STATUSES),
+            sa.or_(
+                services.c.status.in_(_INFLIGHT_SERVICE_STATUSES),
+                sa.and_(
+                    services.c.status == "failed",
+                    services.c.desired_replicas > 0,
+                ),
+            ),
         )
     )
     if count:
         raise RuntimeError(
-            "0016 cannot reconstruct immutable node placement for pending or deploying "
-            "logical Kubernetes services; wait for them to become running/degraded or "
-            "stop them before upgrading"
+            "0016 cannot reconstruct immutable node placement for pending, deploying, "
+            "or failed positive-replica logical Kubernetes services; wait for active "
+            "services to stabilize or stop failed services before upgrading"
         )
 
 
 def upgrade() -> None:
-    _reject_inflight_legacy_services()
+    _reject_unrecoverable_legacy_services()
     with _preserve_sqlite_referencing_rows():
         for table_name in _TABLE_NAMES:
             with op.batch_alter_table(table_name) as batch:

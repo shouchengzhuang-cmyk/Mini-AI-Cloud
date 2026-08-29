@@ -45,6 +45,7 @@ def _table(metadata: sa.MetaData, name: str) -> sa.Table:
             [
                 sa.Column("runtime_type", sa.String(32), nullable=False),
                 sa.Column("status", sa.String(32), nullable=False),
+                sa.Column("desired_replicas", sa.Integer(), nullable=False),
             ]
         )
     if name == "service_replicas":
@@ -99,7 +100,7 @@ def _logical_snapshot(
         "selection_policy": "nvidia-only",
     }
     if service:
-        values.update(runtime_type="kubernetes", status="running")
+        values.update(runtime_type="kubernetes", status="running", desired_replicas=1)
     values.update(overrides)
     return values
 
@@ -202,8 +203,14 @@ def test_service_node_placement_migration_backfills_and_downgrades(
     engine.dispose()
 
 
-def test_service_node_placement_migration_rejects_inflight_legacy_service_before_ddl(
+@pytest.mark.parametrize(
+    ("status", "desired_replicas"),
+    [("pending", 1), ("deploying", 1), ("failed", 1)],
+)
+def test_service_node_placement_migration_rejects_unrecoverable_service_before_ddl(
     tmp_path: Path,
+    status: str,
+    desired_replicas: int,
 ) -> None:
     engine = sa.create_engine(f"sqlite:///{tmp_path / 'inflight-service.sqlite3'}")
     metadata = sa.MetaData()
@@ -218,7 +225,12 @@ def test_service_node_placement_migration_rejects_inflight_legacy_service_before
         connection.exec_driver_sql("PRAGMA foreign_keys=ON")
         connection.execute(
             services.insert().values(
-                _logical_snapshot(service_id, service=True, status="deploying")
+                _logical_snapshot(
+                    service_id,
+                    service=True,
+                    status=status,
+                    desired_replicas=desired_replicas,
+                )
             )
         )
         connection.execute(
@@ -228,7 +240,7 @@ def test_service_node_placement_migration_rejects_inflight_legacy_service_before
         context = MigrationContext.configure(connection)
         migration.op = Operations(context)
 
-        with pytest.raises(RuntimeError, match="pending or deploying"):
+        with pytest.raises(RuntimeError, match="cannot reconstruct immutable node placement"):
             with context.begin_transaction(_per_migration=True):
                 migration.upgrade()
 
@@ -242,6 +254,48 @@ def test_service_node_placement_migration_rejects_inflight_legacy_service_before
             connection.execute(sa.select(sa.func.count()).select_from(replicas)).scalar_one() == 1
         )
         assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+    engine.dispose()
+
+
+def test_service_node_placement_migration_allows_failed_scaled_to_zero(
+    tmp_path: Path,
+) -> None:
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'failed-stopped-service.sqlite3'}")
+    metadata = sa.MetaData()
+    services = _table(metadata, "model_services")
+    replicas = _table(metadata, "service_replicas")
+    metadata.create_all(engine)
+    service_id = uuid.uuid4()
+
+    migration = _load_migration()
+    with engine.connect() as connection:
+        connection.execute(
+            services.insert().values(
+                _logical_snapshot(
+                    service_id,
+                    service=True,
+                    status="failed",
+                    desired_replicas=0,
+                )
+            )
+        )
+        connection.execute(
+            replicas.insert().values(_logical_snapshot(uuid.uuid4(), service_id=service_id))
+        )
+        connection.commit()
+        context = MigrationContext.configure(connection)
+        migration.op = Operations(context)
+
+        with context.begin_transaction(_per_migration=True):
+            migration.upgrade()
+
+        upgraded = sa.Table("model_services", sa.MetaData(), autoload_with=connection)
+        row = connection.execute(
+            sa.select(
+                upgraded.c.status, upgraded.c.desired_replicas, upgraded.c.eligible_node_names
+            )
+        ).one()
+        assert row == ("failed", 0, [])
     engine.dispose()
 
 
@@ -259,6 +313,7 @@ def test_service_node_placement_migration_compiles_postgresql_offline_sql() -> N
     rendered = output.getvalue()
     assert "'[]'::json" in rendered
     assert "assigned_node_name" in rendered
+    assert "status = 'failed' AND desired_replicas > 0" in rendered
 
 
 def test_sqlite_foreign_keys_are_restored_when_migration_body_fails() -> None:

@@ -24,7 +24,6 @@ from core.runtime_profiles import (
 
 MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024
 MAX_INVENTORY_ROWS = 256
-KUBERNETES_CAPACITY_INDEX_BASE = 1_000_000_000
 
 
 class InventoryStatus(StrEnum):
@@ -568,10 +567,7 @@ def parse_kubernetes_node(node: Mapping[str, object]) -> _ParseResult:
             devices.append(
                 AcceleratorDevice(
                     device_id=f"k8s-capacity:{node_uid}:{resource_name}:{slot}",
-                    # Kubernetes capacity slots are synthetic evidence, not host
-                    # device ordinals. Keep them in a disjoint persisted index
-                    # namespace so host CLI and Device Plugin inventory can coexist.
-                    device_index=KUBERNETES_CAPACITY_INDEX_BASE + next_index,
+                    device_index=next_index,
                     vendor=vendor,
                     kind=kind,
                     model=model,
@@ -778,6 +774,11 @@ class InventoryProviderRegistry(_InventoryProviderBase):
         names = [provider.name for provider in self.providers]
         if len(names) != len(set(names)):
             raise ValueError("inventory provider names must be unique")
+        if "kubernetes-node" in names and len(names) > 1:
+            raise ValueError(
+                "kubernetes-node must be the only accelerator inventory provider because "
+                "cross-authority physical-device aliasing is not available"
+            )
 
     def snapshot(self) -> InventorySnapshot:
         results = tuple(provider.discover() for provider in self.providers)
