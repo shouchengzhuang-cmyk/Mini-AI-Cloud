@@ -222,7 +222,9 @@ async def test_autoscaler_scans_past_locked_logical_model(
                     selection_policy=AcceleratorSelectionPolicy.NVIDIA_ONLY.value,
                     eligible_node_names=("gpu-node-a", "gpu-node-b"),
                 )
-                service.last_autoscale_checked_at = now - timedelta(hours=2 - index)
+                service.last_autoscale_checked_at = datetime(2000, 1, 1, tzinfo=UTC) + timedelta(
+                    seconds=index
+                )
 
         metrics = _StaticMetrics(
             {
@@ -231,6 +233,31 @@ async def test_autoscaler_scans_past_locked_logical_model(
             }
         )
         autoscaler = ServiceAutoscaler(live_database, metrics, batch_size=1)
+        candidates = autoscaler._candidates()
+        try:
+            first_candidate = await anext(candidates)
+            assert first_candidate[0] == service_ids[0]
+            async with live_database.session() as session, session.begin():
+                moved_service = await session.get(
+                    ModelService,
+                    service_ids[0],
+                    with_for_update=True,
+                )
+                assert moved_service is not None
+                moved_service.last_autoscale_checked_at = now
+            second_candidate = await anext(candidates)
+            assert second_candidate[0] == service_ids[1]
+        finally:
+            await candidates.aclose()
+
+        async with live_database.session() as session, session.begin():
+            moved_service = await session.get(
+                ModelService,
+                service_ids[0],
+                with_for_update=True,
+            )
+            assert moved_service is not None
+            moved_service.last_autoscale_checked_at = datetime(2000, 1, 1, tzinfo=UTC)
         async with live_database.session() as blocker, blocker.begin():
             locked = await blocker.scalar(
                 select(LogicalModel.id)
