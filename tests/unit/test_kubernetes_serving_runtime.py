@@ -186,6 +186,66 @@ def test_nonaccelerator_contract_hash_remains_compatible_with_a4() -> None:
     assert selector[SPEC_HASH_LABEL] == "9ae65e930dfffd128522b1a3d56861f6"
 
 
+def test_workload_identity_references_render_exactly_and_enter_contract_hash() -> None:
+    base = _runtime(SimpleNamespace())._selector_labels(
+        _spec(),
+        worker_id="k8s-serving-worker",
+        worker_session_id=WORKER_SESSION_ID,
+    )
+    runtime = KubernetesServingRuntimeAdapter(
+        namespace="serving-tests",
+        cluster_id="kind-serving-test",
+        service_account_name="serving-runtime",
+        image_pull_secrets=("registry-pull", "secondary-registry", "registry-pull"),
+        api=SimpleNamespace(),
+    )
+    configured = runtime._selector_labels(
+        _spec(),
+        worker_id="k8s-serving-worker",
+        worker_session_id=WORKER_SESSION_ID,
+    )
+    pod = runtime._build_pod(_spec(), configured)
+
+    assert pod.spec.service_account_name == "serving-runtime"
+    assert [item.name for item in pod.spec.image_pull_secrets] == [
+        "registry-pull",
+        "secondary-registry",
+    ]
+    assert configured[SPEC_HASH_LABEL] != base[SPEC_HASH_LABEL]
+
+
+@pytest.mark.parametrize("drift", ["service_account", "image_pull_secrets"])
+async def test_prepare_rejects_workload_identity_reference_drift(drift: str) -> None:
+    api = _prepare_api()
+    runtime = KubernetesServingRuntimeAdapter(
+        namespace="serving-tests",
+        cluster_id="kind-serving-test",
+        service_account_name="serving-runtime",
+        image_pull_secrets=("registry-pull", "secondary-registry"),
+        api=api,
+    )
+    spec = _spec()
+    selector = runtime._selector_labels(
+        spec,
+        worker_id="k8s-serving-worker",
+        worker_session_id=WORKER_SESSION_ID,
+    )
+    pod = runtime._build_pod(spec, selector)
+    if drift == "service_account":
+        pod.spec.service_account_name = "different-runtime"
+    else:
+        pod.spec.image_pull_secrets[1].name = "different-registry"
+    api.create_namespaced_pod.side_effect = ApiException(status=409)
+    api.read_namespaced_pod = AsyncMock(return_value=pod)
+
+    with pytest.raises(KubernetesServingOwnershipError, match="mismatched launch spec"):
+        await runtime.prepare(
+            spec,
+            worker_id="k8s-serving-worker",
+            worker_session_id=WORKER_SESSION_ID,
+        )
+
+
 async def test_prepare_builds_secure_fenced_pod_with_static_headless_dns() -> None:
     api = _prepare_api()
     runtime = _runtime(api)

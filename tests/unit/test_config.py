@@ -1,9 +1,11 @@
+from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
 from core.config import Settings
+from core.runtime_profiles import RuntimeProfileCatalog
 
 
 def test_worker_labels_are_parsed_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -174,9 +176,39 @@ def test_kubernetes_serving_is_safe_by_default_and_accepts_explicit_test_configu
         kubernetes_serving_namespace="model-serving",
         kubernetes_serving_cluster_id="kind.phase4-a",
         kubernetes_serving_image="mini-ai-cloud:kind-serving-v4a",
+        kubernetes_serving_service_account_name="serving-runtime",
+        kubernetes_serving_image_pull_secrets=("registry-pull, secondary-registry, registry-pull"),
+        runtime_profile_manifest_path=("/etc/mini-ai-cloud/runtime_profiles/manifest.json"),
     )
     assert configured.kubernetes_serving_namespace == "model-serving"
     assert configured.kubernetes_serving_cluster_id == "kind.phase4-a"
+    assert configured.kubernetes_serving_service_account_name == "serving-runtime"
+    assert configured.kubernetes_serving_image_pull_secrets == (
+        "registry-pull",
+        "secondary-registry",
+    )
+    assert configured.runtime_profile_manifest_path == (
+        "/etc/mini-ai-cloud/runtime_profiles/manifest.json"
+    )
+
+
+def test_default_runtime_profile_manifest_is_release_relative_not_cwd_relative(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    settings = Settings(_env_file=None)
+    manifest_path = Path(settings.runtime_profile_manifest_path)
+    catalog = RuntimeProfileCatalog.from_path(manifest_path)
+
+    assert manifest_path.is_absolute()
+    assert manifest_path.name == "manifest.json"
+    assert manifest_path.parent.name == "runtime_profiles"
+    assert {entry.identity for entry in catalog.manifest.profiles} >= {
+        "nvidia-vllm-k8s@2.0.0",
+        "ascend-vllm-k8s-a2@2.0.0",
+    }
 
 
 @pytest.mark.parametrize(
@@ -194,9 +226,19 @@ def test_kubernetes_serving_is_safe_by_default_and_accepts_explicit_test_configu
         },
         {"kubernetes_serving_namespace": "Uppercase"},
         {"kubernetes_serving_cluster_id": "trailing-"},
+        {"kubernetes_serving_service_account_name": "Bad_Name"},
+        {"kubernetes_serving_image_pull_secrets": "registry-pull,trailing-"},
         {"kubernetes_serving_lease_seconds": 6, "kubernetes_serving_probe_timeout": 3},
     ],
 )
 def test_kubernetes_serving_rejects_unsafe_configuration(overrides: dict[str, Any]) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **overrides)
+
+
+def test_kubernetes_serving_image_pull_secrets_accept_empty_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KUBERNETES_SERVING_IMAGE_PULL_SECRETS", "")
+
+    assert Settings(_env_file=None).kubernetes_serving_image_pull_secrets == ()

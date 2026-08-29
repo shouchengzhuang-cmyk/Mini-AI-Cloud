@@ -194,6 +194,8 @@ def create_app(
                     resolved_settings.kubernetes_serving_probe_timeout
                 ),
                 readiness_probe_period_seconds=(resolved_settings.kubernetes_serving_poll_interval),
+                service_account_name=(resolved_settings.kubernetes_serving_service_account_name),
+                image_pull_secrets=resolved_settings.kubernetes_serving_image_pull_secrets,
             ),
             app_env=resolved_settings.app_env,
             cluster_id=resolved_settings.kubernetes_serving_cluster_id,

@@ -235,6 +235,8 @@ class KubernetesServingRuntimeAdapter:
         termination_grace_seconds: int = 30,
         readiness_probe_timeout_seconds: float = 1.0,
         readiness_probe_period_seconds: float = 1.0,
+        service_account_name: str | None = None,
+        image_pull_secrets: Sequence[str] = (),
         api: Any | None = None,
         version_api: Any | None = None,
         allocation_observer: Callable[[KubernetesObservedAllocation], object] | None = None,
@@ -245,6 +247,14 @@ class KubernetesServingRuntimeAdapter:
             raise ValueError("namespace must be a DNS-1123 label")
         if not _LABEL_VALUE.fullmatch(normalized_cluster_id):
             raise ValueError("cluster_id must be a Kubernetes label value")
+        normalized_service_account = _optional_kubernetes_name(
+            service_account_name,
+            field_name="service_account_name",
+        )
+        normalized_image_pull_secrets = _kubernetes_names(
+            image_pull_secrets,
+            field_name="image_pull_secrets",
+        )
         if termination_grace_seconds < 0 or termination_grace_seconds > 3600:
             raise ValueError("termination_grace_seconds must be between zero and 3600")
         if (
@@ -267,6 +277,8 @@ class KubernetesServingRuntimeAdapter:
         self.termination_grace_seconds = termination_grace_seconds
         self.readiness_probe_timeout_seconds = math.ceil(readiness_probe_timeout_seconds)
         self.readiness_probe_period_seconds = math.ceil(readiness_probe_period_seconds)
+        self.service_account_name = normalized_service_account
+        self.image_pull_secrets = normalized_image_pull_secrets
         self._api = api
         self._version_api = version_api
         self._allocation_observer = allocation_observer
@@ -824,6 +836,12 @@ class KubernetesServingRuntimeAdapter:
                 host_network=False,
                 host_pid=False,
                 restart_policy="Never",
+                service_account_name=self.service_account_name,
+                image_pull_secrets=(
+                    [client.V1LocalObjectReference(name=name) for name in self.image_pull_secrets]
+                    if self.image_pull_secrets
+                    else None
+                ),
                 runtime_class_name=runtime_class_name,
                 scheduler_name=scheduler_name,
                 security_context=client.V1PodSecurityContext(
@@ -1106,6 +1124,11 @@ def _pod_contract(pod: object) -> dict[str, object]:
     contract_label_keys = _BASE_CONTRACT_LABEL_KEYS + (
         _ACCELERATOR_CONTRACT_LABEL_KEYS if accelerator_contract else ()
     )
+    service_account_name = getattr(pod_spec, "service_account_name", None)
+    image_pull_secrets = tuple(
+        getattr(item, "name", None)
+        for item in (getattr(pod_spec, "image_pull_secrets", None) or ())
+    )
 
     return {
         "fencing_labels": {key: labels.get(key) for key in contract_label_keys},
@@ -1127,6 +1150,14 @@ def _pod_contract(pod: object) -> dict[str, object]:
         "pod": {
             "automount_service_account_token": getattr(
                 pod_spec, "automount_service_account_token", None
+            ),
+            **(
+                {
+                    "service_account_name": service_account_name,
+                    "image_pull_secrets": image_pull_secrets,
+                }
+                if service_account_name not in (None, "default") or image_pull_secrets
+                else {}
             ),
             "hostname": getattr(pod_spec, "hostname", None),
             "host_ipc": getattr(pod_spec, "host_ipc", None) is True,
@@ -1273,6 +1304,27 @@ def _pod_contract(pod: object) -> dict[str, object]:
             "downward_api_present": getattr(volume, "downward_api", None) is not None,
         },
     }
+
+
+def _optional_kubernetes_name(value: str | None, *, field_name: str) -> str | None:
+    if value is None or not value.strip():
+        return None
+    normalized = value.strip()
+    return validate_kubernetes_dns_subdomain(normalized, field_name=field_name)
+
+
+def _kubernetes_names(values: Sequence[str], *, field_name: str) -> tuple[str, ...]:
+    if isinstance(values, str):
+        raise ValueError(f"{field_name} must be a sequence of Kubernetes names")
+    normalized_names: list[str] = []
+    for value in values:
+        normalized = value.strip()
+        if not normalized or normalized in normalized_names:
+            continue
+        normalized_names.append(
+            validate_kubernetes_dns_subdomain(normalized, field_name=field_name)
+        )
+    return tuple(normalized_names)
 
 
 def _string_mapping(value: object) -> dict[str, str]:
