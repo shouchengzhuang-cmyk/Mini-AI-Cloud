@@ -11,7 +11,12 @@ _VENDOR_KINDS = {
 _KUBERNETES_RESOURCE = re.compile(
     r"^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?/[A-Za-z0-9](?:[-A-Za-z0-9_.]*[A-Za-z0-9])?$"
 )
-_DISCOVERED_HEALTH_STATES = {"healthy", "unknown", "inventory-only"}
+_DISCOVERED_HEALTH_STATES = {
+    "healthy",
+    "unknown",
+    "inventory-only",
+    "externally-allocated",
+}
 
 
 def _validate_inventory_text(name: str, value: str, *, maximum: int) -> None:
@@ -78,7 +83,9 @@ class AcceleratorDevice:
         if not 0 <= self.memory_free_mb <= self.memory_total_mb:
             raise ValueError("memory_free_mb must be between zero and memory_total_mb")
         if self.health not in _DISCOVERED_HEALTH_STATES:
-            raise ValueError("health must be healthy, unknown, or inventory-only")
+            raise ValueError(
+                "health must be healthy, unknown, inventory-only, or externally-allocated"
+            )
         if self.compute_arch is not None:
             _validate_inventory_text("compute_arch", self.compute_arch, maximum=128)
         if len(self.runtime_profile_ids) > 64:

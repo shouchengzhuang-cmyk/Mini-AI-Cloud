@@ -1477,3 +1477,71 @@ def test_existing_service_commitments_reduce_matching_resource_capacity() -> Non
         ),
     )
     assert choose_admission(request, other_resource_candidates).allowed is True
+
+
+def test_zero_replica_service_preserves_compatibility_without_capacity_or_quota() -> None:
+    catalog, variant, request, resource_name = _nvidia_fixture()
+    request = replace(request, count=1)
+    inventory = [
+        replace(
+            _device(
+                worker_id="worker-a",
+                node_name="node-a",
+                index=0,
+                profile_id=variant.runtime_profile_id,
+                resource_name=resource_name,
+            ),
+            health="externally-allocated",
+        )
+    ]
+    exhausted_quota = QuotaSnapshot(
+        quota=ProjectQuota(
+            project_id=PROJECT_ID,
+            max_gpus=0,
+            max_nvidia_gpus=0,
+            max_ascend_npus=0,
+        ),
+        state=ProjectQuotaState(
+            project_id=PROJECT_ID,
+            reserved_gpus=0,
+            reserved_nvidia_gpus=0,
+            reserved_ascend_npus=0,
+            service_reserved_gpus=0,
+            service_reserved_nvidia_gpus=0,
+            service_reserved_ascend_npus=0,
+        ),
+    )
+    zero_candidates, zero_bindings = _service_candidates(
+        variants=[variant],
+        inventory=inventory,
+        catalog=catalog,
+        quota=exhausted_quota,
+        request=request,
+        desired_replicas=0,
+        requested_dtype="float16",
+    )
+    positive_candidates, _positive_bindings = _service_candidates(
+        variants=[variant],
+        inventory=inventory,
+        catalog=catalog,
+        quota=exhausted_quota,
+        request=request,
+        desired_replicas=1,
+        requested_dtype="float16",
+    )
+    incompatible_candidates, _incompatible_bindings = _service_candidates(
+        variants=[variant],
+        inventory=[replace(inventory[0], runtime_profile_ids=())],
+        catalog=catalog,
+        quota=exhausted_quota,
+        request=request,
+        desired_replicas=0,
+        requested_dtype="float16",
+    )
+
+    assert choose_admission(request, zero_candidates).allowed is True
+    assert zero_candidates[0].available_capacity == request.count
+    assert zero_candidates[0].available_quota == request.count
+    assert zero_bindings[zero_candidates[0].candidate_id].eligible_node_names == ("node-a",)
+    assert choose_admission(request, positive_candidates).allowed is False
+    assert choose_admission(request, incompatible_candidates).allowed is False

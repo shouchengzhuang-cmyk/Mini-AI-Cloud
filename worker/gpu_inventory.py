@@ -81,6 +81,17 @@ class KubernetesNodeReader(Protocol):
     ) -> Awaitable[Mapping[str, object]]: ...
 
 
+class KubernetesPodReader(Protocol):
+    def __call__(
+        self,
+        *,
+        node_name: str,
+        kubeconfig: str | None,
+        in_cluster: bool,
+        request_timeout: float,
+    ) -> Awaitable[tuple[Mapping[str, object], ...]]: ...
+
+
 Runner = Callable[..., subprocess.CompletedProcess[Any]]
 
 
@@ -584,6 +595,137 @@ def parse_kubernetes_node(node: Mapping[str, object]) -> _ParseResult:
     return _ParseResult(tuple(devices), rejected_rows)
 
 
+_MANAGED_LABEL = "mini-ai-cloud/managed"
+_CLUSTER_ID_LABEL = "mini-ai-cloud/cluster-id"
+_WORKER_ID_LABEL = "mini-ai-cloud/worker-id"
+
+
+def _database_accounted_managed_pod(
+    labels: Mapping[object, object],
+    *,
+    cluster_id: str | None,
+    worker_id: str | None,
+) -> bool:
+    if labels.get(_MANAGED_LABEL) != "true":
+        return False
+    return bool(
+        (cluster_id is not None and labels.get(_CLUSTER_ID_LABEL) == cluster_id)
+        or (worker_id is not None and labels.get(_WORKER_ID_LABEL) == worker_id)
+    )
+
+
+def _resource_quantity(resources: Mapping[object, object], resource_name: str) -> int:
+    raw_value = resources.get(resource_name)
+    try:
+        value = int(str(raw_value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid Kubernetes accelerator resource quantity") from exc
+    if value < 0:
+        raise ValueError("Kubernetes accelerator resource quantity must not be negative")
+    return value
+
+
+def _external_pod_accelerator_requests(
+    pods: Iterable[Mapping[str, object]],
+    *,
+    node_name: str,
+    cluster_id: str | None,
+    worker_id: str | None,
+) -> dict[str, int]:
+    requested: dict[str, int] = {}
+    for pod in pods:
+        metadata = pod.get("metadata")
+        spec = pod.get("spec")
+        status = pod.get("status")
+        if not isinstance(metadata, Mapping) or not isinstance(spec, Mapping):
+            raise ValueError("invalid Kubernetes Pod object")
+        if spec.get("nodeName") != node_name:
+            continue
+        if isinstance(status, Mapping) and status.get("phase") in {"Succeeded", "Failed"}:
+            continue
+        labels = metadata.get("labels")
+        labels = labels if isinstance(labels, Mapping) else {}
+        if _database_accounted_managed_pod(
+            labels,
+            cluster_id=cluster_id,
+            worker_id=worker_id,
+        ):
+            continue
+
+        for containers_key in ("containers", "initContainers"):
+            containers = spec.get(containers_key, [])
+            if not isinstance(containers, list):
+                raise ValueError("invalid Kubernetes Pod container list")
+            for container in containers:
+                if not isinstance(container, Mapping):
+                    raise ValueError("invalid Kubernetes Pod container")
+                resources = container.get("resources")
+                if resources is None:
+                    continue
+                if not isinstance(resources, Mapping):
+                    raise ValueError("invalid Kubernetes Pod resources")
+                raw_requests = resources.get("requests")
+                raw_limits = resources.get("limits")
+                requests = raw_requests if isinstance(raw_requests, Mapping) else {}
+                limits = raw_limits if isinstance(raw_limits, Mapping) else {}
+                resource_names = {
+                    name
+                    for name in (*requests.keys(), *limits.keys())
+                    if isinstance(name, str) and _kubernetes_resource_contract(name) is not None
+                }
+                for resource_name in resource_names:
+                    source = requests if resource_name in requests else limits
+                    requested[resource_name] = requested.get(resource_name, 0) + (
+                        _resource_quantity(source, resource_name)
+                    )
+
+        overhead = spec.get("overhead")
+        if overhead is not None:
+            if not isinstance(overhead, Mapping):
+                raise ValueError("invalid Kubernetes Pod overhead")
+            for resource_name in (
+                name
+                for name in overhead
+                if isinstance(name, str) and _kubernetes_resource_contract(name) is not None
+            ):
+                requested[resource_name] = requested.get(resource_name, 0) + (
+                    _resource_quantity(overhead, resource_name)
+                )
+    return requested
+
+
+def _deduct_external_pod_requests(
+    devices: tuple[AcceleratorDevice, ...],
+    requested: Mapping[str, int],
+) -> tuple[tuple[AcceleratorDevice, ...], int]:
+    capacity: dict[str, int] = {}
+    for device in devices:
+        resource_name = device.kubernetes_resource_name
+        if resource_name is not None:
+            capacity[resource_name] = capacity.get(resource_name, 0) + 1
+    if any(count > capacity.get(resource_name, 0) for resource_name, count in requested.items()):
+        raise ValueError("Kubernetes Pod requests exceed Node allocatable capacity")
+
+    available = {
+        resource_name: count - requested.get(resource_name, 0)
+        for resource_name, count in capacity.items()
+    }
+    accounted: list[AcceleratorDevice] = []
+    available_by_resource: dict[str, int] = {}
+    for device in devices:
+        resource_name = device.kubernetes_resource_name
+        if resource_name is None:
+            accounted.append(device)
+            continue
+        available_count = available_by_resource.get(resource_name, 0)
+        if available_count >= available[resource_name]:
+            accounted.append(replace(device, health="externally-allocated"))
+            continue
+        accounted.append(device)
+        available_by_resource[resource_name] = available_count + 1
+    return tuple(accounted), sum(requested.values())
+
+
 class KubernetesNodeAcceleratorProvider(_InventoryProviderBase):
     """Read Device Plugin capacity from one Kubernetes Node object.
 
@@ -600,6 +742,9 @@ class KubernetesNodeAcceleratorProvider(_InventoryProviderBase):
         kubeconfig: str | None = None,
         in_cluster: bool = False,
         node_reader: KubernetesNodeReader | None = None,
+        pod_reader: KubernetesPodReader | None = None,
+        cluster_id: str | None = None,
+        worker_id: str | None = None,
         timeout: float = 5.0,
     ) -> None:
         if timeout <= 0:
@@ -608,6 +753,9 @@ class KubernetesNodeAcceleratorProvider(_InventoryProviderBase):
         self.kubeconfig = kubeconfig
         self.in_cluster = in_cluster
         self._node_reader = node_reader or _read_kubernetes_node
+        self._pod_reader = pod_reader or _read_kubernetes_pods
+        self.cluster_id = cluster_id.strip() if cluster_id is not None else None
+        self.worker_id = worker_id.strip() if worker_id is not None else None
         self.timeout = timeout
 
     def discover(self) -> InventoryProviderResult:
@@ -626,11 +774,19 @@ class KubernetesNodeAcceleratorProvider(_InventoryProviderBase):
             )
         try:
             async with asyncio.timeout(self.timeout):
-                node = await self._node_reader(
-                    node_name=self.node_name,
-                    kubeconfig=self.kubeconfig,
-                    in_cluster=self.in_cluster,
-                    request_timeout=self.timeout,
+                node, pods = await asyncio.gather(
+                    self._node_reader(
+                        node_name=self.node_name,
+                        kubeconfig=self.kubeconfig,
+                        in_cluster=self.in_cluster,
+                        request_timeout=self.timeout,
+                    ),
+                    self._pod_reader(
+                        node_name=self.node_name,
+                        kubeconfig=self.kubeconfig,
+                        in_cluster=self.in_cluster,
+                        request_timeout=self.timeout,
+                    ),
                 )
         except Exception:
             return InventoryProviderResult(
@@ -646,17 +802,36 @@ class KubernetesNodeAcceleratorProvider(_InventoryProviderBase):
                 rejected_rows=1,
             )
         parsed = parse_kubernetes_node(node)
+        try:
+            external_requests = _external_pod_accelerator_requests(
+                pods,
+                node_name=self.node_name,
+                cluster_id=self.cluster_id,
+                worker_id=self.worker_id,
+            )
+            devices, excluded_slots = _deduct_external_pod_requests(
+                parsed.devices,
+                external_requests,
+            )
+        except (TypeError, ValueError):
+            return InventoryProviderResult(
+                provider=self.name,
+                status=InventoryStatus.DEGRADED,
+                message="invalid_pod_resource_requests",
+                rejected_rows=1,
+            )
+        details: list[str] = []
+        if parsed.rejected_rows:
+            details.append(f"rejected {parsed.rejected_rows} incomplete capacity slot(s)")
+        if excluded_slots:
+            details.append(f"excluded {excluded_slots} externally requested capacity slot(s)")
         return InventoryProviderResult(
             provider=self.name,
             status=(
                 InventoryStatus.DEGRADED if parsed.rejected_rows else InventoryStatus.AVAILABLE
             ),
-            devices=parsed.devices,
-            message=(
-                f"rejected {parsed.rejected_rows} incomplete capacity slot(s)"
-                if parsed.rejected_rows
-                else None
-            ),
+            devices=devices,
+            message="; ".join(details) or None,
             rejected_rows=parsed.rejected_rows,
         )
 
@@ -688,6 +863,44 @@ async def _read_kubernetes_node(
         if not isinstance(serialized, Mapping):
             raise TypeError("Kubernetes Node response must be an object")
         return serialized
+    finally:
+        if api_client is not None:
+            await api_client.close()
+
+
+async def _read_kubernetes_pods(
+    *,
+    node_name: str,
+    kubeconfig: str | None,
+    in_cluster: bool,
+    request_timeout: float,
+) -> tuple[Mapping[str, object], ...]:
+    configuration = client.Configuration()
+    api_client: client.ApiClient | None = None
+    try:
+        if in_cluster:
+            loaded = config.load_incluster_config(client_configuration=configuration)
+            if isawaitable(loaded):
+                await loaded
+        else:
+            await config.load_kube_config(
+                config_file=kubeconfig,
+                client_configuration=configuration,
+                persist_config=False,
+            )
+        api_client = client.ApiClient(configuration=configuration)
+        api = client.CoreV1Api(api_client=api_client)
+        pod_list = await api.list_pod_for_all_namespaces(
+            field_selector=f"spec.nodeName={node_name}",
+            _request_timeout=request_timeout,
+        )
+        serialized = api_client.sanitize_for_serialization(pod_list)
+        if not isinstance(serialized, Mapping) or not isinstance(serialized.get("items"), list):
+            raise TypeError("Kubernetes PodList response must contain an items list")
+        pods = serialized["items"]
+        if not all(isinstance(pod, Mapping) for pod in pods):
+            raise TypeError("Kubernetes PodList items must be objects")
+        return tuple(pods)
     finally:
         if api_client is not None:
             await api_client.close()
@@ -955,6 +1168,8 @@ def build_accelerator_inventory_registry(
                     node_name=settings.worker_node_name,
                     kubeconfig=settings.kubernetes_kubeconfig,
                     in_cluster=settings.kubernetes_in_cluster,
+                    cluster_id=settings.kubernetes_serving_cluster_id,
+                    worker_id=worker_id,
                 )
             )
         elif name == "fake":

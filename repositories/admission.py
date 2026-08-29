@@ -1430,6 +1430,7 @@ def _service_candidates(
     bindings: dict[str, _ServiceCandidateBinding] = {}
     service_usage = service_usage or _ServiceAcceleratorUsage()
     deferred_usage = deferred_usage or _DeferredAcceleratorUsage()
+    zero_replica_commitment = desired_replicas == 0
     commitment_divisor = max(1, desired_replicas)
     for variant in variants:
         manifest_entry = None
@@ -1478,7 +1479,10 @@ def _service_candidates(
             frozen_capabilities = frozenset(capabilities)
             effective_capabilities[device.device_id] = frozen_capabilities
             if (
-                device.health not in {"healthy", "inventory-only"}
+                (
+                    device.health not in {"healthy", "inventory-only"}
+                    and not (zero_replica_commitment and device.health == "externally-allocated")
+                )
                 or runtime_profile_binding is None
                 or runtime_profile_binding not in device.runtime_profile_ids
                 or runtime_profile is None
@@ -1500,7 +1504,9 @@ def _service_candidates(
         if finite_quota is not None:
             finite_quota += quota_credit
         available_quota = (
-            request.count if finite_quota is None else finite_quota // commitment_divisor
+            request.count
+            if zero_replica_commitment or finite_quota is None
+            else finite_quota // commitment_divisor
         )
         for index, (key, devices) in enumerate(sorted(groups.items()), start=1):
             model, resource_name = key
@@ -1593,7 +1599,11 @@ def _service_candidates(
                 runtime_profile_digest=variant.runtime_profile_digest,
                 model_variant_id=str(variant.id),
                 allocation_authority=AllocationAuthority.KUBERNETES_DEVICE_PLUGIN,
-                available_capacity=(available_replica_slots * request.count) // commitment_divisor,
+                available_capacity=(
+                    request.count
+                    if zero_replica_commitment and compatible_node_keys
+                    else (available_replica_slots * request.count) // commitment_divisor
+                ),
                 available_quota=available_quota,
                 healthy=True,
                 capabilities=frozenset(capabilities),

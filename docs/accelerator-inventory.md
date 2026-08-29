@@ -11,7 +11,7 @@ A3 将设备发现收敛为 `InventoryProviderRegistry`。每个 provider 输出
 | --- | --- | --- |
 | `nvidia-smi` | 有界 `nvidia-smi --query-gpu ... --format=csv,noheader,nounits` | `nvidia/gpu` |
 | `ascend-npu-smi` | `npu-smi info -m` 与按 NPU ID 查询 memory | `huawei-ascend/npu` |
-| `kubernetes-node` | Node JSON 的 allocatable、labels 和 Device Plugin resource | 不可直接调度的 capacity slot |
+| `kubernetes-node` | Node allocatable/labels 与已绑定 Pod 的 accelerator requests | 不可直接调度的空闲 capacity slot |
 | `fake` | 确定性本地生成 | 仅 development/test |
 | `none` | 显式禁用发现 | 健康的空 inventory |
 
@@ -54,6 +54,17 @@ Node allocatable 不提供物理 device ID，因此 provider 生成
 `k8s-capacity:<node-uid>:<resource>:<slot>` 的稳定容量槽 ID，并将 health 标记为
 `inventory-only`。这些 ID 不参与现有 exact-device 调度，也不得写成 execution 的
 observed device IDs；后者仍只能由 Pod/Device Plugin 运行态观测写回。
+
+Node allocatable 是静态可分配上限，不会随 Pod 绑定自动递减。provider 会同时列出目标
+节点上的非终态 Pod，并扣除外部 Pod 的 accelerator requests（未显式 request 时使用
+对应 limit）。具有匹配 cluster/worker 所有权标签的 Mini AI Cloud Pod 由数据库中的
+service/reservation commitment 统一计费，避免重复扣减。Pod 列表不可读、资源数量畸形
+或请求超过 allocatable 时，provider 会 fail closed，不发布可调度容量。外部占用的容量槽
+保留节点/profile 兼容性元数据，但 health 标记为 `externally-allocated`，不会作为空闲容量
+参与正副本或 batch 准入。
+
+因此运行 `kubernetes-node` provider 的 Kubernetes 身份必须同时拥有目标 Node 的
+`get` 权限和所有 namespace Pod 的 `list` 权限；使用 kubeconfig 时也必须授予等价权限。
 
 ## 证据边界
 
