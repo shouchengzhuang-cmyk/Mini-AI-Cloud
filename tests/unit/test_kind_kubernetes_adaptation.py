@@ -23,7 +23,9 @@ from scripts.kind_kubernetes_adaptation import (
     application_reference,
     build_upgrade_sentinels,
     chart_fullname,
+    local_image_cleanup_argv,
     parse_build_digest,
+    pinned_image_aliases,
     render_kind_config,
     validate_pod_security,
     verify_bundle,
@@ -68,6 +70,39 @@ def test_fixed_images_and_kind_port_contract_are_immutable() -> None:
         assert separator
         assert len(digest) == 64
     assert NODE_PORT == 30080
+
+
+def test_pinned_external_images_use_unique_single_platform_tags_and_digest_aliases() -> None:
+    aliases = pinned_image_aliases(
+        _identity(),
+        postgres_image=DEFAULT_POSTGRES_IMAGE,
+        redis_image=DEFAULT_REDIS_IMAGE,
+    )
+
+    assert [alias.component for alias in aliases] == [
+        "postgres",
+        "redis",
+        "fake-plugin",
+        "fake-allocation",
+    ]
+    assert len({alias.local_tag for alias in aliases}) == 4
+    assert len({alias.containerd_tag for alias in aliases}) == 4
+    for alias in aliases:
+        assert alias.digest_reference.endswith(alias.digest_reference.rsplit("@", 1)[1])
+        assert alias.local_tag.endswith(":m7-1234abcd")
+        assert alias.containerd_tag == f"docker.io/library/{alias.local_tag}"
+
+    cleanup = local_image_cleanup_argv(
+        "docker",
+        ("mini-ai-cloud:m7-1234abcd", *(alias.local_tag for alias in aliases)),
+    )
+    assert cleanup[:4] == ("docker", "image", "rm", "--force")
+    assert cleanup[4:] == (
+        "mini-ai-cloud:m7-1234abcd",
+        *(alias.local_tag for alias in aliases),
+    )
+    with pytest.raises(KindEvidenceError, match="outside the run-specific tag"):
+        local_image_cleanup_argv("docker", ("postgres:16-alpine",))
 
 
 def test_kind_config_renders_only_the_run_host_port() -> None:

@@ -90,6 +90,14 @@ class HarnessConfig:
     redis_image: str = DEFAULT_REDIS_IMAGE
 
 
+@dataclass(frozen=True, slots=True)
+class PinnedImageAlias:
+    component: str
+    digest_reference: str
+    local_tag: str
+    containerd_tag: str
+
+
 @dataclass(slots=True)
 class PhaseFailure(RuntimeError):
     detail: str
@@ -127,6 +135,49 @@ def application_reference(tag: str, digest: str) -> str:
 
 def chart_fullname(release_name: str) -> str:
     return release_name if "mini-ai-cloud" in release_name else f"{release_name}-mini-ai-cloud"
+
+
+def pinned_image_aliases(
+    identity: RunIdentity,
+    *,
+    postgres_image: str,
+    redis_image: str,
+) -> tuple[PinnedImageAlias, ...]:
+    suffix = identity.run_id[-8:]
+    sources = (
+        ("postgres", postgres_image),
+        ("redis", redis_image),
+        ("fake-plugin", FAKE_PLUGIN_IMAGE),
+        ("fake-allocation", FAKE_ALLOCATION_IMAGE),
+    )
+    aliases: list[PinnedImageAlias] = []
+    for component, source in sources:
+        validate_pinned_image(source, description=f"{component} image")
+        local_tag = f"mini-ai-cloud-p4-{component}:m7-{suffix}"
+        aliases.append(
+            PinnedImageAlias(
+                component=component,
+                digest_reference=source,
+                local_tag=local_tag,
+                containerd_tag=f"docker.io/library/{local_tag}",
+            )
+        )
+    return tuple(aliases)
+
+
+def local_image_cleanup_argv(docker: str, tags: Sequence[str]) -> tuple[str, ...]:
+    unique_tags = tuple(dict.fromkeys(tags))
+    if not unique_tags:
+        raise KindEvidenceError("local image cleanup requires at least one run-specific tag")
+    if any(
+        not (
+            re.fullmatch(r"mini-ai-cloud:m7-[0-9a-f]{8}", tag)
+            or re.fullmatch(r"mini-ai-cloud-p4-[a-z-]+:m7-[0-9a-f]{8}", tag)
+        )
+        for tag in unique_tags
+    ):
+        raise KindEvidenceError("refusing to remove an image outside the run-specific tag contract")
+    return (docker, "image", "rm", "--force", *unique_tags)
 
 
 def build_upgrade_sentinels(identity: RunIdentity, app_image: str) -> dict[str, object]:
@@ -370,6 +421,12 @@ class KindAdaptationHarness:
         self.local_app_tag = f"mini-ai-cloud:m7-{self.identity.run_id[-8:]}"
         self.app_tag = f"m7-{self.identity.run_id[-8:]}"
         self.app_image = f"{APP_REPOSITORY}:{self.app_tag}@sha256:{'0' * 64}"
+        self.image_aliases = pinned_image_aliases(
+            self.identity,
+            postgres_image=config.postgres_image,
+            redis_image=config.redis_image,
+        )
+        self.created_local_image_tags: list[str] = []
         self.cluster_created = False
         self.release_installed = False
         self.cleanup_complete = False
@@ -625,6 +682,7 @@ class KindAdaptationHarness:
             ),
             timeout_seconds=1800,
         )
+        self.created_local_image_tags.append(self.local_app_tag)
         metadata = _json_object(
             self.build_metadata.read_text(encoding="utf-8"), description="Docker build metadata"
         )
@@ -658,19 +716,32 @@ class KindAdaptationHarness:
         outcomes: list[CommandOutcome] = []
         kind_template = self.config.kind_config_template.read_text(encoding="utf-8")
         _private_write(self.rendered_kind_config, render_kind_config(kind_template, self.host_port))
-        for image, label in (
-            (self.config.postgres_image, "pull-postgres-image"),
-            (self.config.redis_image, "pull-redis-image"),
-            (FAKE_PLUGIN_IMAGE, "pull-fake-plugin-image"),
-            (FAKE_ALLOCATION_IMAGE, "pull-fake-allocation-image"),
-        ):
+        for alias in self.image_aliases:
             self._record(
                 outcomes,
                 claim,
-                label,
-                (self.config.tools.docker, "pull", "--platform", "linux/amd64", image),
+                f"pull-{alias.component}-image",
+                (
+                    self.config.tools.docker,
+                    "pull",
+                    "--platform",
+                    "linux/amd64",
+                    alias.digest_reference,
+                ),
                 timeout_seconds=900,
             )
+            self._record(
+                outcomes,
+                claim,
+                f"tag-{alias.component}-single-platform-image",
+                (
+                    self.config.tools.docker,
+                    "tag",
+                    alias.digest_reference,
+                    alias.local_tag,
+                ),
+            )
+            self.created_local_image_tags.append(alias.local_tag)
         self._record(
             outcomes,
             claim,
@@ -709,17 +780,15 @@ class KindAdaptationHarness:
         )
         if node_image.stdout.strip() != KIND_NODE_IMAGE:
             raise PhaseFailure("Kind node container does not use the pinned image", outcomes)
-        for image, label in (
-            (self.local_app_tag, "load-application-image"),
-            (self.config.postgres_image, "load-postgres-image"),
-            (self.config.redis_image, "load-redis-image"),
-            (FAKE_PLUGIN_IMAGE, "load-fake-plugin-image"),
-            (FAKE_ALLOCATION_IMAGE, "load-fake-allocation-image"),
-        ):
+        load_images = (
+            (self.local_app_tag, "application"),
+            *((alias.local_tag, alias.component) for alias in self.image_aliases),
+        )
+        for image, component in load_images:
             self._record(
                 outcomes,
                 claim,
-                label,
+                f"load-{component}-image",
                 (
                     self.config.tools.kind,
                     "load",
@@ -765,6 +834,41 @@ class KindAdaptationHarness:
                 self.app_image,
             ),
         )
+        for alias in self.image_aliases:
+            self._record(
+                outcomes,
+                claim,
+                f"alias-{alias.component}-digest-in-containerd",
+                (
+                    self.config.tools.docker,
+                    "exec",
+                    node,
+                    "ctr",
+                    "--namespace",
+                    "k8s.io",
+                    "images",
+                    "tag",
+                    "--force",
+                    alias.containerd_tag,
+                    alias.digest_reference,
+                ),
+            )
+            self._record(
+                outcomes,
+                claim,
+                f"verify-{alias.component}-digest-in-containerd",
+                (
+                    self.config.tools.docker,
+                    "exec",
+                    node,
+                    "ctr",
+                    "--namespace",
+                    "k8s.io",
+                    "images",
+                    "check",
+                    alias.digest_reference,
+                ),
+            )
         server = self._record(
             outcomes,
             claim,
@@ -1279,7 +1383,7 @@ class KindAdaptationHarness:
         )
         self._delete_owned_namespaces(outcomes, claim)
         self._delete_cluster(outcomes, claim)
-        self._remove_local_image(outcomes, claim)
+        self._remove_local_images(outcomes, claim)
         if _fingerprint(self.default_kubeconfig) != self.default_kubeconfig_before:
             raise PhaseFailure("the default kubeconfig changed during the isolated run", outcomes)
         self.cleanup_payload.update(
@@ -1385,11 +1489,13 @@ class KindAdaptationHarness:
                 self.cluster_created = self.identity.cluster_name in listing.stdout.splitlines()
                 if self.cluster_created:
                     errors.append("emergency Kind cluster remained after exact deletion")
-        if self.build_metadata.exists():
-            attempt(
-                "emergency-remove-local-app-image",
-                (self.config.tools.docker, "image", "rm", "--force", self.local_app_tag),
+        if self.created_local_image_tags:
+            image_cleanup = attempt(
+                "emergency-remove-run-specific-images",
+                local_image_cleanup_argv(self.config.tools.docker, self.created_local_image_tags),
             )
+            if image_cleanup.returncode == 0:
+                self.created_local_image_tags.clear()
         cluster_deleted = not self.cluster_created
         self.cleanup_payload.update(
             {
@@ -1485,13 +1591,14 @@ class KindAdaptationHarness:
         if self.identity.cluster_name in clusters.stdout.splitlines():
             raise PhaseFailure("Kind cluster remained after exact deletion", outcomes)
 
-    def _remove_local_image(self, outcomes: list[CommandOutcome], claim: str) -> None:
+    def _remove_local_images(self, outcomes: list[CommandOutcome], claim: str) -> None:
         self._record(
             outcomes,
             claim,
-            "remove-run-specific-application-image",
-            (self.config.tools.docker, "image", "rm", "--force", self.local_app_tag),
+            "remove-run-specific-images",
+            local_image_cleanup_argv(self.config.tools.docker, self.created_local_image_tags),
         )
+        self.created_local_image_tags.clear()
 
     def _remove_temporary_state(self) -> str | None:
         try:
