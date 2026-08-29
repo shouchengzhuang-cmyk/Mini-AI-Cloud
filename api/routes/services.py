@@ -40,6 +40,7 @@ from repositories.admission import (
     ServiceAdmissionSnapshot,
 )
 from repositories.gateway_model_names import GatewayModelNameConflictError
+from repositories.model_variants import LogicalModelRepository
 from repositories.quotas import QuotaExceededError
 from repositories.registry import ImagePolicyRepository, RegisteredModelRepository
 from repositories.services import ServiceCounts, ServiceRepository
@@ -326,11 +327,11 @@ async def scale_service(
     eligible_node_names: tuple[str, ...] | None = None
     try:
         async with database.session() as session, session.begin():
-            existing = await ServiceRepository.get(
+            existing = await _lock_service_for_scale(
                 session,
-                service_id,
+                service_id=service_id,
                 project_id=project_id,
-                for_update=True,
+                desired_replicas=payload.replicas,
             )
             if existing is None:
                 raise NotFoundError("SERVICE_NOT_FOUND", "Service not found")
@@ -391,6 +392,40 @@ async def scale_service(
         raise admission_rejection
     assert service is not None
     return _service_response(service, counts)
+
+
+async def _lock_service_for_scale(
+    session: AsyncSession,
+    *,
+    service_id: uuid.UUID,
+    project_id: uuid.UUID,
+    desired_replicas: int,
+) -> ModelService | None:
+    preview = await ServiceRepository.get(
+        session,
+        service_id,
+        project_id=project_id,
+        for_update=False,
+    )
+    if preview is None:
+        return None
+    if (
+        desired_replicas > 0
+        and preview.runtime_type == RuntimeType.KUBERNETES
+        and preview.logical_model_id is not None
+    ):
+        await LogicalModelRepository.get(
+            session,
+            project_id=project_id,
+            logical_model_id=preview.logical_model_id,
+            for_update=True,
+        )
+    return await ServiceRepository.get(
+        session,
+        service_id,
+        project_id=project_id,
+        for_update=True,
+    )
 
 
 @router.post("/{service_id}/stop", response_model=ServiceResponse)

@@ -24,6 +24,7 @@ from core.runtime_profiles import (
 
 MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024
 MAX_INVENTORY_ROWS = 256
+KUBERNETES_CAPACITY_INDEX_BASE = 1_000_000_000
 
 
 class InventoryStatus(StrEnum):
@@ -567,7 +568,10 @@ def parse_kubernetes_node(node: Mapping[str, object]) -> _ParseResult:
             devices.append(
                 AcceleratorDevice(
                     device_id=f"k8s-capacity:{node_uid}:{resource_name}:{slot}",
-                    device_index=next_index,
+                    # Kubernetes capacity slots are synthetic evidence, not host
+                    # device ordinals. Keep them in a disjoint persisted index
+                    # namespace so host CLI and Device Plugin inventory can coexist.
+                    device_index=KUBERNETES_CAPACITY_INDEX_BASE + next_index,
                     vendor=vendor,
                     kind=kind,
                     model=model,

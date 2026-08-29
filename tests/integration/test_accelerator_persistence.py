@@ -29,6 +29,7 @@ from repositories.reservations import (
 from repositories.workers import WorkerRepository
 from worker.capabilities import detect_capabilities
 from worker.gpu_inventory import (
+    KUBERNETES_CAPACITY_INDEX_BASE,
     InventoryProviderResult,
     InventorySnapshot,
     InventoryStatus,
@@ -250,6 +251,83 @@ async def test_inventory_persists_ascend_profile_and_resource_metadata(
     assert device.runtime_profile_ids == ["ascend-vllm-k8s-a2"]
     assert device.capabilities_json == ["bf16", "tensor-parallel"]
     assert device.kubernetes_resource_name == "huawei.com/Ascend910"
+
+
+async def test_host_and_kubernetes_inventory_indexes_persist_in_separate_namespaces(
+    database: Database,
+) -> None:
+    worker_id = "overlapping-inventory-worker"
+    worker_session_id = uuid.uuid4()
+    kubernetes_uuid = "k8s-capacity:node-1:nvidia.com/gpu:0"
+    async with database.session() as session, session.begin():
+        await WorkerRepository.register(
+            session,
+            worker_id=worker_id,
+            hostname="overlapping-inventory-worker.test",
+            concurrency=1,
+            cpu_count=8,
+            memory_total_mb=65_536,
+            docker_version=None,
+            labels={},
+            gpu_count=1,
+            gpu_model="NVIDIA A100",
+            gpu_memory_mb=40_960,
+            worker_session_id=worker_session_id,
+        )
+        await WorkerRepository.replace_gpu_inventory(
+            session,
+            worker_id=worker_id,
+            worker_session_id=worker_session_id,
+            devices=[
+                {
+                    "uuid": kubernetes_uuid,
+                    "index": 0,
+                    "vendor": "nvidia",
+                    "accelerator_kind": "gpu",
+                    "model": "NVIDIA A100",
+                    "memory_total_mb": 40_960,
+                    "memory_free_mb": 40_960,
+                    "kubernetes_resource_name": "nvidia.com/gpu",
+                    "health": "inventory-only",
+                }
+            ],
+        )
+
+    async with database.session() as session, session.begin():
+        persisted = await WorkerRepository.replace_gpu_inventory(
+            session,
+            worker_id=worker_id,
+            worker_session_id=worker_session_id,
+            devices=[
+                {
+                    "uuid": "GPU-physical-0",
+                    "index": 0,
+                    "vendor": "nvidia",
+                    "accelerator_kind": "gpu",
+                    "model": "NVIDIA A100",
+                    "memory_total_mb": 40_960,
+                    "memory_free_mb": 39_000,
+                    "kubernetes_resource_name": None,
+                    "health": "healthy",
+                },
+                {
+                    "uuid": kubernetes_uuid,
+                    "index": KUBERNETES_CAPACITY_INDEX_BASE,
+                    "vendor": "nvidia",
+                    "accelerator_kind": "gpu",
+                    "model": "NVIDIA A100",
+                    "memory_total_mb": 40_960,
+                    "memory_free_mb": 40_960,
+                    "kubernetes_resource_name": "nvidia.com/gpu",
+                    "health": "inventory-only",
+                },
+            ],
+        )
+
+    assert {(device.device_uuid, device.device_index) for device in persisted} == {
+        ("GPU-physical-0", 0),
+        (kubernetes_uuid, KUBERNETES_CAPACITY_INDEX_BASE),
+    }
 
 
 async def test_heartbeat_refreshes_dynamic_inventory_after_worker_liveness(

@@ -12,6 +12,7 @@ from core.database import Database
 from core.enums import RuntimeType
 from core.logging import get_logger
 from core.runtime_profiles import RuntimeProfileCatalog
+from models.model_variant import LogicalModel
 from models.service import ModelService
 from repositories.admission import AdmissionRepository
 from repositories.clock import database_utcnow
@@ -67,21 +68,63 @@ class ServiceAutoscaler:
         missing = 0
         cooling_down = 0
         async with self.database.session() as session, session.begin():
+            candidate_rows = list(
+                (
+                    await session.execute(
+                        select(
+                            ModelService.id,
+                            ModelService.logical_model_id,
+                            ModelService.runtime_type,
+                        )
+                        .where(ModelService.autoscaling_enabled.is_(True))
+                        .order_by(
+                            ModelService.last_autoscale_checked_at.asc().nullsfirst(),
+                            ModelService.id,
+                        )
+                        .limit(self.batch_size)
+                    )
+                ).all()
+            )
+            logical_model_ids = sorted(
+                {
+                    logical_model_id
+                    for _service_id, logical_model_id, runtime_type in candidate_rows
+                    if runtime_type == RuntimeType.KUBERNETES and logical_model_id is not None
+                },
+                key=str,
+            )
+            locked_logical_model_ids = set(
+                await session.scalars(
+                    select(LogicalModel.id)
+                    .where(LogicalModel.id.in_(logical_model_ids))
+                    .order_by(LogicalModel.id)
+                    .with_for_update(skip_locked=True)
+                )
+            )
+            candidate_service_ids = [
+                service_id
+                for service_id, logical_model_id, runtime_type in candidate_rows
+                if runtime_type != RuntimeType.KUBERNETES
+                or logical_model_id is None
+                or logical_model_id in locked_logical_model_ids
+            ]
             services = list(
                 await session.scalars(
                     select(ModelService)
-                    .where(ModelService.autoscaling_enabled.is_(True))
+                    .where(
+                        ModelService.id.in_(candidate_service_ids),
+                        ModelService.autoscaling_enabled.is_(True),
+                    )
                     .order_by(
                         ModelService.last_autoscale_checked_at.asc().nullsfirst(),
                         ModelService.id,
                     )
-                    .limit(self.batch_size)
                     .with_for_update(skip_locked=True)
                 )
             )
-            # Candidate rows are already locked. Lock all project quota rows in
-            # one stable order before applying per-service deltas so concurrent
-            # autoscaler passes cannot deadlock across projects.
+            # Logical models are locked in stable order before their candidate
+            # services, matching gateway routing. Lock project quota rows next
+            # in stable order before applying per-service deltas.
             for project_id in sorted({service.project_id for service in services}, key=str):
                 await QuotaRepository.get_locked(session, project_id=project_id)
             now = await database_utcnow(session)

@@ -4,6 +4,7 @@ import uuid
 from collections.abc import AsyncIterator, MutableMapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any, cast
 
 import httpx
@@ -12,11 +13,13 @@ import pytest_asyncio
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import Table, event, select
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.types import Message, Scope
 
 from api.dependencies import get_principal
 from api.errors import APIError, register_exception_handlers
 from api.routes import gateway as gateway_routes
+from api.routes import services as service_routes
 from api.services import gateway as gateway_service_module
 from api.services.autoscaler import ServiceAutoscaler
 from api.services.gateway import GatewayMetrics, GatewayService, ServiceLoad
@@ -54,6 +57,67 @@ from repositories.services import EndpointSelection, ServiceRepository
 from repositories.workers import WorkerRepository
 
 PROJECT_ID = uuid.UUID("20000000-0000-0000-0000-000000000001")
+
+
+async def test_scale_locks_logical_model_before_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service_id = uuid.uuid4()
+    logical_model_id = uuid.uuid4()
+    preview = cast(
+        ModelService,
+        SimpleNamespace(
+            runtime_type=RuntimeType.KUBERNETES,
+            logical_model_id=logical_model_id,
+        ),
+    )
+    locked = cast(ModelService, object())
+    calls: list[str] = []
+
+    async def get_service(
+        _session: AsyncSession,
+        requested_service_id: uuid.UUID,
+        *,
+        project_id: uuid.UUID | None = None,
+        for_update: bool = False,
+    ) -> ModelService | None:
+        assert requested_service_id == service_id
+        assert project_id == PROJECT_ID
+        calls.append(f"service:{for_update}")
+        return locked if for_update else preview
+
+    async def get_logical_model(
+        _session: AsyncSession,
+        *,
+        project_id: uuid.UUID,
+        logical_model_id: uuid.UUID,
+        for_update: bool = False,
+    ) -> object:
+        assert project_id == PROJECT_ID
+        assert logical_model_id == preview.logical_model_id
+        calls.append(f"logical:{for_update}")
+        return object()
+
+    monkeypatch.setattr(
+        service_routes.ServiceRepository,
+        "get",
+        staticmethod(get_service),
+    )
+    monkeypatch.setattr(
+        service_routes.LogicalModelRepository,
+        "get",
+        staticmethod(get_logical_model),
+    )
+
+    result = await service_routes._lock_service_for_scale(
+        cast(AsyncSession, object()),
+        service_id=service_id,
+        project_id=PROJECT_ID,
+        desired_replicas=2,
+    )
+
+    assert result is locked
+    assert calls == ["service:False", "logical:True", "service:True"]
 
 
 class ChunkStream(httpx.AsyncByteStream):

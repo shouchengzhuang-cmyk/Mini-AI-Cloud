@@ -549,6 +549,47 @@ def test_registry_rejects_same_vendor_device_index_from_multiple_providers() -> 
         InventoryProviderRegistry((real, fake)).snapshot()
 
 
+async def test_registry_merges_host_and_kubernetes_capacity_index_namespaces() -> None:
+    node = json.loads(_fixture("kubernetes-node.json"))
+    node["status"]["allocatable"] = {
+        "cpu": "64",
+        "memory": "512Gi",
+        "nvidia.com/gpu": "2",
+    }
+    host = NvidiaSMIInventoryProvider(
+        runner=Mock(
+            return_value=subprocess.CompletedProcess(
+                args=["nvidia-smi"],
+                returncode=0,
+                stdout="GPU-real, 0, NVIDIA A100, 40960, 40000, 8.0\n",
+            )
+        )
+    )
+    kubernetes = KubernetesNodeAcceleratorProvider(
+        node_name="dual-stack-node",
+        node_reader=AsyncMock(return_value=node),
+    )
+
+    snapshot = await InventoryProviderRegistry((host, kubernetes)).snapshot_async()
+
+    overlapping = [
+        device
+        for device in snapshot.devices
+        if device.vendor == AcceleratorVendor.NVIDIA
+        and device.device_index in {0, gpu_inventory.KUBERNETES_CAPACITY_INDEX_BASE}
+    ]
+    assert len(overlapping) == 2
+    assert {device.kubernetes_resource_name for device in overlapping} == {
+        None,
+        "nvidia.com/gpu",
+    }
+    assert {device.device_index for device in overlapping} == {
+        0,
+        gpu_inventory.KUBERNETES_CAPACITY_INDEX_BASE,
+    }
+    assert len(snapshot.devices) == 3
+
+
 def test_provider_factory_uses_fake_override_only_in_non_production() -> None:
     settings = Settings(
         _env_file=None,
