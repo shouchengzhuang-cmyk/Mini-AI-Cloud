@@ -72,6 +72,8 @@ def test_gateway_routing_policy_migration_backfills_enforces_and_downgrades(
         "model_services",
         metadata,
         sa.Column("id", sa.Uuid(), primary_key=True),
+        sa.Column("project_id", sa.Uuid(), sa.ForeignKey("projects.id"), nullable=False),
+        sa.Column("name", sa.String(255), nullable=False),
         sa.Column(
             "logical_model_id",
             sa.Uuid(),
@@ -117,7 +119,12 @@ def test_gateway_routing_policy_migration_backfills_enforces_and_downgrades(
             circuits.insert().values(id=child_ids["circuit"], logical_model_id=existing_model_id)
         )
         connection.execute(
-            services.insert().values(id=child_ids["service"], logical_model_id=existing_model_id)
+            services.insert().values(
+                id=child_ids["service"],
+                project_id=first_project_id,
+                name="Existing Public",
+                logical_model_id=existing_model_id,
+            )
         )
         connection.commit()
 
@@ -240,6 +247,14 @@ def test_gateway_routing_policy_migration_rejects_duplicate_public_names_before_
         sa.Column("public_name", sa.String(255), nullable=False),
         sa.UniqueConstraint("project_id", "name", name="uq_logical_models_project_name"),
     )
+    sa.Table(
+        "model_services",
+        metadata,
+        sa.Column("id", sa.Uuid(), primary_key=True),
+        sa.Column("project_id", sa.Uuid(), sa.ForeignKey("projects.id"), nullable=False),
+        sa.Column("name", sa.String(255), nullable=False),
+        sa.Column("logical_model_id", sa.Uuid(), nullable=True),
+    )
     metadata.create_all(engine)
     project_id = uuid.uuid4()
     migration = _load_migration()
@@ -283,6 +298,70 @@ def test_gateway_routing_policy_migration_rejects_duplicate_public_names_before_
     engine.dispose()
 
 
+def test_gateway_routing_policy_migration_rejects_cross_namespace_name_collision(
+    tmp_path: Path,
+) -> None:
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'cross-namespace-name.sqlite3'}")
+    metadata = sa.MetaData()
+    projects = sa.Table("projects", metadata, sa.Column("id", sa.Uuid(), primary_key=True))
+    logical_models = sa.Table(
+        "logical_models",
+        metadata,
+        sa.Column("id", sa.Uuid(), primary_key=True),
+        sa.Column("project_id", sa.Uuid(), sa.ForeignKey("projects.id"), nullable=False),
+        sa.Column("name", sa.String(128), nullable=False),
+        sa.Column("public_name", sa.String(255), nullable=False),
+        sa.UniqueConstraint("project_id", "name", name="uq_logical_models_project_name"),
+    )
+    services = sa.Table(
+        "model_services",
+        metadata,
+        sa.Column("id", sa.Uuid(), primary_key=True),
+        sa.Column("project_id", sa.Uuid(), sa.ForeignKey("projects.id"), nullable=False),
+        sa.Column("name", sa.String(255), nullable=False),
+        sa.Column("logical_model_id", sa.Uuid(), nullable=True),
+    )
+    metadata.create_all(engine)
+    project_id = uuid.uuid4()
+    migration = _load_migration()
+
+    with engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+        connection.execute(projects.insert().values(id=project_id))
+        connection.execute(
+            logical_models.insert().values(
+                id=uuid.uuid4(),
+                project_id=project_id,
+                name="logical-chat",
+                public_name="Public Chat",
+            )
+        )
+        connection.execute(
+            services.insert().values(
+                id=uuid.uuid4(),
+                project_id=project_id,
+                name="Public Chat",
+                logical_model_id=None,
+            )
+        )
+        connection.commit()
+        context = MigrationContext.configure(connection)
+        migration.op = Operations(context)
+
+        with pytest.raises(RuntimeError, match="cross-namespace gateway identity"):
+            with context.begin_transaction(_per_migration=True):
+                migration.upgrade()
+
+        columns = {item["name"] for item in sa.inspect(connection).get_columns("logical_models")}
+        assert "routing_policy" not in columns
+        assert "routing_cursor" not in columns
+        assert (
+            connection.execute(sa.select(sa.func.count()).select_from(services)).scalar_one() == 1
+        )
+        assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+    engine.dispose()
+
+
 def test_sqlite_foreign_keys_are_restored_when_gateway_migration_body_fails() -> None:
     engine = sa.create_engine("sqlite://")
     migration = _load_migration()
@@ -316,4 +395,7 @@ def test_gateway_routing_policy_migration_compiles_postgresql_offline_guard() ->
     rendered = output.getvalue()
     assert "DO $$ BEGIN" in rendered
     assert "duplicate gateway identities" in rendered
+    assert "cross-namespace gateway identities" in rendered
+    assert "JOIN model_services AS service" in rendered
+    assert "service.logical_model_id IS NULL" in rendered
     assert "uq_logical_models_project_public_name" in rendered

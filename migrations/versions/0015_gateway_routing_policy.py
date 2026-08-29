@@ -33,7 +33,7 @@ def _preserve_sqlite_referencing_rows() -> Iterator[None]:
             op.execute(sa.text("PRAGMA foreign_keys=ON"))
 
 
-def _reject_duplicate_public_names() -> None:
+def _reject_ambiguous_gateway_names() -> None:
     """Fail before DDL when the new gateway identity would be ambiguous."""
 
     context = op.get_context()
@@ -47,12 +47,22 @@ def _reject_duplicate_public_names() -> None:
                 "GROUP BY project_id, public_name HAVING count(*) > 1) THEN "
                 "RAISE EXCEPTION '0015 cannot add the logical-model public-name "
                 "constraint while duplicate gateway identities exist'; "
+                "END IF; "
+                "IF EXISTS (SELECT 1 FROM logical_models AS logical_model "
+                "JOIN model_services AS service "
+                "ON service.project_id = logical_model.project_id "
+                "AND service.name = logical_model.public_name "
+                "WHERE service.logical_model_id IS NULL "
+                "OR service.logical_model_id <> logical_model.id) THEN "
+                "RAISE EXCEPTION '0015 cannot add the logical-model public-name "
+                "constraint while cross-namespace gateway identities exist'; "
                 "END IF; END $$"
             )
         )
         return
     logical_models = sa.table(
         "logical_models",
+        sa.column("id", sa.Uuid()),
         sa.column("project_id", sa.Uuid()),
         sa.column("public_name", sa.String(255)),
     )
@@ -72,10 +82,43 @@ def _reject_duplicate_public_names() -> None:
             "project/public_name rows exist; resolve the duplicate gateway identities "
             "before upgrading"
         )
+    model_services = sa.table(
+        "model_services",
+        sa.column("project_id", sa.Uuid()),
+        sa.column("name", sa.String(255)),
+        sa.column("logical_model_id", sa.Uuid()),
+    )
+    collision = (
+        op.get_bind()
+        .execute(
+            sa.select(logical_models.c.project_id, logical_models.c.public_name)
+            .join(
+                model_services,
+                sa.and_(
+                    model_services.c.project_id == logical_models.c.project_id,
+                    model_services.c.name == logical_models.c.public_name,
+                ),
+            )
+            .where(
+                sa.or_(
+                    model_services.c.logical_model_id.is_(None),
+                    model_services.c.logical_model_id != logical_models.c.id,
+                )
+            )
+            .limit(1)
+        )
+        .first()
+    )
+    if collision is not None:
+        raise RuntimeError(
+            "0015 cannot add the logical-model public-name constraint while a logical "
+            "model public_name collides with an unrelated service name in the same "
+            "project; resolve the cross-namespace gateway identity before upgrading"
+        )
 
 
 def upgrade() -> None:
-    _reject_duplicate_public_names()
+    _reject_ambiguous_gateway_names()
     with _preserve_sqlite_referencing_rows():
         with op.batch_alter_table("logical_models") as batch:
             batch.add_column(
