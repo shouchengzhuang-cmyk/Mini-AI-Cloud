@@ -56,6 +56,9 @@ Node allocatable 不提供物理 device ID，因此 provider 生成
 observed device IDs；后者仍只能由 Pod/Device Plugin 运行态观测写回。
 绑定 Runtime Profile 前还会检查 Node taints：每个 `NoSchedule`/`NoExecute` taint
 都必须被 profile 的 toleration 精确覆盖；`PreferNoSchedule` 仅作为软约束保留。
+profile 声明了 hardware families 时还必须匹配机器标签：NVIDIA 使用 GFD compute
+capability，当前 Ascend A2 profile 只接受 `node.kubernetes.io/npu.chip.name` 明确报告的
+Ascend 910B 系列；缺失或未知硬件族均不绑定 profile。
 
 Node allocatable 是静态可分配上限，不会随 Pod 绑定自动递减。provider 会同时列出目标
 节点上的非终态 Pod，并按 Kubernetes scheduler 语义扣除外部 Pod 的 accelerator

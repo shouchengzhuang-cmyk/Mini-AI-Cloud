@@ -1206,6 +1206,8 @@ def _kubernetes_node_matches_profile(
         for requirement in profile.kubernetes.node_affinity
     ):
         return False
+    if not _kubernetes_node_matches_hardware_family(node_labels, profile):
+        return False
     return all(
         effect == "PreferNoSchedule"
         or any(
@@ -1219,6 +1221,47 @@ def _kubernetes_node_matches_profile(
         )
         for key, value, effect in node_taints
     )
+
+
+_NVIDIA_COMPUTE_FAMILY = re.compile(
+    r"^NVIDIA CUDA compute capability (?P<major>[0-9]+)\.(?P<minor>[0-9]+)\+$"
+)
+
+
+def _kubernetes_node_matches_hardware_family(
+    node_labels: Mapping[str, str],
+    profile: RuntimeProfile,
+) -> bool:
+    hardware_families = profile.compatibility.hardware_families
+    if not hardware_families:
+        return True
+    if profile.vendor == AcceleratorVendor.NVIDIA:
+        raw_major = node_labels.get("nvidia.com/gpu.compute.major")
+        raw_minor = node_labels.get("nvidia.com/gpu.compute.minor", "0")
+        try:
+            observed = (int(raw_major or ""), int(raw_minor))
+        except ValueError:
+            return False
+        for family in hardware_families:
+            match = _NVIDIA_COMPUTE_FAMILY.fullmatch(family)
+            if match is None:
+                continue
+            required = (int(match.group("major")), int(match.group("minor")))
+            if observed >= required:
+                return True
+        return False
+    if profile.vendor == AcceleratorVendor.HUAWEI_ASCEND:
+        chip_name = re.sub(
+            r"[^a-z0-9]",
+            "",
+            node_labels.get("node.kubernetes.io/npu.chip.name", "").casefold(),
+        )
+        is_ascend_910b = re.fullmatch(r"(?:ascend)?910b[a-z0-9]*", chip_name) is not None
+        return is_ascend_910b and any(
+            re.sub(r"[^a-z0-9]", "", family.casefold()) in {"atlasa2", "atlasa2ascend910b"}
+            for family in hardware_families
+        )
+    return False
 
 
 def _kubernetes_node_matches_requirement(

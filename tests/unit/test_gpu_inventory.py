@@ -632,6 +632,25 @@ def test_kubernetes_profile_binding_accepts_declared_and_soft_taints() -> None:
     assert all(device.runtime_profile_ids for device in nvidia)
 
 
+@pytest.mark.parametrize("chip_name", ["910C", "Ascend950", None])
+def test_kubernetes_profile_binding_rejects_unsupported_ascend_hardware_family(
+    chip_name: str | None,
+) -> None:
+    node = json.loads(_fixture("kubernetes-node.json"))
+    node["metadata"]["labels"]["accelerator.mini-ai-cloud/vendor"] = "huawei-ascend"
+    if chip_name is None:
+        del node["metadata"]["labels"]["node.kubernetes.io/npu.chip.name"]
+    else:
+        node["metadata"]["labels"]["node.kubernetes.io/npu.chip.name"] = chip_name
+    catalog = RuntimeProfileCatalog.from_path(REPOSITORY_ROOT / "runtime_profiles/manifest.json")
+
+    bound = bind_kubernetes_runtime_profiles(parse_kubernetes_node(node).devices, catalog)
+
+    ascend = [device for device in bound if device.vendor == AcceleratorVendor.HUAWEI_ASCEND]
+    assert ascend
+    assert {device.runtime_profile_ids for device in ascend} == {()}
+
+
 @pytest.mark.parametrize(
     ("label", "value"),
     [
