@@ -2,6 +2,7 @@ import asyncio
 import json
 import subprocess
 from pathlib import Path
+from typing import Literal
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -10,7 +11,7 @@ from pydantic import ValidationError
 import worker.gpu_inventory as gpu_inventory
 from core.config import Settings
 from core.enums import AcceleratorKind, AcceleratorVendor
-from core.runtime_profiles import RuntimeProfileCatalog
+from core.runtime_profiles import KubernetesNodeSelectorRequirement, RuntimeProfileCatalog
 from worker.gpu_inventory import (
     AscendNpuSMIInventoryProvider,
     FakeGPUInventoryProvider,
@@ -195,6 +196,10 @@ async def test_kubernetes_provider_reads_configured_cluster_without_kubectl() ->
         "nvidia.com/gpu",
         "huawei.com/Ascend910",
     }
+    assert all(
+        dict(device.kubernetes_node_labels)["accelerator.mini-ai-cloud/vendor"] == "nvidia"
+        for device in result.devices
+    )
     assert all("kubernetes-capacity-slot" in device.capabilities for device in result.devices)
     assert all(device.health == "inventory-only" for device in result.devices)
     assert all(device.device_id.startswith("k8s-capacity:node-uid-1:") for device in result.devices)
@@ -338,7 +343,7 @@ def test_kubernetes_capacity_rejects_unschedulable_or_unready_nodes(
     assert parsed.rejected_rows == 1
 
 
-async def test_kubernetes_capacity_binds_only_exact_catalog_resource_contracts() -> None:
+async def test_kubernetes_capacity_binds_only_schedulable_catalog_contracts() -> None:
     node_reader = AsyncMock(return_value=json.loads(_fixture("kubernetes-node.json")))
     provider = KubernetesNodeAcceleratorProvider(
         node_name="dual-stack-node",
@@ -359,10 +364,82 @@ async def test_kubernetes_capacity_binds_only_exact_catalog_resource_contracts()
     nvidia = [device for device in bound if device.vendor == AcceleratorVendor.NVIDIA]
     ascend = [device for device in bound if device.vendor == AcceleratorVendor.HUAWEI_ASCEND]
     assert {device.runtime_profile_ids for device in nvidia} == {("nvidia-vllm-k8s",)}
-    assert {device.runtime_profile_ids for device in ascend} == {("ascend-vllm-k8s-a2",)}
-    assert all("streaming" in device.capabilities for device in bound)
-    assert all("tensor-parallel" in device.capabilities for device in bound)
+    assert {device.runtime_profile_ids for device in ascend} == {()}
+    assert all("streaming" in device.capabilities for device in nvidia)
+    assert all("tensor-parallel" in device.capabilities for device in nvidia)
     assert all(device.health == "inventory-only" for device in bound)
+
+    ascend_node = json.loads(_fixture("kubernetes-node.json"))
+    ascend_node["metadata"]["labels"]["accelerator.mini-ai-cloud/vendor"] = "huawei-ascend"
+    ascend_bound = bind_kubernetes_runtime_profiles(
+        parse_kubernetes_node(ascend_node).devices,
+        catalog,
+    )
+    ascend = [device for device in ascend_bound if device.vendor == AcceleratorVendor.HUAWEI_ASCEND]
+    nvidia = [device for device in ascend_bound if device.vendor == AcceleratorVendor.NVIDIA]
+    assert {device.runtime_profile_ids for device in ascend} == {("ascend-vllm-k8s-a2",)}
+    assert {device.runtime_profile_ids for device in nvidia} == {()}
+
+
+@pytest.mark.parametrize(
+    ("label", "value"),
+    [
+        ("accelerator.mini-ai-cloud/vendor", "huawei-ascend"),
+        ("nvidia.com/gpu.product", None),
+        ("nvidia.com/gpu.count", "0"),
+        ("nvidia.com/gpu.compute.major", "7"),
+        ("nvidia.com/gpu.sharing-strategy", "time-slicing"),
+        ("nvidia.com/mig.strategy", "mixed"),
+    ],
+)
+def test_kubernetes_capacity_rejects_unsatisfied_profile_node_constraints(
+    label: str,
+    value: str | None,
+) -> None:
+    node = json.loads(_fixture("kubernetes-node.json"))
+    if value is None:
+        del node["metadata"]["labels"][label]
+    else:
+        node["metadata"]["labels"][label] = value
+    catalog = RuntimeProfileCatalog.from_path(REPOSITORY_ROOT / "runtime_profiles/manifest.json")
+
+    bound = bind_kubernetes_runtime_profiles(parse_kubernetes_node(node).devices, catalog)
+
+    nvidia = [device for device in bound if device.vendor == AcceleratorVendor.NVIDIA]
+    assert nvidia
+    assert all(device.runtime_profile_ids == () for device in nvidia)
+
+
+@pytest.mark.parametrize(
+    ("node_labels", "operator", "values", "expected"),
+    [
+        ({"feature": "8"}, "Exists", (), True),
+        ({}, "Exists", (), False),
+        ({}, "DoesNotExist", (), True),
+        ({"feature": "8"}, "DoesNotExist", (), False),
+        ({"feature": "8"}, "In", ("8", "9"), True),
+        ({"feature": "7"}, "In", ("8", "9"), False),
+        ({"feature": "7"}, "NotIn", ("8", "9"), True),
+        ({}, "NotIn", ("8", "9"), True),
+        ({"feature": "8"}, "Gt", ("7",), True),
+        ({"feature": "7"}, "Gt", ("7",), False),
+        ({"feature": "7"}, "Lt", ("8",), True),
+        ({"feature": "not-an-int"}, "Lt", ("8",), False),
+    ],
+)
+def test_kubernetes_node_affinity_operator_matching(
+    node_labels: dict[str, str],
+    operator: Literal["In", "NotIn", "Exists", "DoesNotExist", "Gt", "Lt"],
+    values: tuple[str, ...],
+    expected: bool,
+) -> None:
+    requirement = KubernetesNodeSelectorRequirement(
+        key="feature",
+        operator=operator,
+        values=values,
+    )
+
+    assert gpu_inventory._kubernetes_node_matches_requirement(node_labels, requirement) is expected
 
 
 def test_host_cli_inventory_is_not_inferred_as_device_plugin_capacity() -> None:

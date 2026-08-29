@@ -15,7 +15,12 @@ from kubernetes_asyncio import client, config
 from core.accelerators import AcceleratorDevice, kind_for_vendor
 from core.config import Settings
 from core.enums import AcceleratorKind, AcceleratorVendor
-from core.runtime_profiles import RuntimeProfileCatalog, RuntimeProfileManifestEntry
+from core.runtime_profiles import (
+    KubernetesNodeSelectorRequirement,
+    RuntimeProfile,
+    RuntimeProfileCatalog,
+    RuntimeProfileManifestEntry,
+)
 
 MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024
 MAX_INVENTORY_ROWS = 256
@@ -512,6 +517,13 @@ def parse_kubernetes_node(node: Mapping[str, object]) -> _ParseResult:
     node_uid = str(metadata.get("uid") or "").strip()
     labels = metadata.get("labels")
     labels = labels if isinstance(labels, Mapping) else {}
+    node_labels = tuple(
+        sorted(
+            (key, value)
+            for key, value in labels.items()
+            if isinstance(key, str) and isinstance(value, str)
+        )
+    )
     allocatable = status.get("allocatable")
     if not node_uid or not isinstance(allocatable, Mapping):
         return _ParseResult((), 1)
@@ -565,6 +577,7 @@ def parse_kubernetes_node(node: Mapping[str, object]) -> _ParseResult:
                     compute_arch=compute_arch,
                     capabilities=("kubernetes-capacity-slot",),
                     kubernetes_resource_name=resource_name,
+                    kubernetes_node_labels=node_labels,
                 )
             )
             next_index += 1
@@ -815,10 +828,11 @@ def bind_kubernetes_runtime_profiles(
 ) -> tuple[AcceleratorDevice, ...]:
     """Bind Node capacity slots to exact, catalog-owned Kubernetes contracts.
 
-    A3 intentionally discovers Device Plugin resource names without importing
-    runtime policy. The worker performs this later join only when it owns both
-    a validated Runtime Profile catalog and an exact resource-name match. Host
-    CLI inventory without a Device Plugin resource remains unbound and cannot
+    A3 intentionally discovers Device Plugin resources and Node labels without
+    importing runtime policy. The worker performs this later join only when it
+    owns a validated Runtime Profile catalog and the Node satisfies the exact
+    resource, nodeSelector, and required node-affinity contract. Host CLI
+    inventory without a Device Plugin resource remains unbound and cannot
     become Kubernetes capacity by inference.
     """
 
@@ -835,7 +849,7 @@ def bind_kubernetes_runtime_profiles(
 
     contracts: dict[
         tuple[AcceleratorVendor, AcceleratorKind, str],
-        list[tuple[str, frozenset[str]]],
+        list[tuple[RuntimeProfile, frozenset[str]]],
     ] = {}
     for entry in latest_entries.values():
         profile = catalog.load_exact(
@@ -849,9 +863,7 @@ def bind_kubernetes_runtime_profiles(
         if profile.capabilities.tensor_parallel.supported:
             contract_capabilities.add("tensor-parallel")
         contract_key = (profile.vendor, profile.kind, profile.kubernetes.resource_name)
-        contracts.setdefault(contract_key, []).append(
-            (profile.id, frozenset(contract_capabilities))
-        )
+        contracts.setdefault(contract_key, []).append((profile, frozenset(contract_capabilities)))
 
     bound: list[AcceleratorDevice] = []
     for device in devices:
@@ -859,11 +871,17 @@ def bind_kubernetes_runtime_profiles(
         if resource_name is None:
             bound.append(device)
             continue
-        matches = contracts.get((device.vendor, device.kind, resource_name), [])
+        matches = [
+            (profile, capabilities)
+            for profile, capabilities in contracts.get(
+                (device.vendor, device.kind, resource_name), []
+            )
+            if _kubernetes_node_matches_profile(device.kubernetes_node_labels, profile)
+        ]
         if not matches:
             bound.append(device)
             continue
-        profile_ids = tuple(sorted({profile_id for profile_id, _ in matches}))
+        profile_ids = tuple(sorted({profile.id for profile, _ in matches}))
         merged_capabilities = tuple(
             sorted(
                 set(device.capabilities).union(
@@ -879,6 +897,49 @@ def bind_kubernetes_runtime_profiles(
             )
         )
     return tuple(bound)
+
+
+def _kubernetes_node_matches_profile(
+    node_label_items: tuple[tuple[str, str], ...],
+    profile: RuntimeProfile,
+) -> bool:
+    node_labels = dict(node_label_items)
+    if any(
+        node_labels.get(key) != value for key, value in profile.kubernetes.node_selector.items()
+    ):
+        return False
+    return all(
+        _kubernetes_node_matches_requirement(node_labels, requirement)
+        for requirement in profile.kubernetes.node_affinity
+    )
+
+
+def _kubernetes_node_matches_requirement(
+    node_labels: Mapping[str, str],
+    requirement: KubernetesNodeSelectorRequirement,
+) -> bool:
+    key_present = requirement.key in node_labels
+    value = node_labels.get(requirement.key)
+    if requirement.operator == "Exists":
+        return key_present
+    if requirement.operator == "DoesNotExist":
+        return not key_present
+    if requirement.operator == "In":
+        return key_present and value in requirement.values
+    if requirement.operator == "NotIn":
+        return not key_present or value not in requirement.values
+    if not key_present or value is None:
+        return False
+    try:
+        numeric_value = int(value)
+        threshold = int(requirement.values[0])
+    except (ValueError, IndexError):
+        return False
+    if requirement.operator == "Gt":
+        return numeric_value > threshold
+    if requirement.operator == "Lt":
+        return numeric_value < threshold
+    return False
 
 
 def _profile_version(value: str) -> tuple[int, int, int]:

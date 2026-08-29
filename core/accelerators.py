@@ -59,6 +59,7 @@ class AcceleratorDevice:
     fake: bool = False
     device_index: int = 0
     kubernetes_resource_name: str | None = None
+    kubernetes_node_labels: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.vendor, AcceleratorVendor):
@@ -99,6 +100,21 @@ class AcceleratorDevice:
             )
             if not _KUBERNETES_RESOURCE.fullmatch(self.kubernetes_resource_name):
                 raise ValueError("kubernetes_resource_name must be a qualified resource name")
+        label_keys = [key for key, _ in self.kubernetes_node_labels]
+        if len(label_keys) != len(set(label_keys)):
+            raise ValueError("kubernetes_node_labels keys must be unique")
+        for key, value in self.kubernetes_node_labels:
+            _validate_inventory_text("kubernetes_node_label key", key, maximum=253)
+            if any(character.isspace() for character in key):
+                raise ValueError("kubernetes_node_label keys must not contain whitespace")
+            if value != value.strip() or len(value) > 63:
+                raise ValueError(
+                    "kubernetes_node_label values must be canonical and at most 63 characters"
+                )
+            if any(character.isspace() or ord(character) < 32 for character in value):
+                raise ValueError(
+                    "kubernetes_node_label values must not contain whitespace or controls"
+                )
 
     @property
     def uuid(self) -> str:
