@@ -86,7 +86,10 @@ def test_m6_commit_relationships_are_resolved_and_verified() -> None:
         for item in coverage.stacked_pull_requests
         if item.integration == "semantic-integration"
     )
+    semantic_integration.source_head = "0" * 40
+    validate_m6_release_coverage(coverage, REPOSITORY_ROOT)
+
     semantic_integration.integration = "literal-ancestor"
 
-    with pytest.raises(ContractValidationError, match="source head is not an ancestor"):
+    with pytest.raises(ContractValidationError, match="PR #22 source head cannot be resolved"):
         validate_m6_release_coverage(coverage, REPOSITORY_ROOT)

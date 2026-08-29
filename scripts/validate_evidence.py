@@ -258,6 +258,7 @@ def validate_m6_release_coverage(
         **{
             pull_request.source_head: f"PR #{pull_request.number} source head"
             for pull_request in coverage.stacked_pull_requests
+            if pull_request.integration == "literal-ancestor"
         },
     }
     for commit, label in commit_labels.items():
