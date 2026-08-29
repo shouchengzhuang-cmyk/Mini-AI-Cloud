@@ -205,7 +205,7 @@ def test_service_node_placement_migration_backfills_and_downgrades(
 
 @pytest.mark.parametrize(
     ("status", "desired_replicas"),
-    [("pending", 1), ("deploying", 1), ("failed", 1)],
+    [("pending", 1), ("deploying", 1), ("degraded", 1), ("failed", 1)],
 )
 def test_service_node_placement_migration_rejects_unrecoverable_service_before_ddl(
     tmp_path: Path,
@@ -257,8 +257,10 @@ def test_service_node_placement_migration_rejects_unrecoverable_service_before_d
     engine.dispose()
 
 
-def test_service_node_placement_migration_allows_failed_scaled_to_zero(
+@pytest.mark.parametrize("status", ["degraded", "failed"])
+def test_service_node_placement_migration_allows_unhealthy_service_scaled_to_zero(
     tmp_path: Path,
+    status: str,
 ) -> None:
     engine = sa.create_engine(f"sqlite:///{tmp_path / 'failed-stopped-service.sqlite3'}")
     metadata = sa.MetaData()
@@ -274,7 +276,7 @@ def test_service_node_placement_migration_allows_failed_scaled_to_zero(
                 _logical_snapshot(
                     service_id,
                     service=True,
-                    status="failed",
+                    status=status,
                     desired_replicas=0,
                 )
             )
@@ -295,7 +297,7 @@ def test_service_node_placement_migration_allows_failed_scaled_to_zero(
                 upgraded.c.status, upgraded.c.desired_replicas, upgraded.c.eligible_node_names
             )
         ).one()
-        assert row == ("failed", 0, [])
+        assert row == (status, 0, [])
     engine.dispose()
 
 
@@ -313,7 +315,7 @@ def test_service_node_placement_migration_compiles_postgresql_offline_sql() -> N
     rendered = output.getvalue()
     assert "'[]'::json" in rendered
     assert "assigned_node_name" in rendered
-    assert "status = 'failed' AND desired_replicas > 0" in rendered
+    assert "status IN ('degraded', 'failed') AND desired_replicas > 0" in rendered
 
 
 def test_sqlite_foreign_keys_are_restored_when_migration_body_fails() -> None:

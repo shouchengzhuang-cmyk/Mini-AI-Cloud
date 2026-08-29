@@ -21,9 +21,10 @@ from core.enums import (
 )
 from core.kubernetes_names import validate_kubernetes_dns_subdomain
 from core.runtime_profiles import (
+    RuntimeProfile,
     RuntimeProfileCatalog,
     RuntimeProfileCompatibilityError,
-    RuntimeProfileManifestEntry,
+    runtime_profile_binding_id,
 )
 from models.admission import AdmissionEvent
 from models.model_variant import ModelVariant
@@ -49,6 +50,13 @@ from scheduler.admission import (
 )
 
 _CANDIDATE_SUMMARY_MAX_BYTES = 15_500
+
+
+def _runtime_profile_capabilities(profile: RuntimeProfile) -> frozenset[str]:
+    capabilities = set(profile.capabilities.features) | set(profile.capabilities.dtypes)
+    if profile.capabilities.tensor_parallel.supported:
+        capabilities.add("tensor-parallel")
+    return frozenset(capabilities)
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,11 +334,18 @@ def _batch_homogeneous_compatible_devices(
     kind: AcceleratorKind,
     model: str,
     profile_id: str,
+    profile_version: str,
+    profile_digest: str,
     resource_name: str,
     required_capabilities: frozenset[str] = frozenset(),
     profile_capabilities: frozenset[str] = frozenset(),
     minimum_memory_mb: int = 0,
 ) -> list[InventoryDeviceSnapshot]:
+    binding_id = runtime_profile_binding_id(
+        profile_id=profile_id,
+        profile_version=profile_version,
+        semantic_digest=profile_digest,
+    )
     candidate_node_keys = {
         (device.worker_id, device.node_name)
         for device in inventory
@@ -340,7 +355,7 @@ def _batch_homogeneous_compatible_devices(
         and device.kind == kind
         and device.model == model
         and device.kubernetes_resource_name == resource_name
-        and profile_id in device.runtime_profile_ids
+        and binding_id in device.runtime_profile_ids
     }
     compatible_devices: list[InventoryDeviceSnapshot] = []
     for node_key in sorted(candidate_node_keys):
@@ -355,7 +370,7 @@ def _batch_homogeneous_compatible_devices(
             and device.kind == kind
             and device.model == model
             and device.memory_total_mb >= minimum_memory_mb
-            and profile_id in device.runtime_profile_ids
+            and binding_id in device.runtime_profile_ids
             and required_capabilities.issubset(
                 frozenset(device.capabilities) | profile_capabilities
             )
@@ -376,6 +391,8 @@ def _batch_pool_available_capacity(
     kind: AcceleratorKind,
     model: str,
     profile_id: str,
+    profile_version: str,
+    profile_digest: str,
     resource_name: str,
     service_usage: _ServiceAcceleratorUsage,
     deferred_usage: _DeferredAcceleratorUsage,
@@ -401,6 +418,8 @@ def _batch_pool_available_capacity(
         kind=kind,
         model=model,
         profile_id=profile_id,
+        profile_version=profile_version,
+        profile_digest=profile_digest,
         resource_name=resource_name,
         required_capabilities=required_capabilities,
         profile_capabilities=profile_capabilities,
@@ -656,9 +675,7 @@ class AdmissionRepository:
             or profile.kubernetes.resource_name != normalized_resource
         ):
             return 0
-        profile_capabilities = frozenset(profile.capabilities.features) | frozenset(
-            profile.capabilities.dtypes
-        )
+        profile_capabilities = _runtime_profile_capabilities(profile)
         inventory = await AdmissionRepository.list_healthy_inventory_devices(
             session,
             vendors=(vendor,),
@@ -682,6 +699,8 @@ class AdmissionRepository:
             kind=kind,
             model=model,
             profile_id=profile_id,
+            profile_version=profile_version,
+            profile_digest=profile_digest,
             resource_name=normalized_resource,
             service_usage=service_usage,
             deferred_usage=deferred_usage,
@@ -802,21 +821,15 @@ class AdmissionRepository:
             tuple[str, AcceleratorVendor, AcceleratorKind, str, str, str, str, str],
             list[InventoryDeviceSnapshot],
         ] = {}
-        latest_entries: dict[
-            tuple[AcceleratorVendor, AcceleratorKind, str], RuntimeProfileManifestEntry
-        ] = {}
-        for entry in catalog.manifest.profiles:
-            latest_key = (entry.vendor, entry.kind, entry.profile_id)
-            current = latest_entries.get(latest_key)
-            is_newer = current is None or _profile_version_key(
-                entry.profile_version
-            ) > _profile_version_key(current.profile_version)
-            if is_newer:
-                latest_entries[latest_key] = entry
         for device in candidate_inventory:
-            for entry in latest_entries.values():
+            for entry in catalog.manifest.profiles:
+                binding_id = runtime_profile_binding_id(
+                    profile_id=entry.profile_id,
+                    profile_version=entry.profile_version,
+                    semantic_digest=entry.semantic_digest,
+                )
                 if (
-                    entry.profile_id not in device.runtime_profile_ids
+                    binding_id not in device.runtime_profile_ids
                     or entry.vendor != device.vendor
                     or entry.kind != device.kind
                     or (
@@ -862,9 +875,7 @@ class AdmissionRepository:
                 profile_version=profile_version,
                 semantic_digest=profile_digest,
             )
-            profile_capabilities = frozenset(profile.capabilities.features) | frozenset(
-                profile.capabilities.dtypes
-            )
+            profile_capabilities = _runtime_profile_capabilities(profile)
             compatible_devices = _batch_homogeneous_compatible_devices(
                 inventory=inventory,
                 worker_id=worker_id,
@@ -872,6 +883,8 @@ class AdmissionRepository:
                 kind=kind,
                 model=model,
                 profile_id=profile_id,
+                profile_version=profile_version,
+                profile_digest=profile_digest,
                 resource_name=resource_name,
                 required_capabilities=request.required_capabilities,
                 profile_capabilities=profile_capabilities,
@@ -904,6 +917,8 @@ class AdmissionRepository:
                     kind=kind,
                     model=model,
                     profile_id=profile_id,
+                    profile_version=profile_version,
+                    profile_digest=profile_digest,
                     resource_name=resource_name,
                     service_usage=active_services,
                     deferred_usage=active_deferred,
@@ -1419,6 +1434,7 @@ def _service_candidates(
     for variant in variants:
         manifest_entry = None
         runtime_profile = None
+        runtime_profile_binding = None
         try:
             manifest_entry = catalog.resolve_compatible(
                 profile_id=variant.runtime_profile_id,
@@ -1434,11 +1450,21 @@ def _service_candidates(
                 profile_version=variant.runtime_profile_version,
                 semantic_digest=variant.runtime_profile_digest,
             )
+            runtime_profile_binding = runtime_profile_binding_id(
+                profile_id=variant.runtime_profile_id,
+                profile_version=variant.runtime_profile_version,
+                semantic_digest=variant.runtime_profile_digest,
+            )
         except RuntimeProfileCompatibilityError:
             pass
         variant_ready = (requested_dtype == "auto" or requested_dtype == variant.dtype) and len(
             variant.artifact_source
         ) <= 512
+        profile_capabilities = (
+            _runtime_profile_capabilities(runtime_profile)
+            if runtime_profile is not None
+            else frozenset()
+        )
         relevant = [
             device
             for device in inventory
@@ -1448,14 +1474,13 @@ def _service_candidates(
         effective_capabilities: dict[uuid.UUID, frozenset[str]] = {}
         for device in relevant:
             capabilities = set(device.capabilities)
-            capabilities.add(variant.dtype)
-            if manifest_entry is not None:
-                capabilities.update(manifest_entry.features)
+            capabilities.update(profile_capabilities)
             frozen_capabilities = frozenset(capabilities)
             effective_capabilities[device.device_id] = frozen_capabilities
             if (
                 device.health not in {"healthy", "inventory-only"}
-                or variant.runtime_profile_id not in device.runtime_profile_ids
+                or runtime_profile_binding is None
+                or runtime_profile_binding not in device.runtime_profile_ids
                 or runtime_profile is None
                 or device.kubernetes_resource_name != runtime_profile.kubernetes.resource_name
             ):
@@ -1494,7 +1519,7 @@ def _service_candidates(
                     and device.kind == variant.kind
                     and device.model == model
                     and device.memory_total_mb >= minimum_memory_mb
-                    and variant.runtime_profile_id in device.runtime_profile_ids
+                    and runtime_profile_binding in device.runtime_profile_ids
                     and request.required_capabilities.issubset(
                         effective_capabilities[device.device_id]
                     )
@@ -2177,8 +2202,3 @@ def _summary_size(items: list[dict[str, object]]) -> int:
             sort_keys=True,
         ).encode("utf-8")
     )
-
-
-def _profile_version_key(value: str) -> tuple[int, int, int]:
-    major, minor, patch = value.split(".")
-    return int(major), int(minor), int(patch)

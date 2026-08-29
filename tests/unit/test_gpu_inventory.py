@@ -11,7 +11,11 @@ from pydantic import ValidationError
 import worker.gpu_inventory as gpu_inventory
 from core.config import Settings
 from core.enums import AcceleratorKind, AcceleratorVendor
-from core.runtime_profiles import KubernetesNodeSelectorRequirement, RuntimeProfileCatalog
+from core.runtime_profiles import (
+    KubernetesNodeSelectorRequirement,
+    RuntimeProfileCatalog,
+    runtime_profile_binding_id,
+)
 from worker.gpu_inventory import (
     AscendNpuSMIInventoryProvider,
     FakeGPUInventoryProvider,
@@ -33,6 +37,15 @@ REPOSITORY_ROOT = Path(__file__).parents[2]
 
 def _fixture(name: str) -> str:
     return (FIXTURES / name).read_text(encoding="utf-8")
+
+
+def _binding(catalog: RuntimeProfileCatalog, identity: str) -> str:
+    entry = next(item for item in catalog.manifest.profiles if item.identity == identity)
+    return runtime_profile_binding_id(
+        profile_id=entry.profile_id,
+        profile_version=entry.profile_version,
+        semantic_digest=entry.semantic_digest,
+    )
 
 
 def test_nvidia_inventory_preserves_details_and_reports_partial_fixture() -> None:
@@ -363,10 +376,18 @@ async def test_kubernetes_capacity_binds_only_schedulable_catalog_contracts() ->
     )
     nvidia = [device for device in bound if device.vendor == AcceleratorVendor.NVIDIA]
     ascend = [device for device in bound if device.vendor == AcceleratorVendor.HUAWEI_ASCEND]
-    assert {device.runtime_profile_ids for device in nvidia} == {("nvidia-vllm-k8s",)}
+    assert {device.runtime_profile_ids for device in nvidia} == {
+        tuple(
+            sorted(
+                {
+                    _binding(catalog, "nvidia-vllm-k8s@1.0.0"),
+                    _binding(catalog, "nvidia-vllm-k8s@2.0.0"),
+                }
+            )
+        )
+    }
     assert {device.runtime_profile_ids for device in ascend} == {()}
-    assert all("streaming" in device.capabilities for device in nvidia)
-    assert all("tensor-parallel" in device.capabilities for device in nvidia)
+    assert all(device.capabilities == ("kubernetes-capacity-slot",) for device in nvidia)
     assert all(device.health == "inventory-only" for device in bound)
 
     ascend_node = json.loads(_fixture("kubernetes-node.json"))
@@ -377,7 +398,16 @@ async def test_kubernetes_capacity_binds_only_schedulable_catalog_contracts() ->
     )
     ascend = [device for device in ascend_bound if device.vendor == AcceleratorVendor.HUAWEI_ASCEND]
     nvidia = [device for device in ascend_bound if device.vendor == AcceleratorVendor.NVIDIA]
-    assert {device.runtime_profile_ids for device in ascend} == {("ascend-vllm-k8s-a2",)}
+    assert {device.runtime_profile_ids for device in ascend} == {
+        tuple(
+            sorted(
+                {
+                    _binding(catalog, "ascend-vllm-k8s-a2@1.0.0"),
+                    _binding(catalog, "ascend-vllm-k8s-a2@2.0.0"),
+                }
+            )
+        )
+    }
     assert {device.runtime_profile_ids for device in nvidia} == {()}
 
 
@@ -407,7 +437,12 @@ def test_kubernetes_capacity_rejects_unsatisfied_profile_node_constraints(
 
     nvidia = [device for device in bound if device.vendor == AcceleratorVendor.NVIDIA]
     assert nvidia
-    assert all(device.runtime_profile_ids == () for device in nvidia)
+    expected = (
+        ()
+        if label == "accelerator.mini-ai-cloud/vendor"
+        else (_binding(catalog, "nvidia-vllm-k8s@1.0.0"),)
+    )
+    assert all(device.runtime_profile_ids == expected for device in nvidia)
 
 
 @pytest.mark.parametrize(

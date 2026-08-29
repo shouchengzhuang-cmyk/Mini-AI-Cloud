@@ -19,7 +19,7 @@ from core.runtime_profiles import (
     KubernetesNodeSelectorRequirement,
     RuntimeProfile,
     RuntimeProfileCatalog,
-    RuntimeProfileManifestEntry,
+    runtime_profile_binding_id,
 )
 
 MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024
@@ -841,34 +841,23 @@ def bind_kubernetes_runtime_profiles(
     become Kubernetes capacity by inference.
     """
 
-    latest_entries: dict[
-        tuple[AcceleratorVendor, AcceleratorKind, str], RuntimeProfileManifestEntry
-    ] = {}
-    for entry in catalog.manifest.profiles:
-        key = (entry.vendor, entry.kind, entry.profile_id)
-        current = latest_entries.get(key)
-        if current is None or _profile_version(entry.profile_version) > _profile_version(
-            current.profile_version
-        ):
-            latest_entries[key] = entry
-
     contracts: dict[
         tuple[AcceleratorVendor, AcceleratorKind, str],
-        list[tuple[RuntimeProfile, frozenset[str]]],
+        list[tuple[RuntimeProfile, str]],
     ] = {}
-    for entry in latest_entries.values():
+    for entry in catalog.manifest.profiles:
         profile = catalog.load_exact(
             profile_id=entry.profile_id,
             profile_version=entry.profile_version,
             semantic_digest=entry.semantic_digest,
         )
-        contract_capabilities = set(profile.capabilities.features) | set(
-            profile.capabilities.dtypes
+        binding_id = runtime_profile_binding_id(
+            profile_id=entry.profile_id,
+            profile_version=entry.profile_version,
+            semantic_digest=entry.semantic_digest,
         )
-        if profile.capabilities.tensor_parallel.supported:
-            contract_capabilities.add("tensor-parallel")
         contract_key = (profile.vendor, profile.kind, profile.kubernetes.resource_name)
-        contracts.setdefault(contract_key, []).append((profile, frozenset(contract_capabilities)))
+        contracts.setdefault(contract_key, []).append((profile, binding_id))
 
     bound: list[AcceleratorDevice] = []
     for device in devices:
@@ -877,8 +866,8 @@ def bind_kubernetes_runtime_profiles(
             bound.append(device)
             continue
         matches = [
-            (profile, capabilities)
-            for profile, capabilities in contracts.get(
+            binding_id
+            for profile, binding_id in contracts.get(
                 (device.vendor, device.kind, resource_name), []
             )
             if _kubernetes_node_matches_profile(device.kubernetes_node_labels, profile)
@@ -886,19 +875,11 @@ def bind_kubernetes_runtime_profiles(
         if not matches:
             bound.append(device)
             continue
-        profile_ids = tuple(sorted({profile.id for profile, _ in matches}))
-        merged_capabilities = tuple(
-            sorted(
-                set(device.capabilities).union(
-                    *(profile_capabilities for _, profile_capabilities in matches)
-                )
-            )
-        )
+        profile_ids = tuple(sorted(set(matches)))
         bound.append(
             replace(
                 device,
                 runtime_profile_ids=profile_ids,
-                capabilities=merged_capabilities,
             )
         )
     return tuple(bound)
@@ -945,11 +926,6 @@ def _kubernetes_node_matches_requirement(
     if requirement.operator == "Lt":
         return numeric_value < threshold
     return False
-
-
-def _profile_version(value: str) -> tuple[int, int, int]:
-    major, minor, patch = value.split(".")
-    return int(major), int(minor), int(patch)
 
 
 def _provider_names(settings: Settings) -> tuple[str, ...]:

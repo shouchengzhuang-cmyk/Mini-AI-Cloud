@@ -17,6 +17,7 @@ from core.image_policy import ImageReferenceError, canonicalize_image_reference
 
 PROFILE_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{2,63}$")
 PROFILE_VERSION_PATTERN = re.compile(r"^[1-9][0-9]*\.[0-9]+\.[0-9]+$")
+SEMANTIC_DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 KUBERNETES_RESOURCE_PATTERN = re.compile(
     r"^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?/[A-Za-z0-9](?:[-A-Za-z0-9_.]*[A-Za-z0-9])?$"
 )
@@ -62,6 +63,27 @@ _EVIDENCE_REFERENCE_REQUIRED = {
     "REAL_CONTROL_PLANE_PASS",
     "REAL_DUAL_BACKEND_PASS",
 }
+
+
+def runtime_profile_binding_id(
+    *,
+    profile_id: str,
+    profile_version: str,
+    semantic_digest: str,
+) -> str:
+    """Return the exact immutable inventory binding for one runtime profile."""
+
+    if not PROFILE_ID_PATTERN.fullmatch(profile_id):
+        raise ValueError("invalid runtime profile binding profile_id")
+    if not PROFILE_VERSION_PATTERN.fullmatch(profile_version):
+        raise ValueError("invalid runtime profile binding profile_version")
+    if not SEMANTIC_DIGEST_PATTERN.fullmatch(semantic_digest):
+        raise ValueError("invalid runtime profile binding semantic_digest")
+    binding = f"{profile_id}@{profile_version}#{semantic_digest}"
+    if len(binding) > 255:
+        raise ValueError("runtime profile binding must not exceed 255 characters")
+    return binding
+
 
 NonEmptyText = Annotated[str, Field(min_length=1, max_length=512)]
 
@@ -398,7 +420,7 @@ class RuntimeProfileManifestEntry(FrozenContractModel):
     profile_id: str = Field(pattern=PROFILE_ID_PATTERN.pattern)
     profile_version: str = Field(pattern=PROFILE_VERSION_PATTERN.pattern)
     path: str = Field(pattern=r"^runtime_profiles/[a-z0-9-]+(?:\.example)?\.yaml$")
-    semantic_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    semantic_digest: str = Field(pattern=SEMANTIC_DIGEST_PATTERN.pattern)
     vendor: AcceleratorVendor
     kind: AcceleratorKind
     engine: str = Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")

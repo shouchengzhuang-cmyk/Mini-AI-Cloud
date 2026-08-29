@@ -20,7 +20,7 @@ from core.enums import (
     WorkerStatus,
 )
 from core.rbac import ProjectStatus
-from core.runtime_profiles import RuntimeProfileCatalog
+from core.runtime_profiles import RuntimeProfileCatalog, runtime_profile_binding_id
 from models.admission import AdmissionEvent
 from models.identity import Project
 from models.model_variant import LogicalModel, ModelVariant
@@ -315,6 +315,15 @@ async def test_authoritative_placement_refreshes_worker_fence_from_database(
 async def test_ascend_batch_uses_typed_quota_without_database_device_binding(
     database: Database,
 ) -> None:
+    catalog = RuntimeProfileCatalog.from_path(REPOSITORY_ROOT / "runtime_profiles/manifest.json")
+    entry = next(
+        item for item in catalog.manifest.profiles if item.identity == "ascend-vllm-k8s-a2@2.0.0"
+    )
+    binding_id = runtime_profile_binding_id(
+        profile_id=entry.profile_id,
+        profile_version=entry.profile_version,
+        semantic_digest=entry.semantic_digest,
+    )
     async with database.session() as session, session.begin():
         worker = await WorkerRepository.register(
             session,
@@ -345,7 +354,7 @@ async def test_ascend_batch_uses_typed_quota_without_database_device_binding(
                     "memory_total_mb": 64_000,
                     "memory_free_mb": 63_000,
                     "compute_arch": "Ascend910B",
-                    "runtime_profile_ids": ["ascend-vllm-k8s-a2"],
+                    "runtime_profile_ids": [binding_id],
                     "capabilities": ["bfloat16", "streaming"],
                     "kubernetes_resource_name": "huawei.com/Ascend910",
                 }
@@ -525,7 +534,13 @@ async def test_logical_service_admission_pins_variant_and_replica_snapshot(
                     "memory_total_mb": 64_000,
                     "memory_free_mb": 63_000,
                     "compute_arch": "Ascend910B",
-                    "runtime_profile_ids": [entry.profile_id],
+                    "runtime_profile_ids": [
+                        runtime_profile_binding_id(
+                            profile_id=entry.profile_id,
+                            profile_version=entry.profile_version,
+                            semantic_digest=entry.semantic_digest,
+                        )
+                    ],
                     "capabilities": ["bfloat16", "streaming"],
                     "kubernetes_resource_name": profile.kubernetes.resource_name,
                 }

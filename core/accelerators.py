@@ -54,6 +54,7 @@ class AcceleratorDevice:
     memory_free_mb: int
     health: str = "healthy"
     compute_arch: str | None = None
+    # Legacy field name; Kubernetes values are immutable profile@version#digest bindings.
     runtime_profile_ids: tuple[str, ...] = ()
     capabilities: tuple[str, ...] = ()
     fake: bool = False
@@ -84,8 +85,8 @@ class AcceleratorDevice:
             raise ValueError("runtime_profile_ids must not contain more than 64 values")
         if len(self.runtime_profile_ids) != len(set(self.runtime_profile_ids)):
             raise ValueError("runtime_profile_ids must be unique")
-        for profile_id in self.runtime_profile_ids:
-            _validate_inventory_text("runtime_profile_id", profile_id, maximum=128)
+        for profile_binding in self.runtime_profile_ids:
+            _validate_inventory_text("runtime_profile_binding", profile_binding, maximum=255)
         if len(self.capabilities) > 128:
             raise ValueError("capabilities must not contain more than 128 values")
         if len(self.capabilities) != len(set(self.capabilities)):

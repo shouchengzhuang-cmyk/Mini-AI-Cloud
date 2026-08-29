@@ -27,7 +27,7 @@ from core.enums import (
 from core.image_policy import ImagePolicyAction, ImageRule
 from core.rbac import Principal, PrincipalKind
 from core.redis import RedisQueue
-from core.runtime_profiles import RuntimeProfileCatalog
+from core.runtime_profiles import RuntimeProfileCatalog, runtime_profile_binding_id
 from models.admission import AdmissionEvent
 from models.identity import Project
 from models.model_variant import LogicalModel, ModelVariant
@@ -210,7 +210,13 @@ async def _create_logical_kubernetes_service(
                     "model": "NVIDIA A100",
                     "memory_total_mb": 40_960,
                     "memory_free_mb": 40_960,
-                    "runtime_profile_ids": [entry.profile_id],
+                    "runtime_profile_ids": [
+                        runtime_profile_binding_id(
+                            profile_id=entry.profile_id,
+                            profile_version=entry.profile_version,
+                            semantic_digest=entry.semantic_digest,
+                        )
+                    ],
                     "capabilities": ["float16", "streaming"],
                     "kubernetes_resource_name": profile.kubernetes.resource_name,
                 }

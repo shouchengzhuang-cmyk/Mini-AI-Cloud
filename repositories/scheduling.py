@@ -18,7 +18,7 @@ from core.enums import (
     TaskStatus,
     WorkerStatus,
 )
-from core.runtime_profiles import RuntimeProfileCatalog
+from core.runtime_profiles import RuntimeProfileCatalog, runtime_profile_binding_id
 from core.state_machine import ensure_transition
 from models.scheduling import (
     GPUDevice,
@@ -496,10 +496,13 @@ class SchedulingRepository:
                     .with_for_update()
                 )
             )
+            binding_id = runtime_profile_binding_id(
+                profile_id=admission.runtime_profile_id,
+                profile_version=admission.runtime_profile_version,
+                semantic_digest=admission.runtime_profile_digest,
+            )
             devices = [
-                device
-                for device in devices
-                if admission.runtime_profile_id in (device.runtime_profile_ids or [])
+                device for device in devices if binding_id in (device.runtime_profile_ids or [])
             ]
             raw_accelerator_request = task.accelerator_request_json
             raw_capabilities = (

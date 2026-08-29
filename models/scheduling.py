@@ -49,6 +49,7 @@ class GPUDevice(Base):
     memory_free_mb: Mapped[int] = mapped_column(Integer)
     compute_capability: Mapped[str | None] = mapped_column(String(32))
     compute_arch: Mapped[str | None] = mapped_column(String(128))
+    # Legacy column name; Kubernetes values are exact profile@version#digest bindings.
     runtime_profile_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     capabilities_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     kubernetes_resource_name: Mapped[str | None] = mapped_column(String(255))

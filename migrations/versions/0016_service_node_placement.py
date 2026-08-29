@@ -68,7 +68,7 @@ def _reject_unrecoverable_legacy_services() -> None:
                 "WHERE logical_model_id IS NOT NULL "
                 "AND runtime_type = 'kubernetes' "
                 "AND (status IN ('pending', 'deploying') "
-                "OR (status = 'failed' AND desired_replicas > 0))) THEN "
+                "OR (status IN ('degraded', 'failed') AND desired_replicas > 0))) THEN "
                 "RAISE EXCEPTION '0016 cannot migrate unrecoverable logical Kubernetes "
                 "services'; "
                 "END IF; END $$"
@@ -91,7 +91,7 @@ def _reject_unrecoverable_legacy_services() -> None:
             sa.or_(
                 services.c.status.in_(_INFLIGHT_SERVICE_STATUSES),
                 sa.and_(
-                    services.c.status == "failed",
+                    services.c.status.in_(("degraded", "failed")),
                     services.c.desired_replicas > 0,
                 ),
             ),
@@ -100,8 +100,8 @@ def _reject_unrecoverable_legacy_services() -> None:
     if count:
         raise RuntimeError(
             "0016 cannot reconstruct immutable node placement for pending, deploying, "
-            "or failed positive-replica logical Kubernetes services; wait for active "
-            "services to stabilize or stop failed services before upgrading"
+            "or degraded/failed positive-replica logical Kubernetes services; wait for "
+            "active services to stabilize or stop degraded/failed services before upgrading"
         )
 
 

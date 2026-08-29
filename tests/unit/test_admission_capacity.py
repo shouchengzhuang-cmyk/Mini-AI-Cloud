@@ -18,7 +18,11 @@ from core.enums import (
     ModelAvailabilityStatus,
     WorkerStatus,
 )
-from core.runtime_profiles import RuntimeProfileCatalog, RuntimeProfileCompatibilityError
+from core.runtime_profiles import (
+    RuntimeProfileCatalog,
+    RuntimeProfileCompatibilityError,
+    runtime_profile_binding_id,
+)
 from models.model_variant import ModelVariant
 from models.service import ReplicaStatus
 from models.usage import ProjectQuota, ProjectQuotaState
@@ -111,10 +115,22 @@ def _device(
     node_name: str,
     index: int,
     profile_id: str,
+    profile_version: str = "2.0.0",
+    profile_digest: str | None = None,
     resource_name: str,
     model: str = "NVIDIA A100",
     capabilities: frozenset[str] = frozenset({"float16", "streaming"}),
 ) -> InventoryDeviceSnapshot:
+    if profile_digest is None:
+        catalog = RuntimeProfileCatalog.from_path(
+            REPOSITORY_ROOT / "runtime_profiles/manifest.json"
+        )
+        entry = next(
+            item
+            for item in catalog.manifest.profiles
+            if item.profile_id == profile_id and item.profile_version == profile_version
+        )
+        profile_digest = entry.semantic_digest
     return InventoryDeviceSnapshot(
         device_id=uuid.uuid4(),
         worker_id=worker_id,
@@ -129,7 +145,13 @@ def _device(
         model=model,
         memory_total_mb=40_960,
         memory_free_mb=40_960,
-        runtime_profile_ids=(profile_id,),
+        runtime_profile_ids=(
+            runtime_profile_binding_id(
+                profile_id=profile_id,
+                profile_version=profile_version,
+                semantic_digest=profile_digest,
+            ),
+        ),
         capabilities=capabilities,
         kubernetes_resource_name=resource_name,
         inventory_generation=1,
@@ -175,6 +197,69 @@ def test_service_tensor_parallel_capacity_is_not_assembled_across_nodes() -> Non
     assert candidates[0].available_capacity == 0
     assert decision.allowed is False
     assert decision.reason == AdmissionRejectionReason.NVIDIA_CAPACITY_UNAVAILABLE
+
+
+def test_service_admission_matches_the_exact_runtime_profile_binding() -> None:
+    catalog, latest_variant, base_request, resource_name = _nvidia_fixture()
+    legacy_entry = next(
+        entry for entry in catalog.manifest.profiles if entry.identity == "nvidia-vllm-k8s@1.0.0"
+    )
+    legacy_variant = ModelVariant(
+        id=uuid.uuid4(),
+        logical_model_id=latest_variant.logical_model_id,
+        name="nvidia-legacy-profile",
+        vendor=latest_variant.vendor,
+        kind=latest_variant.kind,
+        runtime_profile_id=legacy_entry.profile_id,
+        runtime_profile_version=legacy_entry.profile_version,
+        runtime_profile_digest=legacy_entry.semantic_digest,
+        artifact_source=latest_variant.artifact_source,
+        artifact_revision=latest_variant.artifact_revision,
+        artifact_digest=latest_variant.artifact_digest,
+        architecture=latest_variant.architecture,
+        dtype="bfloat16",
+        status=latest_variant.status,
+    )
+    legacy_request = replace(
+        base_request,
+        count=1,
+        model_variant_id=str(legacy_variant.id),
+    )
+    latest_request = replace(base_request, count=1)
+    inventory = [
+        _device(
+            worker_id="legacy-profile-worker",
+            node_name="legacy-profile-node",
+            index=0,
+            profile_id=legacy_entry.profile_id,
+            profile_version=legacy_entry.profile_version,
+            profile_digest=legacy_entry.semantic_digest,
+            resource_name=resource_name,
+            capabilities=frozenset({"bfloat16", "streaming"}),
+        )
+    ]
+
+    legacy_candidates, _ = _service_candidates(
+        variants=[legacy_variant],
+        inventory=inventory,
+        catalog=catalog,
+        quota=_quota_snapshot(),
+        request=legacy_request,
+        desired_replicas=1,
+        requested_dtype="bfloat16",
+    )
+    latest_candidates, _ = _service_candidates(
+        variants=[latest_variant],
+        inventory=inventory,
+        catalog=catalog,
+        quota=_quota_snapshot(),
+        request=latest_request,
+        desired_replicas=1,
+        requested_dtype="float16",
+    )
+
+    assert choose_admission(legacy_request, legacy_candidates).allowed is True
+    assert choose_admission(latest_request, latest_candidates).allowed is False
 
 
 def test_service_replicas_aggregate_same_node_slots_across_homogeneous_nodes() -> None:
@@ -732,6 +817,8 @@ def test_batch_recheck_rejects_mixed_generic_resource_slots(
         kind=AcceleratorKind.GPU,
         model="NVIDIA A100",
         profile_id=variant.runtime_profile_id,
+        profile_version=variant.runtime_profile_version,
+        profile_digest=variant.runtime_profile_digest,
         resource_name=resource_name,
         service_usage=_ServiceAcceleratorUsage(),
         deferred_usage=_DeferredAcceleratorUsage(),
@@ -793,6 +880,8 @@ def test_batch_capacity_keeps_compatibility_and_remaining_on_the_same_node() -> 
         kind=AcceleratorKind.GPU,
         model="NVIDIA A100",
         profile_id=variant.runtime_profile_id,
+        profile_version=variant.runtime_profile_version,
+        profile_digest=variant.runtime_profile_digest,
         resource_name=resource_name,
         service_usage=usage,
         deferred_usage=_DeferredAcceleratorUsage(),
@@ -838,6 +927,8 @@ def test_batch_whole_device_capacity_does_not_double_charge_memory_free() -> Non
         kind=AcceleratorKind.GPU,
         model="NVIDIA A100",
         profile_id=variant.runtime_profile_id,
+        profile_version=variant.runtime_profile_version,
+        profile_digest=variant.runtime_profile_digest,
         resource_name=resource_name,
         service_usage=usage,
         deferred_usage=_DeferredAcceleratorUsage(),
@@ -879,6 +970,8 @@ def test_batch_compatible_node_is_not_poisoned_by_other_incompatible_node() -> N
         kind=AcceleratorKind.GPU,
         model="NVIDIA A100",
         profile_id=variant.runtime_profile_id,
+        profile_version=variant.runtime_profile_version,
+        profile_digest=variant.runtime_profile_digest,
         resource_name=resource_name,
         required_capabilities=required,
     )
@@ -889,6 +982,8 @@ def test_batch_compatible_node_is_not_poisoned_by_other_incompatible_node() -> N
         kind=AcceleratorKind.GPU,
         model="NVIDIA A100",
         profile_id=variant.runtime_profile_id,
+        profile_version=variant.runtime_profile_version,
+        profile_digest=variant.runtime_profile_digest,
         resource_name=resource_name,
         service_usage=_ServiceAcceleratorUsage(),
         deferred_usage=_DeferredAcceleratorUsage(),
