@@ -67,7 +67,7 @@ class ServiceAutoscaler:
         held = 0
         missing = 0
         cooling_down = 0
-        async with self.database.session() as session, session.begin():
+        async with self.database.session() as session:
             candidate_rows = list(
                 (
                     await session.execute(
@@ -81,54 +81,48 @@ class ServiceAutoscaler:
                             ModelService.last_autoscale_checked_at.asc().nullsfirst(),
                             ModelService.id,
                         )
-                        .limit(self.batch_size)
                     )
                 ).all()
             )
-            logical_model_ids = sorted(
-                {
-                    logical_model_id
-                    for _service_id, logical_model_id, runtime_type in candidate_rows
-                    if runtime_type == RuntimeType.KUBERNETES and logical_model_id is not None
-                },
-                key=str,
-            )
-            locked_logical_model_ids = set(
-                await session.scalars(
-                    select(LogicalModel.id)
-                    .where(LogicalModel.id.in_(logical_model_ids))
-                    .order_by(LogicalModel.id)
-                    .with_for_update(skip_locked=True)
-                )
-            )
-            candidate_service_ids = [
-                service_id
-                for service_id, logical_model_id, runtime_type in candidate_rows
-                if runtime_type != RuntimeType.KUBERNETES
-                or logical_model_id is None
-                or logical_model_id in locked_logical_model_ids
-            ]
-            services = list(
-                await session.scalars(
+        for service_id, logical_model_id, runtime_type in candidate_rows:
+            if examined >= self.batch_size:
+                break
+            async with self.database.session() as session, session.begin():
+                if runtime_type == RuntimeType.KUBERNETES and logical_model_id is not None:
+                    locked_logical_model_id = await session.scalar(
+                        select(LogicalModel.id)
+                        .where(LogicalModel.id == logical_model_id)
+                        .with_for_update(skip_locked=True)
+                    )
+                    if locked_logical_model_id is None:
+                        continue
+                service = await session.scalar(
                     select(ModelService)
                     .where(
-                        ModelService.id.in_(candidate_service_ids),
+                        ModelService.id == service_id,
                         ModelService.autoscaling_enabled.is_(True),
-                    )
-                    .order_by(
-                        ModelService.last_autoscale_checked_at.asc().nullsfirst(),
-                        ModelService.id,
                     )
                     .with_for_update(skip_locked=True)
                 )
-            )
-            # Logical models are locked in stable order before their candidate
-            # services, matching gateway routing. Lock project quota rows next
-            # in stable order before applying per-service deltas.
-            for project_id in sorted({service.project_id for service in services}, key=str):
-                await QuotaRepository.get_locked(session, project_id=project_id)
-            now = await database_utcnow(session)
-            for service in services:
+                if service is None:
+                    continue
+                expected_logical_model_id = (
+                    logical_model_id if runtime_type == RuntimeType.KUBERNETES else None
+                )
+                actual_logical_model_id = (
+                    service.logical_model_id
+                    if service.runtime_type == RuntimeType.KUBERNETES
+                    else None
+                )
+                if actual_logical_model_id != expected_logical_model_id:
+                    # The admission identity is immutable through public APIs. If a
+                    # direct database mutation races the unlocked scan, retry it on a
+                    # later pass after acquiring the correct logical-model lock.
+                    continue
+                # Preserve the shared lock order used by gateway routing and scale:
+                # logical model -> service -> project quota.
+                await QuotaRepository.get_locked(session, project_id=service.project_id)
+                now = await database_utcnow(session)
                 examined += 1
                 service.last_autoscale_checked_at = now
                 load = await self.metrics.snapshot(service.id)
