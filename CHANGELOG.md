@@ -6,6 +6,29 @@
 
 暂无。
 
+## [0.5.0] - 2026-08-29
+
+### Added
+
+- 厂商中立 accelerator 请求、持久化与 allocation-authority 合同，以及可插拔 NVIDIA、Huawei Ascend、Kubernetes inventory providers。
+- 不可变 Runtime Profile、logical model / physical variant、NVIDIA vLLM 与 Huawei Ascend A2 profile 和验收记录。
+- accelerator-aware Kubernetes serving renderer、vendor-aware admission/quota/fencing，以及 strict、preferred、balanced 双厂商路由、fallback、circuit 和物理用量归因。
+- NVIDIA + Huawei Ascend 双后端 benchmark harness，覆盖 buffered/SSE、语义校验、TTFT 和独立 fallback drill 阶段。
+- A1–A11、post-A11 correctness hardening、benchmark review fixes 与开放堆叠 PR #20–#27 的机器可检覆盖表。
+
+### Changed
+
+- Kubernetes inventory 绑定 Runtime Profile hardware family、taints/tolerations，并按 scheduler 语义扣除外部 Pod requests。
+- 服务准入、扩缩容、reconcile、worker heartbeat、gateway 并发与 migration upgrade 改为 fail-closed，补充稳定锁顺序、placement snapshot 和隔离 PostgreSQL 回归。
+- benchmark 的 SSE TTFT 只从首个非空 content delta 起算；exact prompt 比较完整归一化响应；fallback drill 与 baseline 测量分阶段执行。
+
+### Evidence boundary
+
+- Runtime Profile、静态验证、模拟 fixture、PostgreSQL/Redis integration 与单节点 Kind 路径已具备仓库内证据；其结论不得外推为生产 HA 或多物理节点能力。
+- 真实 NVIDIA 与真实 Huawei Ascend 硬件均为 `REAL_HW_NOT_RUN`，不声明真实吞吐、延迟、语义等价或故障切换表现。
+- 不声明 universal hardware compatibility、SLA、production-ready cloud 或完整 Kubernetes-native platform 支持。
+- 该条目只准备 v0.5.0；合并 `main`、tag、GitHub Release 与任何部署仍需各自的明确授权和精确 SHA 门禁。
+
 ## [0.4.0] - 2026-08-26
 
 ### Added

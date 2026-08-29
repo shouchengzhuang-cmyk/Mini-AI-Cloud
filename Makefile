@@ -180,12 +180,12 @@ test-dr: ## Run isolated destructive DR rehearsal; requires CONFIRM_DR=YES.
 	@test "$(CONFIRM_DR)" = "YES" || { echo "CONFIRM_DR=YES is required" >&2; exit 2; }
 	$(UV) run python scripts/dr_rehearsal.py
 
-test-release: release-validate lint typecheck validate-evidence config ## Run the v0.4.0 release gate.
+test-release: release-validate lint typecheck validate-evidence config ## Run the v0.5.0 release gate.
 	$(UV) run pytest
 	$(UV) build --wheel --out-dir $(RELEASE_WHEEL_DIR)
 	$(UV) run python scripts/release_gate.py wheel-smoke --dist-dir $(RELEASE_WHEEL_DIR)
 	docker build --file docker/Dockerfile --tag $(RELEASE_IMAGE) .
-	docker run --rm $(RELEASE_IMAGE) python -c "import importlib.metadata; assert importlib.metadata.version('mini-ai-cloud') == '0.4.0'"
+	docker run --rm $(RELEASE_IMAGE) python -c "import importlib.metadata; assert importlib.metadata.version('mini-ai-cloud') == '0.5.0'"
 	bash -ec 'trap "bash scripts/kind_serving.sh down" EXIT; bash scripts/kind_serving.sh up; bash scripts/kind_serving.sh test'
 	$(UV) run mini-cloud evidence collect
 	$(UV) run python scripts/release_gate.py prepare

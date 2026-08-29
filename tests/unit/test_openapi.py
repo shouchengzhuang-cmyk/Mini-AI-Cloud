@@ -70,4 +70,4 @@ def test_package_name_and_version_match_runtime_identity() -> None:
     metadata = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]
 
     assert metadata["name"] == PROJECT_NAME == "mini-ai-cloud"
-    assert metadata["version"] == PROJECT_VERSION == DEVELOPMENT_VERSION == "0.4.0"
+    assert metadata["version"] == PROJECT_VERSION == DEVELOPMENT_VERSION == "0.5.0"

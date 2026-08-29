@@ -79,6 +79,46 @@ class Claim(BaseModel):
     known_limitations: list[str] = Field(min_length=1)
 
 
+class CoverageProof(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["code", "test", "migration", "profile", "evidence", "document"]
+    path: str = Field(min_length=1)
+    note: str = Field(min_length=1)
+
+
+class CoverageArea(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=r"^(?:A(?:[1-9]|1[01])|post-a11-hardening|benchmark-review-fixes)$")
+    title: str = Field(min_length=1)
+    status: Literal["fully-represented", "partially-represented", "missing"]
+    proofs: list[CoverageProof] = Field(min_length=1)
+    limitations: list[str] = Field(min_length=1)
+
+
+class StackedPullRequestCoverage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    number: int = Field(ge=20, le=27)
+    area_ids: list[str] = Field(min_length=1)
+    source_head: str = Field(pattern=r"^[0-9a-f]{40}$")
+    integration: Literal["literal-ancestor", "semantic-integration"]
+    classification: Literal["fully-represented", "partially-represented", "missing"]
+    rationale: str = Field(min_length=1)
+
+
+class M6ReleaseCoverage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: str = Field(pattern=r"^1\.\d+\.\d+$")
+    canonical_m6_head: str = Field(pattern=r"^[0-9a-f]{40}$")
+    main_baseline: str = Field(pattern=r"^[0-9a-f]{40}$")
+    real_hardware_status: Literal["REAL_HW_NOT_RUN"]
+    areas: list[CoverageArea] = Field(min_length=1)
+    stacked_pull_requests: list[StackedPullRequestCoverage] = Field(min_length=1)
+
+
 class EvidenceContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -90,6 +130,17 @@ class EvidenceContract(BaseModel):
 
 class ContractValidationError(ValueError):
     pass
+
+
+REQUIRED_M6_AREAS = {
+    *(f"A{index}" for index in range(1, 12)),
+    "post-a11-hardening",
+    "benchmark-review-fixes",
+}
+REQUIRED_MIGRATION_AREAS = {"A2", "A5", "A9", "A10", "post-a11-hardening"}
+REQUIRED_PROFILE_AREAS = {"A4", "A7", "A8"}
+REQUIRED_EVIDENCE_AREAS = {"A7", "A8", "A11", "benchmark-review-fixes"}
+REQUIRED_STACKED_PULL_REQUESTS = set(range(20, 28))
 
 
 def _load_yaml(path: Path, key: str) -> list[dict[str, object]]:
@@ -109,6 +160,11 @@ def load_contract(repository_root: Path) -> EvidenceContract:
             "claims": _load_yaml(evidence_root / "claims.yaml", "claims"),
         }
     )
+
+
+def load_m6_release_coverage(repository_root: Path) -> M6ReleaseCoverage:
+    path = repository_root / "evidence" / "m6-release-coverage.json"
+    return M6ReleaseCoverage.model_validate_json(path.read_text(encoding="utf-8"))
 
 
 def _duplicates(values: list[str]) -> list[str]:
@@ -189,6 +245,68 @@ def validate_contract(contract: EvidenceContract, repository_root: Path) -> None
         raise ContractValidationError("\n".join(errors))
 
 
+def validate_m6_release_coverage(
+    coverage: M6ReleaseCoverage,
+    repository_root: Path,
+) -> None:
+    errors: list[str] = []
+    area_ids = [area.id for area in coverage.areas]
+    if duplicates := _duplicates(area_ids):
+        errors.append(f"duplicate M6 coverage area ids: {', '.join(duplicates)}")
+    missing_areas = sorted(REQUIRED_M6_AREAS - set(area_ids))
+    unexpected_areas = sorted(set(area_ids) - REQUIRED_M6_AREAS)
+    if missing_areas:
+        errors.append(f"missing M6 coverage areas: {', '.join(missing_areas)}")
+    if unexpected_areas:
+        errors.append(f"unexpected M6 coverage areas: {', '.join(unexpected_areas)}")
+
+    for area in coverage.areas:
+        if area.status != "fully-represented":
+            errors.append(f"{area.id}: release candidate coverage is {area.status}")
+        proof_kinds = {proof.kind for proof in area.proofs}
+        for required_kind in ("code", "test"):
+            if required_kind not in proof_kinds:
+                errors.append(f"{area.id}: missing {required_kind} proof")
+        if area.id in REQUIRED_MIGRATION_AREAS and "migration" not in proof_kinds:
+            errors.append(f"{area.id}: missing migration proof")
+        if area.id in REQUIRED_PROFILE_AREAS and "profile" not in proof_kinds:
+            errors.append(f"{area.id}: missing profile proof")
+        if area.id in REQUIRED_EVIDENCE_AREAS and "evidence" not in proof_kinds:
+            errors.append(f"{area.id}: missing evidence-boundary proof")
+        for proof in area.proofs:
+            if not (repository_root / proof.path).exists():
+                errors.append(f"{area.id}: missing {proof.kind} proof path: {proof.path}")
+
+    pull_request_numbers = [item.number for item in coverage.stacked_pull_requests]
+    if duplicates := _duplicates([str(number) for number in pull_request_numbers]):
+        errors.append(f"duplicate stacked PR coverage: {', '.join(duplicates)}")
+    missing_pull_requests = sorted(REQUIRED_STACKED_PULL_REQUESTS - set(pull_request_numbers))
+    unexpected_pull_requests = sorted(set(pull_request_numbers) - REQUIRED_STACKED_PULL_REQUESTS)
+    if missing_pull_requests:
+        errors.append(
+            "missing stacked PR coverage: "
+            + ", ".join(f"#{number}" for number in missing_pull_requests)
+        )
+    if unexpected_pull_requests:
+        errors.append(
+            "unexpected stacked PR coverage: "
+            + ", ".join(f"#{number}" for number in unexpected_pull_requests)
+        )
+    known_areas = set(area_ids)
+    for pull_request in coverage.stacked_pull_requests:
+        if pull_request.classification != "fully-represented":
+            errors.append(
+                f"PR #{pull_request.number}: release candidate coverage is "
+                f"{pull_request.classification}"
+            )
+        unknown_areas = sorted(set(pull_request.area_ids) - known_areas)
+        if unknown_areas:
+            errors.append(f"PR #{pull_request.number}: unknown areas: {', '.join(unknown_areas)}")
+
+    if errors:
+        raise ContractValidationError("\n".join(errors))
+
+
 def generated_schema() -> dict[str, object]:
     return EvidenceContract.model_json_schema()
 
@@ -223,24 +341,94 @@ def render_matrix(contract: EvidenceContract) -> str:
     return "\n".join(lines)
 
 
-def validate_generated_files(contract: EvidenceContract, repository_root: Path) -> None:
+def render_m6_release_coverage(coverage: M6ReleaseCoverage) -> str:
+    lines = [
+        "# M6 release coverage",
+        "",
+        "> Generated from `evidence/m6-release-coverage.json`.",
+        "> Run `uv run python scripts/validate_evidence.py --write-generated` to update.",
+        "",
+        f"- Canonical M6 head: `{coverage.canonical_m6_head}`",
+        f"- Main baseline: `{coverage.main_baseline}`",
+        f"- Real hardware status: `{coverage.real_hardware_status}`",
+        "",
+        "## A1-A11 and closure coverage",
+        "",
+        "| Area | Status | Proofs | Limitations |",
+        "|---|---|---|---|",
+    ]
+    for area in coverage.areas:
+        proofs = "<br>".join(
+            f"`{proof.kind}`: `{proof.path}` — {proof.note}" for proof in area.proofs
+        )
+        limitations = "<br>".join(area.limitations)
+        lines.append(f"| `{area.id}` {area.title} | `{area.status}` | {proofs} | {limitations} |")
+    lines.extend(
+        [
+            "",
+            "## Open stacked PR disposition",
+            "",
+            "| PR | Areas | Integration | Classification | Rationale |",
+            "|---|---|---|---|---|",
+        ]
+    )
+    for pull_request in coverage.stacked_pull_requests:
+        lines.append(
+            f"| #{pull_request.number} | {', '.join(pull_request.area_ids)} | "
+            f"`{pull_request.integration}` | `{pull_request.classification}` | "
+            f"{pull_request.rationale} Source head: `{pull_request.source_head}`. |"
+        )
+    lines.extend(
+        [
+            "",
+            "`fully-represented` is based on final code, tests, migrations, profiles, and "
+            "evidence semantics. Literal ancestry alone is not accepted as proof.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def validate_generated_files(
+    contract: EvidenceContract,
+    repository_root: Path,
+    coverage: M6ReleaseCoverage | None = None,
+) -> None:
+    coverage = coverage or load_m6_release_coverage(repository_root)
     expected_schema = json.dumps(generated_schema(), indent=2, sort_keys=True) + "\n"
     expected_matrix = render_matrix(contract)
+    expected_coverage = render_m6_release_coverage(coverage)
     actual_schema = (repository_root / "evidence" / "schema.json").read_text(encoding="utf-8")
     actual_matrix = (repository_root / "evidence" / "matrix.md").read_text(encoding="utf-8")
+    actual_coverage = (repository_root / "docs" / "m6-release-coverage.md").read_text(
+        encoding="utf-8"
+    )
     if actual_schema != expected_schema:
         raise ContractValidationError("evidence/schema.json is stale; run with --write-generated")
     if actual_matrix != expected_matrix:
         raise ContractValidationError("evidence/matrix.md is stale; run with --write-generated")
+    if actual_coverage != expected_coverage:
+        raise ContractValidationError(
+            "docs/m6-release-coverage.md is stale; run with --write-generated"
+        )
 
 
-def write_generated_files(contract: EvidenceContract, repository_root: Path) -> None:
+def write_generated_files(
+    contract: EvidenceContract,
+    repository_root: Path,
+    coverage: M6ReleaseCoverage | None = None,
+) -> None:
+    coverage = coverage or load_m6_release_coverage(repository_root)
     evidence_root = repository_root / "evidence"
     (evidence_root / "schema.json").write_text(
         json.dumps(generated_schema(), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     (evidence_root / "matrix.md").write_text(render_matrix(contract), encoding="utf-8")
+    (repository_root / "docs" / "m6-release-coverage.md").write_text(
+        render_m6_release_coverage(coverage),
+        encoding="utf-8",
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -251,13 +439,16 @@ def main(argv: list[str] | None = None) -> None:
 
     repository_root = args.root.resolve()
     contract = load_contract(repository_root)
+    coverage = load_m6_release_coverage(repository_root)
     validate_contract(contract, repository_root)
+    validate_m6_release_coverage(coverage, repository_root)
     if args.write_generated:
-        write_generated_files(contract, repository_root)
-    validate_generated_files(contract, repository_root)
+        write_generated_files(contract, repository_root, coverage)
+    validate_generated_files(contract, repository_root, coverage)
     print(
         f"Validated {len(contract.claims)} claims, {len(contract.invariants)} invariants, "
-        f"and {len(contract.environments)} environments."
+        f"{len(contract.environments)} environments, {len(coverage.areas)} M6 areas, "
+        f"and {len(coverage.stacked_pull_requests)} stacked PRs."
     )
 
 
