@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 from collections.abc import AsyncIterator, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -28,10 +29,54 @@ RUNTIME_LABEL = "mini-ai-cloud/runtime"
 POD_RESOURCE_KIND = "serving-pod"
 SERVICE_RESOURCE_KIND = "serving-service"
 HEADLESS_SERVICE_NAME = "mini-ai-cloud-serving-pods"
+DEFAULT_CONTROLLER_DEPLOYMENT = "mini-ai-cloud-api"
+DEFAULT_IMAGE_POLICY_REPOSITORY = "library/mini-ai-cloud"
+DEFAULT_IMAGE_POLICY_TAG = "kind-serving-v4a"
+BAD_IMAGE_REPOSITORY = "invalid.local/mini-ai-cloud/missing"
 
 
 class KindServingE2EError(RuntimeError):
     """One mandatory Kind serving assertion failed."""
+
+
+@dataclass(frozen=True, slots=True)
+class KindServingEnvironment:
+    base_url: str
+    kubeconfig: Path
+    controller_namespace: str
+    workload_namespace: str
+    controller_deployment: str
+    image: str
+    image_policy_repository: str
+    image_policy_tag: str
+    bootstrap_token: str
+    user_password: str
+    api_key_file: Path
+
+    @classmethod
+    def from_process_environment(cls) -> KindServingEnvironment:
+        controller_namespace = _required_env("KIND_SERVING_NAMESPACE")
+        return cls(
+            base_url=_required_env("KIND_SERVING_BASE_URL"),
+            kubeconfig=_resolved_path(_required_env("KIND_SERVING_KUBECONFIG")),
+            controller_namespace=controller_namespace,
+            workload_namespace=_env_or_default(
+                "KIND_SERVING_WORKLOAD_NAMESPACE", controller_namespace
+            ),
+            controller_deployment=_env_or_default(
+                "KIND_SERVING_CONTROLLER_DEPLOYMENT", DEFAULT_CONTROLLER_DEPLOYMENT
+            ),
+            image=_required_env("KIND_SERVING_APP_IMAGE"),
+            image_policy_repository=_env_or_default(
+                "KIND_SERVING_IMAGE_POLICY_REPOSITORY", DEFAULT_IMAGE_POLICY_REPOSITORY
+            ),
+            image_policy_tag=_env_or_default(
+                "KIND_SERVING_IMAGE_POLICY_TAG", DEFAULT_IMAGE_POLICY_TAG
+            ),
+            bootstrap_token=_required_env("KIND_SERVING_BOOTSTRAP_TOKEN"),
+            user_password=_required_env("KIND_SERVING_USER_PASSWORD"),
+            api_key_file=_resolved_path(_required_env("KIND_SERVING_API_KEY_FILE")),
+        )
 
 
 class API:
@@ -106,9 +151,18 @@ class API:
 
 
 class Kubectl:
-    def __init__(self, kubeconfig: Path, namespace: str) -> None:
+    def __init__(
+        self,
+        kubeconfig: Path,
+        namespace: str,
+        *,
+        controller_namespace: str | None = None,
+        controller_deployment: str = DEFAULT_CONTROLLER_DEPLOYMENT,
+    ) -> None:
         self.kubeconfig = kubeconfig
         self.namespace = namespace
+        self.controller_namespace = controller_namespace or namespace
+        self.controller_deployment = controller_deployment
 
     def run(self, *arguments: str, timeout: float = 120.0) -> str:
         command = ["kubectl", "--kubeconfig", str(self.kubeconfig), *arguments]
@@ -167,19 +221,20 @@ class Kubectl:
         self.run("-n", self.namespace, "delete", "pod", name, "--wait=true", timeout=90)
 
     def restart_controller(self) -> None:
+        deployment = f"deployment/{self.controller_deployment}"
         self.run(
             "-n",
-            self.namespace,
+            self.controller_namespace,
             "rollout",
             "restart",
-            "deployment/mini-ai-cloud-api",
+            deployment,
         )
         self.run(
             "-n",
-            self.namespace,
+            self.controller_namespace,
             "rollout",
             "status",
-            "deployment/mini-ai-cloud-api",
+            deployment,
             "--timeout=180s",
             timeout=190,
         )
@@ -202,30 +257,43 @@ async def wait_ready(base_url: str, timeout_seconds: float) -> None:
 
 
 async def run_e2e_from_environment() -> None:
-    base_url = _required_env("KIND_SERVING_BASE_URL")
-    kubeconfig = _resolved_path(_required_env("KIND_SERVING_KUBECONFIG"))
-    namespace = _required_env("KIND_SERVING_NAMESPACE")
-    image = _required_env("KIND_SERVING_APP_IMAGE")
-    bootstrap_token = _required_env("KIND_SERVING_BOOTSTRAP_TOKEN")
-    user_password = _required_env("KIND_SERVING_USER_PASSWORD")
-    api_key_file = _resolved_path(_required_env("KIND_SERVING_API_KEY_FILE"))
-    if not _is_file(kubeconfig):
-        raise KindServingE2EError(f"isolated kubeconfig does not exist: {kubeconfig}")
-    if image.endswith(":latest"):
+    environment = KindServingEnvironment.from_process_environment()
+    if not _is_file(environment.kubeconfig):
+        raise KindServingE2EError(f"isolated kubeconfig does not exist: {environment.kubeconfig}")
+    if environment.image.endswith(":latest"):
         raise KindServingE2EError("Kind serving E2E refuses a latest-tagged image")
 
-    await wait_ready(base_url, 60)
-    api = API(base_url, sensitive_values=(bootstrap_token, user_password))
-    kube = Kubectl(kubeconfig, namespace)
+    await wait_ready(environment.base_url, 60)
+    api = API(
+        environment.base_url,
+        sensitive_values=(environment.bootstrap_token, environment.user_password),
+    )
+    kube = Kubectl(
+        environment.kubeconfig,
+        environment.workload_namespace,
+        controller_namespace=environment.controller_namespace,
+        controller_deployment=environment.controller_deployment,
+    )
     try:
         project_id = await _authenticate(
             api,
-            bootstrap_token=bootstrap_token,
-            user_password=user_password,
-            api_key_file=api_key_file,
+            bootstrap_token=environment.bootstrap_token,
+            user_password=environment.user_password,
+            api_key_file=environment.api_key_file,
         )
-        await _configure_kind_image_policy(api, project_id)
-        await _run_serving_scenario(api, kube, project_id=project_id, image=image)
+        await _configure_kind_image_policy(
+            api,
+            project_id,
+            repository=environment.image_policy_repository,
+            tag=environment.image_policy_tag,
+        )
+        await _run_serving_scenario(
+            api,
+            kube,
+            project_id=project_id,
+            image=environment.image,
+            bad_image_tag=environment.image_policy_tag,
+        )
     finally:
         await api.close()
 
@@ -278,7 +346,13 @@ async def _authenticate(
     return project_id
 
 
-async def _configure_kind_image_policy(api: API, project_id: str) -> None:
+async def _configure_kind_image_policy(
+    api: API,
+    project_id: str,
+    *,
+    repository: str,
+    tag: str,
+) -> None:
     await api.json(
         "PUT",
         f"/api/v1/projects/{project_id}/image-policy",
@@ -289,15 +363,15 @@ async def _configure_kind_image_policy(api: API, project_id: str) -> None:
                 {
                     "action": "allow",
                     "registry": "docker.io",
-                    "repository_glob": "library/mini-ai-cloud",
-                    "tag_glob": "kind-serving-v4a",
+                    "repository_glob": repository,
+                    "tag_glob": tag,
                     "priority": 10,
                 },
                 {
                     "action": "allow",
                     "registry": "invalid.local",
                     "repository_glob": "mini-ai-cloud/missing",
-                    "tag_glob": "kind-serving-v4a",
+                    "tag_glob": tag,
                     "priority": 20,
                 },
             ],
@@ -312,6 +386,7 @@ async def _run_serving_scenario(
     *,
     project_id: str,
     image: str,
+    bad_image_tag: str,
 ) -> None:
     suffix = secrets.token_hex(4)
     service_ids: list[str] = []
@@ -488,6 +563,7 @@ async def _run_serving_scenario(
             model_id=model_id,
             suffix=suffix,
             created_service_ids=service_ids,
+            image_tag=bad_image_tag,
         )
         if bad_service_id not in service_ids:  # Defensive: helper records before assertions.
             service_ids.append(bad_service_id)
@@ -748,6 +824,7 @@ async def _assert_bad_image_backoff(
     model_id: str,
     suffix: str,
     created_service_ids: list[str],
+    image_tag: str,
 ) -> str:
     service = await api.json(
         "POST",
@@ -757,7 +834,7 @@ async def _assert_bad_image_backoff(
             "registered_model_id": model_id,
             "runtime": "fake",
             "runtime_type": "kubernetes",
-            "image": "invalid.local/mini-ai-cloud/missing:kind-serving-v4a",
+            "image": _bad_image_reference(image_tag),
             "cpu_millicores": 50,
             "memory_mb": 64,
             "gpu_count": 0,
@@ -1152,6 +1229,15 @@ def _required_env(name: str) -> str:
     if not value:
         raise KindServingE2EError(f"NOT RUN: required environment variable {name} is missing")
     return value
+
+
+def _env_or_default(name: str, default: str) -> str:
+    value = os.getenv(name)
+    return value.strip() if value is not None and value.strip() else default
+
+
+def _bad_image_reference(tag: str) -> str:
+    return f"{BAD_IMAGE_REPOSITORY}:{tag}"
 
 
 def _redact(value: str, sensitive_values: Sequence[str]) -> str:

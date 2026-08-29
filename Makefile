@@ -17,6 +17,9 @@ BACKUP_OUTPUT_DIR ?= build/backups
 RELEASE_IMAGE ?= mini-ai-cloud:release-gate
 RELEASE_WHEEL_DIR ?= build/release-wheel
 DUAL_BACKEND_OUTPUT ?= build/dual-backend-report.json
+P4_EVIDENCE_ROOT ?= build/kind-evidence
+P4_POSTGRES_IMAGE ?= docker.io/library/postgres@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+P4_REDIS_IMAGE ?= docker.io/library/redis@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
 
 .PHONY: help install format lint typecheck validate-evidence evidence test test-unit test-integration test-docker \
 	test-e2e test-serving check config build up down ps logs migrate migrate-local run-api run-worker \
@@ -24,7 +27,8 @@ DUAL_BACKEND_OUTPUT ?= build/dual-backend-report.json
 	test-kind-serving kind-serving-down demo-fencing demo-adoption demo-sse-drain demo-all \
 	test-nvidia-fake-device-plugin validate-ascend-runtime \
 	test-dr test-soak test-release release-validate benchmark benchmark-dual-backend backup restore \
-	test-helm-render test-kind-helm
+	test-helm-render test-kind-helm test-kind-kubernetes-adaptation test-kind-batch-job \
+	test-kind-upgrade-smoke test-kind-cleanup test-evidence-secret-scan
 
 help: ## Show available targets.
 	@awk 'BEGIN {FS = ":.*## "; printf "Usage: make <target>\n\n"} \
@@ -136,6 +140,27 @@ test-kind-helm: ## Build and run the isolated Helm install/uninstall smoke; requ
 	RUN_ID="$(RUN_ID)" HELM_BIN="$(HELM)" KIND_BIN="$(KIND)" \
 		KUBECTL_BIN="$(KUBECTL)" DOCKER_BIN="$(DOCKER)" \
 		KIND_HELM_IMAGE="$(KIND_HELM_IMAGE)" bash scripts/helm_kind_smoke.sh
+
+test-kind-kubernetes-adaptation: ## Run the complete isolated P4 Kind evidence harness.
+	$(UV) run python scripts/kind_kubernetes_adaptation.py run \
+		--evidence-root "$(P4_EVIDENCE_ROOT)" \
+		--helm "$(HELM)" --kind "$(KIND)" --kubectl "$(KUBECTL)" \
+		--docker "$(DOCKER)" --uv "$(UV)" \
+		--postgres-image "$(P4_POSTGRES_IMAGE)" --redis-image "$(P4_REDIS_IMAGE)"
+
+test-kind-batch-job: test-kind-kubernetes-adaptation ## Run full P4; PASS includes real batch Jobs.
+	@:
+
+test-kind-upgrade-smoke: test-kind-kubernetes-adaptation ## Run full P4; PASS includes upgrade UID checks.
+	@:
+
+test-kind-cleanup: test-kind-kubernetes-adaptation ## Run full P4; PASS includes bounded cleanup.
+	@:
+
+test-evidence-secret-scan: ## Validate an explicit completed P4 bundle; never treats NOT_RUN as PASS.
+	@test -n "$(P4_EVIDENCE_BUNDLE)" || { echo "P4_EVIDENCE_BUNDLE=<bundle-dir> is required" >&2; exit 2; }
+	$(UV) run python scripts/kind_kubernetes_adaptation.py verify-bundle \
+		--bundle "$(P4_EVIDENCE_BUNDLE)"
 
 kind-up: ## Create the isolated Kind cluster used for local runtime testing.
 	$(KIND) create cluster --name $(KIND_CLUSTER_NAME)
