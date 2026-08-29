@@ -195,7 +195,15 @@ def test_openai_gateway_request_allows_passthrough_options_but_keeps_routing_str
     assert upstream["model"] == "org/model"
     assert upstream["temperature"] == 0.2
 
+    public_payload = OpenAIProxyRequest.model_validate(
+        {"model": "Public Logical Chat", "stream": False}
+    )
+    assert public_payload.model == "Public Logical Chat"
+    assert OpenAIProxyRequest.model_validate({"model": "m" * 255}).model == "m" * 255
+
     with pytest.raises(ValidationError):
-        OpenAIProxyRequest.model_validate({"model": "bad model", "stream": False})
+        OpenAIProxyRequest.model_validate({"model": "bad\nmodel", "stream": False})
+    with pytest.raises(ValidationError):
+        OpenAIProxyRequest.model_validate({"model": "m" * 256, "stream": False})
     with pytest.raises(ValidationError):
         OpenAIProxyRequest.model_validate({"model": "chat-main", "stream": 1})

@@ -1656,6 +1656,17 @@
           "title": "GPUUsageResponse",
           "type": "object"
         },
+        "GatewayRoutingPolicy": {
+          "enum": [
+            "strict-nvidia",
+            "strict-ascend",
+            "prefer-nvidia",
+            "prefer-ascend",
+            "balanced"
+          ],
+          "title": "GatewayRoutingPolicy",
+          "type": "string"
+        },
         "HTTPValidationError": {
           "properties": {
             "detail": {
@@ -2157,6 +2168,10 @@
               "minLength": 1,
               "title": "Public Name",
               "type": "string"
+            },
+            "routing_policy": {
+              "$ref": "#/components/schemas/GatewayRoutingPolicy",
+              "default": "balanced"
             }
           },
           "required": [
@@ -2241,6 +2256,9 @@
               "title": "Public Name",
               "type": "string"
             },
+            "routing_policy": {
+              "$ref": "#/components/schemas/GatewayRoutingPolicy"
+            },
             "status": {
               "$ref": "#/components/schemas/ModelAvailabilityStatus"
             },
@@ -2262,6 +2280,7 @@
             "public_name",
             "description",
             "status",
+            "routing_policy",
             "metadata",
             "created_by_user_id",
             "created_at",
@@ -2269,6 +2288,19 @@
             "version"
           ],
           "title": "LogicalModelResponse",
+          "type": "object"
+        },
+        "LogicalModelRoutingPolicyUpdate": {
+          "additionalProperties": false,
+          "properties": {
+            "routing_policy": {
+              "$ref": "#/components/schemas/GatewayRoutingPolicy"
+            }
+          },
+          "required": [
+            "routing_policy"
+          ],
+          "title": "LogicalModelRoutingPolicyUpdate",
           "type": "object"
         },
         "LogicalModelStatusEventResponse": {
@@ -2905,7 +2937,7 @@
           "description": "The stable routing fields plus passthrough OpenAI request options.",
           "properties": {
             "model": {
-              "maxLength": 128,
+              "maxLength": 255,
               "minLength": 1,
               "title": "Model",
               "type": "string"
@@ -4795,6 +4827,17 @@
                 }
               ]
             },
+            "assigned_node_name": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Assigned Node Name"
+            },
             "container_started_at": {
               "anyOf": [
                 {
@@ -4835,6 +4878,20 @@
                 }
               ],
               "title": "Drain Started At"
+            },
+            "eligible_node_names": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Eligible Node Names"
             },
             "endpoint_url": {
               "anyOf": [
@@ -5143,6 +5200,8 @@
             "allocation_authority",
             "accelerator_resource_name",
             "selection_policy",
+            "eligible_node_names",
+            "assigned_node_name",
             "model_revision",
             "image_digest",
             "error_code",
@@ -5218,6 +5277,20 @@
               ],
               "title": "Dtype",
               "type": "string"
+            },
+            "eligible_node_names": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Eligible Node Names"
             },
             "error_message": {
               "anyOf": [
@@ -5525,6 +5598,7 @@
             "allocation_authority",
             "accelerator_resource_name",
             "selection_policy",
+            "eligible_node_names",
             "tensor_parallel_size",
             "dtype",
             "gpu_memory_utilization",
@@ -16323,6 +16397,231 @@
             }
           ],
           "summary": "Get Logical Model",
+          "tags": [
+            "model-variants"
+          ]
+        }
+      },
+      "/api/v1/projects/{project_id}/logical-models/{logical_model_id}/routing-policy": {
+        "put": {
+          "description": "Set Logical Model Routing Policy",
+          "operationId": "set_logical_model_routing_policy_api_v1_projects__project_id__logical_models__logical_model_id__routing_policy_put",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "project_id",
+              "required": true,
+              "schema": {
+                "format": "uuid",
+                "title": "Project Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "logical_model_id",
+              "required": true,
+              "schema": {
+                "format": "uuid",
+                "title": "Logical Model Id",
+                "type": "string"
+              }
+            }
+          ],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogicalModelRoutingPolicyUpdate"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/LogicalModelResponse"
+                  }
+                }
+              },
+              "description": "Successful Response"
+            },
+            "400": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Malformed or unsupported request"
+            },
+            "401": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Authentication required"
+            },
+            "403": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Insufficient permission"
+            },
+            "404": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Resource not found in the authenticated scope"
+            },
+            "409": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "State or idempotency conflict"
+            },
+            "413": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Request body exceeds the configured limit"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            },
+            "429": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Rate limit exceeded"
+            },
+            "500": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Unexpected server error"
+            },
+            "503": {
+              "content": {
+                "application/json": {
+                  "example": {
+                    "error": {
+                      "code": "RESOURCE_NOT_FOUND",
+                      "message": "Resource not found",
+                      "request_id": "018f6f32-babc-7d00-8000-000000000001"
+                    }
+                  },
+                  "schema": {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                }
+              },
+              "description": "Required backend is unavailable"
+            }
+          },
+          "security": [
+            {
+              "BearerApiKey": []
+            },
+            {
+              "ApiKeyHeader": []
+            }
+          ],
+          "summary": "Set Logical Model Routing Policy",
           "tags": [
             "model-variants"
           ]

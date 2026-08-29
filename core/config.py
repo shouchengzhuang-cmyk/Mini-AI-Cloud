@@ -77,6 +77,7 @@ class Settings(BaseSettings):
     worker_labels: Labels = Field(default_factory=lambda: {"runtime": "docker", "region": "local"})
     worker_runtime_types: str = "docker"
     worker_node_name: str | None = None
+    accelerator_inventory_providers: str = "nvidia-smi"
     fake_gpu_count: int = Field(default=0, ge=0, le=64)
     fake_gpu_model: str = "FAKE-A100"
     fake_gpu_memory_mb: int = Field(default=40_960, ge=1)
@@ -246,6 +247,26 @@ class Settings(BaseSettings):
             raise ValueError("Kubernetes fake serving must remain disabled in production")
         if self.fake_gpu_count and self.app_env == "production":
             raise ValueError("FAKE_GPU_COUNT must be zero in production")
+        inventory_providers = tuple(
+            name.strip() for name in self.accelerator_inventory_providers.split(",") if name.strip()
+        )
+        allowed_inventory_providers = {
+            "nvidia-smi",
+            "ascend-npu-smi",
+            "kubernetes-node",
+            "fake",
+            "none",
+        }
+        if not inventory_providers or not set(inventory_providers) <= allowed_inventory_providers:
+            raise ValueError("ACCELERATOR_INVENTORY_PROVIDERS contains an unsupported provider")
+        if len(inventory_providers) != len(set(inventory_providers)):
+            raise ValueError("ACCELERATOR_INVENTORY_PROVIDERS must not contain duplicates")
+        if ({"fake", "none"} & set(inventory_providers)) and len(inventory_providers) != 1:
+            raise ValueError(
+                "ACCELERATOR_INVENTORY_PROVIDERS fake and none values must be exclusive"
+            )
+        if self.app_env == "production" and "fake" in inventory_providers:
+            raise ValueError("fake accelerator inventory is forbidden in production")
         runtime_types = {
             item.strip() for item in self.worker_runtime_types.split(",") if item.strip()
         }

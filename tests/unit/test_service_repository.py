@@ -10,7 +10,12 @@ from sqlalchemy.dialects import postgresql
 
 from api.services.service_reconciler import ServiceReconciler
 from core.database import Database
-from core.enums import RuntimeType
+from core.enums import (
+    AcceleratorKind,
+    AcceleratorVendor,
+    ModelAvailabilityStatus,
+    RuntimeType,
+)
 from models.base import Base
 from models.identity import Project, User
 from models.model_variant import LogicalModel, ModelVariant
@@ -244,6 +249,92 @@ async def test_reconciliation_is_idempotent_and_records_typed_intent(
         ("service_replica", "service.replica.created"),
         ("service_replica", "service.replica.created"),
     ]
+
+
+async def test_logical_service_replicas_keep_immutable_eligible_node_snapshots(
+    service_database: Database,
+) -> None:
+    logical_model_id = uuid.uuid4()
+    variant_id = uuid.uuid4()
+    profile_digest = "sha256:" + "a" * 64
+    async with service_database.session() as session, session.begin():
+        session.add(
+            LogicalModel(
+                id=logical_model_id,
+                project_id=PROJECT_ID,
+                name="eligible-snapshot-model",
+                public_name="eligible-snapshot-model",
+                status=ModelAvailabilityStatus.READY,
+            )
+        )
+        session.add(
+            ModelVariant(
+                id=variant_id,
+                logical_model_id=logical_model_id,
+                name="nvidia-a100",
+                vendor=AcceleratorVendor.NVIDIA,
+                kind=AcceleratorKind.GPU,
+                runtime_profile_id="nvidia-vllm-k8s",
+                runtime_profile_version="2.0.0",
+                runtime_profile_digest=profile_digest,
+                artifact_source="org/model",
+                artifact_revision="revision-1",
+                artifact_digest="sha256:" + "b" * 64,
+                architecture="test",
+                dtype="float16",
+                status=ModelAvailabilityStatus.READY,
+            )
+        )
+        await session.flush()
+        service = await ServiceRepository.create(
+            session,
+            project_id=PROJECT_ID,
+            name="eligible-snapshot-service",
+            model="org/model",
+            runtime=ServingRuntime.VLLM,
+            runtime_type=RuntimeType.KUBERNETES,
+            image="example/vllm:test",
+            cpu_millicores=1_000,
+            memory_mb=4_096,
+            gpu_count=2,
+            gpu_memory_mb=40_960,
+            tensor_parallel_size=2,
+            desired_replicas=1,
+            logical_model_id=logical_model_id,
+            model_variant_id=variant_id,
+            selected_vendor=AcceleratorVendor.NVIDIA,
+            selected_kind=AcceleratorKind.GPU.value,
+            selected_model="NVIDIA A100",
+            runtime_profile_id="nvidia-vllm-k8s",
+            runtime_profile_version="2.0.0",
+            runtime_profile_digest=profile_digest,
+            allocation_authority="kubernetes_device_plugin",
+            accelerator_resource_name="nvidia.com/gpu",
+            selection_policy="nvidia-only",
+            eligible_node_names=("gpu-node-b", "gpu-node-a", "gpu-node-a"),
+        )
+        await ServiceRepository.reconcile_locked(session, service)
+        replicas = await ServiceRepository.list_replicas(session, service.id, for_update=True)
+        assert replicas[0].eligible_node_names == ["gpu-node-a", "gpu-node-b"]
+
+        scaled = await ServiceRepository.set_desired_replicas(
+            session,
+            service_id=service.id,
+            project_id=PROJECT_ID,
+            desired_replicas=2,
+            eligible_node_names=("gpu-node-c", "gpu-node-b"),
+        )
+        assert scaled is not None
+        await ServiceRepository.reconcile_locked(session, scaled)
+        replicas = await ServiceRepository.list_replicas(session, service.id, for_update=True)
+        assert replicas[0].eligible_node_names == ["gpu-node-a", "gpu-node-b"]
+        assert replicas[1].eligible_node_names == ["gpu-node-b", "gpu-node-c"]
+
+        replicas[0].status = ReplicaStatus.FAILED
+        await ServiceRepository.reconcile_locked(session, scaled)
+        replicas = await ServiceRepository.list_replicas(session, service.id, for_update=True)
+        assert replicas[-1].ordinal == 2
+        assert replicas[-1].eligible_node_names == ["gpu-node-b", "gpu-node-c"]
 
 
 async def test_reconciler_uses_kubernetes_specific_drain_timeout(

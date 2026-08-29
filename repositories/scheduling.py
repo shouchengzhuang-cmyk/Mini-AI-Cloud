@@ -18,6 +18,7 @@ from core.enums import (
     TaskStatus,
     WorkerStatus,
 )
+from core.runtime_profiles import RuntimeProfileCatalog, runtime_profile_binding_id
 from core.state_machine import ensure_transition
 from models.scheduling import (
     GPUDevice,
@@ -29,7 +30,7 @@ from models.scheduling import (
 from models.task import Task, TaskEvent
 from models.usage import ProjectQuotaState, TaskExecution
 from models.worker import Worker
-from repositories.admission import BatchAdmissionSnapshot
+from repositories.admission import AdmissionRepository, BatchAdmissionSnapshot
 from repositories.clock import database_utcnow
 from repositories.outbox import OutboxRepository
 from repositories.quotas import QuotaRepository
@@ -437,6 +438,7 @@ class SchedulingRepository:
         memory_price_per_gb_hour: float,
         gpu_price_per_hour: float,
         admission: BatchAdmissionSnapshot | None = None,
+        runtime_profile_catalog: RuntimeProfileCatalog | None = None,
     ) -> tuple[Task, uuid.UUID]:
         task = await session.scalar(
             select(Task)
@@ -475,12 +477,14 @@ class SchedulingRepository:
         requested_device_ids = tuple(uuid.UUID(value) for value in gpu_device_ids)
         devices: list[GPUDevice] = []
         if admission is not None:
+            if runtime_profile_catalog is None:
+                raise PlacementConflict("runtime profile catalog is unavailable")
             devices = list(
                 await session.scalars(
                     select(GPUDevice)
                     .where(
                         GPUDevice.worker_id == worker.id,
-                        GPUDevice.health == "healthy",
+                        GPUDevice.health.in_(("healthy", "inventory-only")),
                         GPUDevice.inventory_generation == worker.inventory_generation,
                         GPUDevice.vendor == admission.vendor.value,
                         GPUDevice.accelerator_kind == admission.kind.value,
@@ -492,24 +496,44 @@ class SchedulingRepository:
                     .with_for_update()
                 )
             )
-            devices = [
-                device
-                for device in devices
-                if admission.runtime_profile_id in (device.runtime_profile_ids or [])
-            ]
-            active_deferred = int(
-                await session.scalar(
-                    select(func.coalesce(func.sum(ResourceReservation.gpu_count), 0)).where(
-                        ResourceReservation.worker_id == worker.id,
-                        ResourceReservation.released_at.is_(None),
-                        ResourceReservation.allocation_authority
-                        == AllocationAuthority.KUBERNETES_DEVICE_PLUGIN.value,
-                        ResourceReservation.requested_vendor == admission.vendor.value,
-                    )
-                )
-                or 0
+            binding_id = runtime_profile_binding_id(
+                profile_id=admission.runtime_profile_id,
+                profile_version=admission.runtime_profile_version,
+                semantic_digest=admission.runtime_profile_digest,
             )
-            if len(devices) - active_deferred < task.gpu_count:
+            devices = [
+                device for device in devices if binding_id in (device.runtime_profile_ids or [])
+            ]
+            raw_accelerator_request = task.accelerator_request_json
+            raw_capabilities = (
+                raw_accelerator_request.get("required_capabilities", [])
+                if isinstance(raw_accelerator_request, dict)
+                else []
+            )
+            if not isinstance(raw_capabilities, list) or not all(
+                isinstance(value, str) for value in raw_capabilities
+            ):
+                raise PlacementConflict("accelerator capability snapshot is invalid")
+            required_capabilities = frozenset(
+                value for value in raw_capabilities if isinstance(value, str)
+            )
+            available_accelerators = (
+                await AdmissionRepository.available_batch_accelerators_for_pool(
+                    session,
+                    catalog=runtime_profile_catalog,
+                    worker_id=worker.id,
+                    vendor=admission.vendor,
+                    kind=admission.kind,
+                    model=admission.selected_model,
+                    profile_id=admission.runtime_profile_id,
+                    profile_version=admission.runtime_profile_version,
+                    profile_digest=admission.runtime_profile_digest,
+                    resource_name=admission.accelerator_resource_name,
+                    minimum_memory_mb=task.gpu_memory_mb,
+                    required_capabilities=required_capabilities,
+                )
+            )
+            if available_accelerators < task.gpu_count:
                 raise PlacementConflict("vendor accelerator capacity changed")
         elif requested_device_ids:
             devices = list(
@@ -552,7 +576,11 @@ class SchedulingRepository:
                     model=device.model,
                     memory_total_mb=device.memory_total_mb,
                     memory_free_mb=device.memory_free_mb,
-                    healthy=device.health == "healthy",
+                    healthy=(
+                        device.health in {"healthy", "inventory-only"}
+                        if admission is not None
+                        else device.health == "healthy"
+                    ),
                     allocated=False,
                 )
                 for device in devices

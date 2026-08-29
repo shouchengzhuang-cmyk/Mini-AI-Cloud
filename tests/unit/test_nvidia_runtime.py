@@ -79,6 +79,7 @@ def test_nvidia_profile_renders_gfd_affinity_and_extended_resource() -> None:
         tensor_parallel_size=2,
         runtime_profile=profile,
         profile_environment=(("VLLM_LOGGING_LEVEL", "INFO"),),
+        eligible_node_names=("nvidia-node-a", "nvidia-node-b"),
     )
     runtime = KubernetesServingRuntimeAdapter(
         namespace="nvidia-tests",
@@ -101,6 +102,10 @@ def test_nvidia_profile_renders_gfd_affinity_and_extended_resource() -> None:
     assert pod.spec.tolerations[0].key == "nvidia.com/gpu"
     required = pod.spec.affinity.node_affinity.required_during_scheduling_ignored_during_execution
     expressions = required.node_selector_terms[0].match_expressions
+    fields = required.node_selector_terms[0].match_fields
+    assert [(item.key, item.operator, tuple(item.values or ())) for item in fields] == [
+        ("metadata.name", "In", ("nvidia-node-a", "nvidia-node-b"))
+    ]
     assert {(item.key, item.operator, tuple(item.values or ())) for item in expressions} == {
         ("nvidia.com/gpu.product", "Exists", ()),
         ("nvidia.com/gpu.count", "Gt", ("0",)),

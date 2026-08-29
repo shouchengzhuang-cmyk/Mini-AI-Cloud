@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass
 
 from core.enums import AcceleratorKind, AcceleratorVendor
@@ -6,6 +7,25 @@ _VENDOR_KINDS = {
     AcceleratorVendor.NVIDIA: AcceleratorKind.GPU,
     AcceleratorVendor.HUAWEI_ASCEND: AcceleratorKind.NPU,
 }
+
+_KUBERNETES_RESOURCE = re.compile(
+    r"^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?/[A-Za-z0-9](?:[-A-Za-z0-9_.]*[A-Za-z0-9])?$"
+)
+_DISCOVERED_HEALTH_STATES = {
+    "healthy",
+    "unknown",
+    "inventory-only",
+    "externally-allocated",
+}
+
+
+def _validate_inventory_text(name: str, value: str, *, maximum: int) -> None:
+    if not value or value != value.strip():
+        raise ValueError(f"{name} must be canonical non-blank text")
+    if len(value) > maximum:
+        raise ValueError(f"{name} must not exceed {maximum} characters")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError(f"{name} must not contain control characters")
 
 
 def kind_for_vendor(vendor: AcceleratorVendor) -> AcceleratorKind:
@@ -39,34 +59,104 @@ class AcceleratorDevice:
     memory_free_mb: int
     health: str = "healthy"
     compute_arch: str | None = None
+    # Legacy field name; Kubernetes values are immutable profile@version#digest bindings.
     runtime_profile_ids: tuple[str, ...] = ()
     capabilities: tuple[str, ...] = ()
     fake: bool = False
+    device_index: int = 0
+    kubernetes_resource_name: str | None = None
+    kubernetes_node_labels: tuple[tuple[str, str], ...] = ()
+    kubernetes_node_taints: tuple[tuple[str, str | None, str], ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.vendor, AcceleratorVendor):
             raise TypeError("vendor must be an AcceleratorVendor")
         if not isinstance(self.kind, AcceleratorKind):
             raise TypeError("kind must be an AcceleratorKind")
-        if not self.device_id.strip():
-            raise ValueError("device_id must not be blank")
+        _validate_inventory_text("device_id", self.device_id, maximum=255)
         if not vendor_kind_is_compatible(self.vendor, self.kind):
             raise ValueError(
                 f"{self.vendor.value} devices must use kind={kind_for_vendor(self.vendor)}"
             )
-        if not self.model.strip():
-            raise ValueError("model must not be blank")
+        _validate_inventory_text("model", self.model, maximum=255)
         if self.memory_total_mb <= 0:
             raise ValueError("memory_total_mb must be greater than zero")
         if not 0 <= self.memory_free_mb <= self.memory_total_mb:
             raise ValueError("memory_free_mb must be between zero and memory_total_mb")
-        if not self.health.strip():
-            raise ValueError("health must not be blank")
+        if self.health not in _DISCOVERED_HEALTH_STATES:
+            raise ValueError(
+                "health must be healthy, unknown, inventory-only, or externally-allocated"
+            )
+        if self.compute_arch is not None:
+            _validate_inventory_text("compute_arch", self.compute_arch, maximum=128)
+        if len(self.runtime_profile_ids) > 64:
+            raise ValueError("runtime_profile_ids must not contain more than 64 values")
         if len(self.runtime_profile_ids) != len(set(self.runtime_profile_ids)):
             raise ValueError("runtime_profile_ids must be unique")
-        if any(not profile_id.strip() for profile_id in self.runtime_profile_ids):
-            raise ValueError("runtime_profile_ids must not contain blank values")
+        for profile_binding in self.runtime_profile_ids:
+            _validate_inventory_text("runtime_profile_binding", profile_binding, maximum=255)
+        if len(self.capabilities) > 128:
+            raise ValueError("capabilities must not contain more than 128 values")
         if len(self.capabilities) != len(set(self.capabilities)):
             raise ValueError("capabilities must be unique")
-        if any(not capability.strip() for capability in self.capabilities):
-            raise ValueError("capabilities must not contain blank values")
+        for capability in self.capabilities:
+            _validate_inventory_text("capability", capability, maximum=128)
+        if self.device_index < 0:
+            raise ValueError("device_index must not be negative")
+        if self.kubernetes_resource_name is not None:
+            _validate_inventory_text(
+                "kubernetes_resource_name", self.kubernetes_resource_name, maximum=255
+            )
+            if not _KUBERNETES_RESOURCE.fullmatch(self.kubernetes_resource_name):
+                raise ValueError("kubernetes_resource_name must be a qualified resource name")
+        label_keys = [key for key, _ in self.kubernetes_node_labels]
+        if len(label_keys) != len(set(label_keys)):
+            raise ValueError("kubernetes_node_labels keys must be unique")
+        for label_key, label_value in self.kubernetes_node_labels:
+            _validate_inventory_text("kubernetes_node_label key", label_key, maximum=253)
+            if any(character.isspace() for character in label_key):
+                raise ValueError("kubernetes_node_label keys must not contain whitespace")
+            if label_value != label_value.strip() or len(label_value) > 63:
+                raise ValueError(
+                    "kubernetes_node_label values must be canonical and at most 63 characters"
+                )
+            if any(character.isspace() or ord(character) < 32 for character in label_value):
+                raise ValueError(
+                    "kubernetes_node_label values must not contain whitespace or controls"
+                )
+        if len(self.kubernetes_node_taints) > 64:
+            raise ValueError("kubernetes_node_taints must not contain more than 64 values")
+        for taint_key, taint_value, effect in self.kubernetes_node_taints:
+            _validate_inventory_text("kubernetes_node_taint key", taint_key, maximum=253)
+            if any(character.isspace() for character in taint_key):
+                raise ValueError("kubernetes_node_taint keys must not contain whitespace")
+            if taint_value is not None and (
+                taint_value != taint_value.strip()
+                or len(taint_value) > 63
+                or any(character.isspace() or ord(character) < 32 for character in taint_value)
+            ):
+                raise ValueError("kubernetes_node_taint values must be canonical labels or absent")
+            if not isinstance(effect, str) or effect not in {
+                "NoSchedule",
+                "PreferNoSchedule",
+                "NoExecute",
+            }:
+                raise ValueError("kubernetes_node_taint effect is unsupported")
+
+    @property
+    def uuid(self) -> str:
+        """Legacy internal alias retained while v0.4 GPU consumers migrate."""
+
+        return self.device_id
+
+    @property
+    def index(self) -> int:
+        """Legacy internal alias retained for exact-device Docker bindings."""
+
+        return self.device_index
+
+    @property
+    def compute_capability(self) -> str | None:
+        """Legacy NVIDIA name for the vendor-neutral compute architecture."""
+
+        return self.compute_arch

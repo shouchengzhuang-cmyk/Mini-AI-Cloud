@@ -1,5 +1,6 @@
 import asyncio
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from core.config import Settings
@@ -26,12 +27,14 @@ class Heartbeat:
         active: dict[uuid.UUID, ActiveExecution],
         settings: Settings,
         worker_session_id: uuid.UUID | None = None,
+        refresh_inventory: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.database = database
         self.worker_id = worker_id
         self.active = active
         self.settings = settings
         self.worker_session_id = worker_session_id
+        self.refresh_inventory = refresh_inventory
         self.logger = get_logger("worker_heartbeat")
 
     async def run(self, stop: asyncio.Event) -> None:
@@ -84,3 +87,16 @@ class Heartbeat:
             self.logger.error("worker registration disappeared", worker_id=self.worker_id)
             for execution in executions:
                 execution.ownership_lost.set()
+            return
+        if self.refresh_inventory is not None:
+            try:
+                await self.refresh_inventory()
+            except Exception as exc:
+                # Inventory persistence is capacity evidence, not an execution-ownership
+                # fence. The lease and worker heartbeat above have already succeeded, so
+                # a transient refresh failure must not stop otherwise valid workloads.
+                self.logger.exception(
+                    "accelerator inventory refresh failed; active task leases remain valid",
+                    worker_id=self.worker_id,
+                    error=str(exc),
+                )

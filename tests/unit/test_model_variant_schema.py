@@ -3,8 +3,12 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from api.schemas.model_variants import LogicalModelCreate, ModelVariantCreate
-from core.enums import AcceleratorKind, AcceleratorVendor
+from api.schemas.model_variants import (
+    LogicalModelCreate,
+    LogicalModelRoutingPolicyUpdate,
+    ModelVariantCreate,
+)
+from core.enums import AcceleratorKind, AcceleratorVendor, GatewayRoutingPolicy
 from core.runtime_profiles import RuntimeProfileCatalog, RuntimeProfileCompatibilityError
 
 REPOSITORY_ROOT = Path(__file__).parents[2]
@@ -43,9 +47,20 @@ def test_logical_model_and_variant_contracts_are_typed() -> None:
     variant = ModelVariantCreate.model_validate(_variant_payload())
 
     assert logical.name == "qwen-small"
+    assert logical.routing_policy is GatewayRoutingPolicy.BALANCED
     assert variant.vendor is AcceleratorVendor.NVIDIA
     assert variant.kind is AcceleratorKind.GPU
     assert variant.artifact_digest == ARTIFACT_DIGEST
+
+    update = LogicalModelRoutingPolicyUpdate(routing_policy="strict-ascend")
+    assert update.routing_policy is GatewayRoutingPolicy.STRICT_ASCEND
+
+    with pytest.raises(ValidationError, match="routing_policy"):
+        LogicalModelCreate(
+            name="invalid-policy",
+            public_name="Invalid Policy",
+            routing_policy="any",
+        )
 
 
 def test_variant_rejects_empty_digest_vendor_kind_mismatch_and_unexplained_degradation() -> None:

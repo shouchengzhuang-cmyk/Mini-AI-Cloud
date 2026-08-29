@@ -87,6 +87,12 @@ uv run alembic check
 4. `alembic check` 不应产生未迁移的模型差异。
 5. 先迁移，再启动新 API/Worker；失败时保留 migration 日志和 DB snapshot。
 
+`0016_service_node_placement` 无法从迁移时正在运行的 Pod 推导完整的兼容节点集。
+升级前必须把所有 logical-model Kubernetes Service 缩到 `desired_replicas=0`，并等待其
+Replica 全部进入 `stopped`、`failed` 或 `lost` 终态；否则迁移会在 DDL 前拒绝执行。
+升级完成后第一次正向扩容会通过正常 admission 使用当前完整 inventory 重建
+`eligible_node_names`。不要用现存 Pod 的 node 列表手工回填该字段，否则会永久缩窄故障转移范围。
+
 ## 代码回滚与数据库回退
 
 Phase I 稳定代码恢复点为 `c47702b`，但“代码能切回”不等于“Phase II 数据可无损降级”。推荐策略：

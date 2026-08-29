@@ -260,6 +260,7 @@ class ServiceResponse(ResponseModel):
     allocation_authority: AllocationAuthority | None
     accelerator_resource_name: str | None
     selection_policy: AcceleratorSelectionPolicy | None
+    eligible_node_names: list[str] | None
     tensor_parallel_size: int = Field(ge=1)
     dtype: VLLMDType
     gpu_memory_utilization: float = Field(gt=0, le=1)
@@ -311,6 +312,8 @@ class ServiceReplicaResponse(ResponseModel):
     allocation_authority: AllocationAuthority | None
     accelerator_resource_name: str | None
     selection_policy: AcceleratorSelectionPolicy | None
+    eligible_node_names: list[str] | None
+    assigned_node_name: str | None
     model_revision: str | None
     image_digest: str | None
     error_code: str | None

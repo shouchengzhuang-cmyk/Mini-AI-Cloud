@@ -11,6 +11,7 @@ from api.schemas.model_variants import (
     LogicalModelCreate,
     LogicalModelListResponse,
     LogicalModelResponse,
+    LogicalModelRoutingPolicyUpdate,
     LogicalModelStatusEventResponse,
     LogicalModelStatusHistoryResponse,
     LogicalModelStatusUpdate,
@@ -31,6 +32,7 @@ from core.rbac import (
 from core.runtime_profiles import RuntimeProfileCatalog, RuntimeProfileCompatibilityError
 from models.model_variant import LogicalModel, LogicalModelStatusEvent, ModelVariant
 from repositories.model_variants import (
+    LogicalModelConflictError,
     LogicalModelNotFoundError,
     LogicalModelRepository,
     ModelVariantInvariantError,
@@ -64,17 +66,17 @@ async def create_logical_model(
                 project_id=project_id,
                 name=payload.name,
                 public_name=payload.public_name,
+                routing_policy=payload.routing_policy,
                 description=payload.description,
                 metadata=payload.metadata,
                 created_by_user_id=principal.user_id,
             )
     except LogicalModelNotFoundError as error:
         raise NotFoundError("PROJECT_NOT_FOUND", "Project not found") from error
+    except LogicalModelConflictError as error:
+        raise _logical_model_conflict(error.field) from error
     except IntegrityError as error:
-        raise ConflictError(
-            "LOGICAL_MODEL_NAME_ALREADY_EXISTS",
-            "A logical model with this name already exists in the project",
-        ) from error
+        raise _logical_model_integrity_conflict(error) from error
     return _logical_model_response(model)
 
 
@@ -149,6 +151,31 @@ async def set_logical_model_status(
         raise NotFoundError("LOGICAL_MODEL_NOT_FOUND", "Logical model not found") from error
     except ModelVariantInvariantError as error:
         raise ConflictError("LOGICAL_MODEL_INVARIANT", str(error)) from error
+    return _logical_model_response(model)
+
+
+@router.put(
+    "/logical-models/{logical_model_id}/routing-policy",
+    response_model=LogicalModelResponse,
+)
+async def set_logical_model_routing_policy(
+    project_id: uuid.UUID,
+    logical_model_id: uuid.UUID,
+    payload: LogicalModelRoutingPolicyUpdate,
+    request: Request,
+    database: Annotated[Database, Depends(get_database)],
+) -> LogicalModelResponse:
+    _authorize(request, project_id, Permission.MODEL_MANAGE)
+    try:
+        async with database.session() as session, session.begin():
+            model = await LogicalModelRepository.set_routing_policy(
+                session,
+                project_id=project_id,
+                logical_model_id=logical_model_id,
+                routing_policy=payload.routing_policy,
+            )
+    except LogicalModelNotFoundError as error:
+        raise NotFoundError("LOGICAL_MODEL_NOT_FOUND", "Logical model not found") from error
     return _logical_model_response(model)
 
 
@@ -413,6 +440,7 @@ def _logical_model_response(model: LogicalModel) -> LogicalModelResponse:
         public_name=model.public_name,
         description=model.description,
         status=model.status,
+        routing_policy=model.routing_policy,
         metadata=model.metadata_json,
         created_by_user_id=model.created_by_user_id,
         created_at=model.created_at,
@@ -449,3 +477,25 @@ def _model_variant_response(variant: ModelVariant) -> ModelVariantResponse:
 
 def _status_event_response(event: LogicalModelStatusEvent) -> LogicalModelStatusEventResponse:
     return LogicalModelStatusEventResponse.model_validate(event)
+
+
+def _logical_model_conflict(field: str) -> ConflictError:
+    if field == "public_name":
+        return ConflictError(
+            "LOGICAL_MODEL_PUBLIC_NAME_ALREADY_EXISTS",
+            "A logical model with this public_name already exists in the project",
+        )
+    return ConflictError(
+        "LOGICAL_MODEL_NAME_ALREADY_EXISTS",
+        "A logical model with this name already exists in the project",
+    )
+
+
+def _logical_model_integrity_conflict(error: IntegrityError) -> ConflictError:
+    message = str(error.orig).casefold()
+    if (
+        "uq_logical_models_project_public_name" in message
+        or "logical_models.project_id, logical_models.public_name" in message
+    ):
+        return _logical_model_conflict("public_name")
+    return _logical_model_conflict("name")

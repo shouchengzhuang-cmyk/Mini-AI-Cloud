@@ -10,7 +10,7 @@ from sqlalchemy import select
 
 from api.services.vllm_replica_runtime import VLLMReplicaRuntimeController
 from core.database import Database
-from core.enums import RuntimeType, WorkerStatus
+from core.enums import AcceleratorKind, AcceleratorVendor, RuntimeType, WorkerStatus
 from models.identity import Project
 from models.scheduling import GPUDevice as PersistedGPUDevice
 from models.service import ReplicaStatus, ServingRuntime
@@ -35,13 +35,14 @@ class _FakeInventory:
     def __init__(self, worker_name: str, gpu_count: int) -> None:
         self.devices = tuple(
             GPUDevice(
-                uuid=f"{worker_name}-gpu-{index}",
-                index=index,
-                vendor="nvidia",
+                device_id=f"{worker_name}-gpu-{index}",
+                device_index=index,
+                vendor=AcceleratorVendor.NVIDIA,
+                kind=AcceleratorKind.GPU,
                 model="FAKE-A100",
                 memory_total_mb=40_960,
                 memory_free_mb=39_000,
-                compute_capability="8.0",
+                compute_arch="8.0",
                 fake=True,
             )
             for index in range(gpu_count)

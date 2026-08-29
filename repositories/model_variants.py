@@ -6,11 +6,20 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.accelerators import vendor_kind_is_compatible
-from core.enums import AcceleratorKind, AcceleratorVendor, ModelAvailabilityStatus
+from core.enums import (
+    AcceleratorKind,
+    AcceleratorVendor,
+    GatewayRoutingPolicy,
+    ModelAvailabilityStatus,
+)
 from core.rbac import ProjectStatus
-from models.identity import Project
 from models.model_variant import LogicalModel, LogicalModelStatusEvent, ModelVariant
 from repositories.clock import database_utcnow
+from repositories.gateway_model_names import (
+    GatewayModelNameConflictError,
+    check_logical_public_name_available,
+    lock_gateway_model_namespace,
+)
 
 _RESOURCE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _PROFILE_ID = re.compile(r"^[a-z][a-z0-9-]{2,63}$")
@@ -20,6 +29,12 @@ _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 class LogicalModelNotFoundError(LookupError):
     pass
+
+
+class LogicalModelConflictError(ValueError):
+    def __init__(self, field: str) -> None:
+        super().__init__(f"logical model {field} already exists in the project")
+        self.field = field
 
 
 class ModelVariantNotFoundError(LookupError):
@@ -51,19 +66,46 @@ class LogicalModelRepository:
         description: str | None,
         metadata: dict[str, object],
         created_by_user_id: uuid.UUID | None,
+        routing_policy: GatewayRoutingPolicy = GatewayRoutingPolicy.BALANCED,
     ) -> LogicalModel:
-        project = await session.scalar(
-            select(Project).where(Project.id == project_id).with_for_update()
-        )
+        project = await lock_gateway_model_namespace(session, project_id=project_id)
         if project is None or project.status is not ProjectStatus.ACTIVE:
             raise LogicalModelNotFoundError("active project does not exist")
+        normalized_name = _normalize_resource_name(name, "logical model name")
+        normalized_public_name = _normalize_display_text(public_name, "public_name", 255)
+        try:
+            await check_logical_public_name_available(
+                session,
+                project_id=project_id,
+                public_name=normalized_public_name,
+            )
+        except GatewayModelNameConflictError as error:
+            raise LogicalModelConflictError("public_name") from error
+        existing_name = await session.scalar(
+            select(LogicalModel.id).where(
+                LogicalModel.project_id == project_id,
+                LogicalModel.name == normalized_name,
+            )
+        )
+        if existing_name is not None:
+            raise LogicalModelConflictError("name")
+        existing_public_name = await session.scalar(
+            select(LogicalModel.id).where(
+                LogicalModel.project_id == project_id,
+                LogicalModel.public_name == normalized_public_name,
+            )
+        )
+        if existing_public_name is not None:
+            raise LogicalModelConflictError("public_name")
         now = await database_utcnow(session)
         model = LogicalModel(
             project_id=project_id,
-            name=_normalize_resource_name(name, "logical model name"),
-            public_name=_normalize_display_text(public_name, "public_name", 255),
+            name=normalized_name,
+            public_name=normalized_public_name,
             description=_normalize_optional_display_text(description, "description", 2_000),
             status=ModelAvailabilityStatus.DISABLED,
+            routing_policy=routing_policy,
+            routing_cursor=0,
             metadata_json=dict(metadata),
             created_by_user_id=created_by_user_id,
             created_at=now,
@@ -83,6 +125,31 @@ class LogicalModelRepository:
                 created_at=now,
             )
         )
+        await session.flush()
+        return model
+
+    @staticmethod
+    async def set_routing_policy(
+        session: AsyncSession,
+        *,
+        project_id: uuid.UUID,
+        logical_model_id: uuid.UUID,
+        routing_policy: GatewayRoutingPolicy,
+    ) -> LogicalModel:
+        model = await LogicalModelRepository.get(
+            session,
+            project_id=project_id,
+            logical_model_id=logical_model_id,
+            for_update=True,
+        )
+        if model is None:
+            raise LogicalModelNotFoundError("logical model does not exist")
+        if model.routing_policy is routing_policy:
+            return model
+        model.routing_policy = routing_policy
+        model.routing_cursor = 0
+        model.updated_at = await database_utcnow(session)
+        model.version += 1
         await session.flush()
         return model
 

@@ -77,6 +77,7 @@ def _accelerator_spec(profile_name: str, *, count: int = 2) -> KubernetesServing
         tensor_parallel_size=count,
         runtime_profile=profile,
         profile_environment=(("VLLM_LOGGING_LEVEL", "INFO"),),
+        eligible_node_names=("gpu-node-a", "gpu-node-b"),
     )
 
 
@@ -297,6 +298,11 @@ async def test_prepare_renders_accelerator_pod_from_runtime_profile(
     assert container.resources.requests == container.resources.limits
     assert pod.spec.runtime_class_name == runtime_class_name
     assert pod.spec.node_selector == dict(profile.kubernetes.node_selector)
+    required = pod.spec.affinity.node_affinity.required_during_scheduling_ignored_during_execution
+    fields = required.node_selector_terms[0].match_fields
+    assert fields[0].key == "metadata.name"
+    assert fields[0].operator == "In"
+    assert fields[0].values == ["gpu-node-a", "gpu-node-b"]
     assert pod.spec.tolerations == []
     assert pod.spec.host_network is False
     assert pod.spec.host_pid is False
@@ -322,6 +328,13 @@ async def test_prepare_renders_accelerator_pod_from_runtime_profile(
     [
         (replace(_spec(), accelerator_count=2), "requires a runtime_profile"),
         (replace(_spec(), tensor_parallel_size=2), "tensor_parallel_size=1"),
+        (
+            replace(
+                _accelerator_spec("nvidia-vllm-k8s.example.yaml"),
+                eligible_node_names=(),
+            ),
+            "non-empty eligible-node snapshot",
+        ),
     ],
 )
 async def test_prepare_rejects_incomplete_accelerator_launch_contract(
@@ -375,6 +388,7 @@ async def test_prepare_rejects_profile_environment_outside_allowlist() -> None:
         "asymmetric_resource",
         "runtime_class",
         "node_selector",
+        "eligible_nodes",
         "tensor_parallel",
     ],
 )
@@ -403,6 +417,11 @@ async def test_prepare_rejects_accelerator_profile_drift(drift: str) -> None:
         pod.spec.runtime_class_name = "different"
     elif drift == "node_selector":
         pod.spec.node_selector = {"accelerator.mini-ai-cloud/vendor": "huawei-ascend"}
+    elif drift == "eligible_nodes":
+        required = (
+            pod.spec.affinity.node_affinity.required_during_scheduling_ignored_during_execution
+        )
+        required.node_selector_terms[0].match_fields[0].values = ["other-node"]
     elif drift == "tensor_parallel":
         pod.spec.containers[0].args[-1] = "1"
     api.create_namespaced_pod.side_effect = ApiException(status=409)
@@ -680,6 +699,17 @@ async def test_start_and_inspect_publish_only_ready_non_deleting_pod() -> None:
     assert deleting.running is False
     assert deleting.ready is False
     assert deleting.deleting is True
+
+
+async def test_inspect_rejects_same_name_pod_with_different_uid() -> None:
+    api = _prepare_api()
+    runtime = _runtime(api)
+    handle, pod = await _prepare(runtime)
+    pod.metadata.uid = "replacement-pod-uid"
+    api.read_namespaced_pod_status = AsyncMock(return_value=pod)
+
+    with pytest.raises(KubernetesServingOwnershipError, match="UID changed"):
+        await runtime.inspect(handle)
 
 
 @pytest.mark.parametrize(

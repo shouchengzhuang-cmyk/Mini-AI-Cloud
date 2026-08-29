@@ -20,7 +20,7 @@ from core.enums import (
     WorkerStatus,
 )
 from core.rbac import ProjectStatus
-from core.runtime_profiles import RuntimeProfileCatalog
+from core.runtime_profiles import RuntimeProfileCatalog, runtime_profile_binding_id
 from models.admission import AdmissionEvent
 from models.identity import Project
 from models.model_variant import LogicalModel, ModelVariant
@@ -315,6 +315,15 @@ async def test_authoritative_placement_refreshes_worker_fence_from_database(
 async def test_ascend_batch_uses_typed_quota_without_database_device_binding(
     database: Database,
 ) -> None:
+    catalog = RuntimeProfileCatalog.from_path(REPOSITORY_ROOT / "runtime_profiles/manifest.json")
+    entry = next(
+        item for item in catalog.manifest.profiles if item.identity == "ascend-vllm-k8s-a2@2.0.0"
+    )
+    binding_id = runtime_profile_binding_id(
+        profile_id=entry.profile_id,
+        profile_version=entry.profile_version,
+        semantic_digest=entry.semantic_digest,
+    )
     async with database.session() as session, session.begin():
         worker = await WorkerRepository.register(
             session,
@@ -345,7 +354,7 @@ async def test_ascend_batch_uses_typed_quota_without_database_device_binding(
                     "memory_total_mb": 64_000,
                     "memory_free_mb": 63_000,
                     "compute_arch": "Ascend910B",
-                    "runtime_profile_ids": ["ascend-vllm-k8s-a2"],
+                    "runtime_profile_ids": [binding_id],
                     "capabilities": ["bfloat16", "streaming"],
                     "kubernetes_resource_name": "huawei.com/Ascend910",
                 }
@@ -360,13 +369,13 @@ async def test_ascend_batch_uses_typed_quota_without_database_device_binding(
             max_running_tasks=None,
             max_cpu_millicores=None,
             max_memory_mb=None,
-            max_gpus=2,
+            max_gpus=None,
             max_services=None,
             max_service_replicas=None,
             max_artifact_bytes=None,
             daily_cost_limit=None,
             max_nvidia_gpus=0,
-            max_ascend_npus=2,
+            max_ascend_npus=None,
         )
         accelerator = AcceleratorRequest.model_validate(
             {
@@ -425,6 +434,42 @@ async def test_ascend_batch_uses_typed_quota_without_database_device_binding(
     assert state is not None and state.reserved_ascend_npus == 2
     assert state.reserved_nvidia_gpus == 0
     assert [event.outcome for event in events] == ["admitted"]
+
+    async with database.session() as session, session.begin():
+        blocked_task = await TaskRepository.create_queued(
+            session,
+            image="python:3.12-slim",
+            command=["python", "-c", "print('blocked ascend')"],
+            environment={},
+            timeout_seconds=60,
+            max_retries=0,
+            cpu_limit=1.0,
+            memory_limit_mb=1_024,
+            labels={},
+            network_enabled=False,
+            gpu_count=2,
+            gpu_memory_mb=32_000,
+            accelerator_request_json=accelerator.model_dump(mode="json"),
+            runtime_type=RuntimeType.KUBERNETES.value,
+            priority=50,
+            idempotency_key=None,
+            request_hash=None,
+            project_id=LEGACY_PROJECT_ID,
+        )
+        blocked_task_id = blocked_task.id
+
+    blocked_result = await _scheduler(database).run_once()
+
+    assert blocked_result.task_id == blocked_task_id
+    assert blocked_result.placed is False
+    assert blocked_result.reason == "ascend_capacity_unavailable"
+    async with database.session() as session:
+        blocked_events = list(
+            await session.scalars(
+                select(AdmissionEvent).where(AdmissionEvent.workload_id == blocked_task_id)
+            )
+        )
+    assert [event.outcome for event in blocked_events] == ["rejected"]
 
     async with database.session() as session, session.begin():
         locked_task = await TaskRepository.get(session, task_id, for_update=True)
@@ -489,7 +534,13 @@ async def test_logical_service_admission_pins_variant_and_replica_snapshot(
                     "memory_total_mb": 64_000,
                     "memory_free_mb": 63_000,
                     "compute_arch": "Ascend910B",
-                    "runtime_profile_ids": [entry.profile_id],
+                    "runtime_profile_ids": [
+                        runtime_profile_binding_id(
+                            profile_id=entry.profile_id,
+                            profile_version=entry.profile_version,
+                            semantic_digest=entry.semantic_digest,
+                        )
+                    ],
                     "capabilities": ["bfloat16", "streaming"],
                     "kubernetes_resource_name": profile.kubernetes.resource_name,
                 }
@@ -585,6 +636,7 @@ async def test_logical_service_admission_pins_variant_and_replica_snapshot(
             allocation_authority=snapshot.allocation_authority.value,
             accelerator_resource_name=snapshot.accelerator_resource_name,
             selection_policy=snapshot.selection_policy.value,
+            eligible_node_names=snapshot.eligible_node_names,
         )
         await ServiceRepository.reconcile_locked(session, service)
 
