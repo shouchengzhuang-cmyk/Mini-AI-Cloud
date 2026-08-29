@@ -1333,6 +1333,60 @@ async def _make_health_due(database: Database, service_id: uuid.UUID) -> None:
             replica.last_health_at = datetime(2000, 1, 1, tzinfo=UTC)
 
 
+async def test_sqlite_autoscaler_closes_candidate_snapshot_before_writes(
+    gateway_database: Database,
+) -> None:
+    metrics = StaticMetrics()
+    service_ids: list[uuid.UUID] = []
+    observed_at = datetime.now(UTC)
+    async with gateway_database.session() as session, session.begin():
+        for index in range(2):
+            service = await ServiceRepository.create(
+                session,
+                project_id=PROJECT_ID,
+                name=f"sqlite-autoscaled-{index}",
+                model=f"org/sqlite-model-{index}",
+                runtime=ServingRuntime.FAKE,
+                runtime_type=RuntimeType.FAKE,
+                image=None,
+                cpu_millicores=100,
+                memory_mb=128,
+                gpu_count=0,
+                gpu_memory_mb=0,
+                desired_replicas=1,
+                autoscaling_enabled=True,
+                autoscaling_min_replicas=1,
+                autoscaling_max_replicas=4,
+                autoscaling_target_concurrency=1,
+                autoscaling_cooldown_seconds=0,
+            )
+            service.last_autoscale_checked_at = datetime(2000, 1, 1, tzinfo=UTC) + timedelta(
+                seconds=index
+            )
+            service_ids.append(service.id)
+            metrics.loads[service.id] = ServiceLoad(
+                active_requests=2,
+                observed_at=observed_at,
+            )
+
+    result = await asyncio.wait_for(
+        ServiceAutoscaler(gateway_database, metrics, batch_size=1).run_once(),
+        timeout=2,
+    )
+
+    async with gateway_database.session() as session:
+        services = {
+            service.id: service
+            for service in await session.scalars(
+                select(ModelService).where(ModelService.id.in_(service_ids))
+            )
+        }
+    assert result.examined == 1
+    assert result.scaled == 1
+    assert services[service_ids[0]].desired_replicas == 2
+    assert services[service_ids[1]].desired_replicas == 1
+
+
 async def test_autoscaler_changes_only_desired_and_holds_on_missing_or_cooldown(
     gateway_database: Database,
 ) -> None:

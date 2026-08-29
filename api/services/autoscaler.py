@@ -205,13 +205,22 @@ class ServiceAutoscaler:
                 ModelService.last_autoscale_checked_at.asc().nullsfirst(),
                 ModelService.id,
             )
-            .execution_options(yield_per=self.batch_size)
         )
+        if self.database.engine.dialect.name == "sqlite":
+            # SQLite readers block a writer commit while a cursor is open. Its
+            # supported local/test deployments therefore close a materialized
+            # snapshot before the per-candidate write transactions begin.
+            async with self.database.session() as session:
+                candidates = list((await session.execute(query)).all())
+            for service_id, logical_model_id, runtime_type, checked_at in candidates:
+                yield service_id, logical_model_id, runtime_type, checked_at
+            return
+
         # A single cursor provides a stable candidate snapshot for the pass: a row
         # skipped by a concurrent lock cannot move forward and re-enter. Production
         # PostgreSQL fetches at most batch_size rows into the client at a time.
         async with self.database.session() as session, session.begin():
-            result = await session.stream(query)
+            result = await session.stream(query.execution_options(yield_per=self.batch_size))
             async for service_id, logical_model_id, runtime_type, checked_at in result:
                 yield service_id, logical_model_id, runtime_type, checked_at
 
