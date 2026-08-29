@@ -43,6 +43,7 @@ from api.services.reaper import Reaper
 from api.services.service_health import ServiceHealthController
 from api.services.service_reconciler import ServiceReconciler
 from api.services.vllm_replica_runtime import VLLMReplicaRuntimeController
+from api.workbench import install_workbench
 from core.config import Settings, get_settings
 from core.database import Database
 from core.logging import configure_logging, get_logger
@@ -356,6 +357,7 @@ def create_app(
     app.include_router(audit.router)
     app.include_router(datasets.router)
     app.include_router(events.router)
+    install_workbench(app)
     install_openapi_contract(app)
     return app
 
