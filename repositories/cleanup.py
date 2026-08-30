@@ -139,7 +139,17 @@ class CleanupRepository:
                     TaskExecution.task_id.in_(retained_task_ids),
                     TaskExecution.runtime_object_id.is_not(None),
                 )
-                .values(runtime_object_id=None)
+                .values(
+                    runtime_object_id=None,
+                    runtime_namespace=None,
+                    runtime_resource_kind=None,
+                    runtime_resource_name=None,
+                    runtime_resource_uid=None,
+                    runtime_worker_session_id=None,
+                    observed_pod_name=None,
+                    observed_pod_uid=None,
+                    runtime_spec_hash=None,
+                )
                 .returning(TaskExecution.id)
             )
             execution_handles_cleared = tuple(execution_handles.scalars().all())

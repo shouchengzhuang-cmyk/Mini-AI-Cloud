@@ -16,7 +16,7 @@ from core.enums import ACTIVE_TASK_STATUSES, WorkerStatus
 from core.logging import configure_logging, get_logger
 from core.redis import RedisQueue
 from core.runtime_profiles import RuntimeProfileCatalog
-from repositories.tasks import TaskRepository
+from repositories.tasks import RecoverableRuntimeExecution, TaskRepository
 from repositories.workers import WorkerRepository
 from scheduler import Scheduler, TaskAssignment
 from worker.artifact_workspace import ArtifactWorkspaceManager
@@ -33,8 +33,14 @@ from worker.gpu_inventory import (
     build_accelerator_inventory_registry,
 )
 from worker.heartbeat import ActiveExecution, Heartbeat
-from worker.kubernetes_runtime import KubernetesRuntime
-from worker.runtime import ComputeRuntime
+from worker.kubernetes_runtime import (
+    EXECUTION_ID_LABEL,
+    TASK_ID_LABEL,
+    WORKER_SESSION_ID_LABEL,
+    KubernetesRuntime,
+    KubernetesRuntimeError,
+)
+from worker.runtime import ComputeRuntime, RuntimeHandle
 from worker.runtime_registry import RuntimeRegistry
 
 
@@ -98,6 +104,7 @@ class WorkerService:
             raise ValueError("fake GPU inventory requires the fake compute runtime")
         runtimes: dict[str, ComputeRuntime] = {}
         self.docker_runtime: DockerRuntime | None = None
+        self.kubernetes_runtime: KubernetesRuntime | None = None
         if "docker" in runtime_types:
             self.docker_runtime = DockerRuntime(
                 pids_limit=settings.docker_pids_limit,
@@ -109,14 +116,17 @@ class WorkerService:
             runtimes["docker"] = self.docker_runtime
         if "kubernetes" in runtime_types:
             assert runtime_profile_catalog is not None
-            runtimes["kubernetes"] = KubernetesRuntime(
+            self.kubernetes_runtime = KubernetesRuntime(
                 namespace=settings.kubernetes_namespace,
+                cluster_id=settings.cluster_id,
+                app_env=settings.app_env,
                 node_name=settings.worker_node_name or self.capabilities.hostname,
                 cleanup_grace_seconds=settings.kubernetes_cleanup_grace_seconds,
                 kubeconfig=settings.kubernetes_kubeconfig,
                 in_cluster=settings.kubernetes_in_cluster,
                 runtime_profile_catalog=runtime_profile_catalog,
             )
+            runtimes["kubernetes"] = self.kubernetes_runtime
         if "fake" in runtime_types:
             runtimes["fake"] = FakeComputeRuntime()
         self.runtime = RuntimeRegistry(runtimes)
@@ -150,8 +160,13 @@ class WorkerService:
         self.stop_requested = asyncio.Event()
         self.heartbeat_stop = asyncio.Event()
         self.next_orphan_reconcile = 0.0
+        self.recovery_kubernetes_handles: list[RuntimeHandle] = []
+        self.recovered_kubernetes_executions: list[
+            tuple[RecoverableRuntimeExecution, RuntimeHandle]
+        ] = []
 
     async def run(self) -> None:
+        await self._discover_recoverable_kubernetes_executions()
         inventory_snapshot, devices = await self._take_accelerator_inventory_snapshot()
         self._apply_accelerator_inventory(inventory_snapshot, devices)
         for result in self.inventory_provider_results:
@@ -172,6 +187,9 @@ class WorkerService:
             await self.docker_runtime.version() if self.docker_runtime is not None else None
         )
         await self._register(docker_version)
+        await self._transfer_recoverable_kubernetes_executions()
+        for recovered, handle in self.recovered_kubernetes_executions:
+            self._start_recovered_execution(recovered, handle)
         try:
             await self.queue.ensure_ready_group()
         except RedisError as exc:
@@ -203,6 +221,74 @@ class WorkerService:
             await self._consume()
         finally:
             await self._shutdown(heartbeat_task)
+
+    async def _discover_recoverable_kubernetes_executions(self) -> None:
+        if self.kubernetes_runtime is None:
+            return
+        self.recovery_kubernetes_handles = list(
+            await self.kubernetes_runtime.list_managed(worker_id=self.worker_id)
+        )
+
+    async def _transfer_recoverable_kubernetes_executions(self) -> None:
+        if self.kubernetes_runtime is None or not self.recovery_kubernetes_handles:
+            return
+        controller_handles: list[RuntimeHandle] = []
+        for handle in self.recovery_kubernetes_handles:
+            try:
+                controller_handles.append(
+                    await self.kubernetes_runtime.transfer_controller(
+                        handle,
+                        controller_session_id=self.worker_session_id,
+                    )
+                )
+            except KubernetesRuntimeError as exc:
+                self.logger.warning(
+                    "Kubernetes Job controller CAS transfer quarantined",
+                    worker_id=self.worker_id,
+                    runtime_object_id=handle.object_id,
+                    error=str(exc),
+                )
+        observations = [
+            {
+                "task_id": handle.labels.get(TASK_ID_LABEL),
+                "execution_id": handle.labels.get(EXECUTION_ID_LABEL),
+                "worker_session_id": handle.labels.get(WORKER_SESSION_ID_LABEL),
+                "controller_session_id": str(handle.controller_session_id),
+                "namespace": handle.namespace,
+                "resource_name": handle.object_id,
+                "resource_uid": handle.resource_uid,
+                "spec_hash": handle.spec_hash,
+                "observed_pod_name": handle.observation.pod_name,
+                "observed_pod_uid": handle.observation.pod_uid,
+            }
+            for handle in controller_handles
+        ]
+        if not observations:
+            return
+        async with self.database.session() as session, session.begin():
+            matched = await TaskRepository.transfer_recoverable_kubernetes_executions(
+                session,
+                worker_id=self.worker_id,
+                new_worker_session_id=self.worker_session_id,
+                lease_seconds=self.settings.task_lease_seconds,
+                observations=observations,
+            )
+        by_execution_id = {
+            uuid.UUID(handle.labels[EXECUTION_ID_LABEL]): handle for handle in controller_handles
+        }
+        self.recovered_kubernetes_executions = [
+            (item, by_execution_id[item.execution_id]) for item in matched
+        ]
+        self.logger.info(
+            "recoverable Kubernetes Job executions discovered",
+            worker_id=self.worker_id,
+            execution_count=len(matched),
+            quarantined_count=(
+                len(self.recovery_kubernetes_handles)
+                - len(matched)
+                + len(self.kubernetes_runtime.recovery_conflicts)
+            ),
+        )
 
     def request_stop(self) -> None:
         self.stop_requested.set()
@@ -295,6 +381,27 @@ class WorkerService:
             source=assignment.source.value,
         )
 
+    def _start_recovered_execution(
+        self,
+        recovered: RecoverableRuntimeExecution,
+        handle: RuntimeHandle,
+    ) -> None:
+        execution = ActiveExecution(
+            task_id=recovered.task_id,
+            execution_id=recovered.execution_id,
+        )
+        self.active[recovered.task_id] = execution
+        task = asyncio.create_task(self._run_assignment(execution, recovered_handle=handle))
+        self.inflight.add(task)
+        task.add_done_callback(self._assignment_done)
+        self.logger.info(
+            "Kubernetes Job execution adopted after worker restart",
+            task_id=str(recovered.task_id),
+            worker_id=self.worker_id,
+            execution_id=str(recovered.execution_id),
+            worker_session_id=str(recovered.worker_session_id),
+        )
+
     def _assignment_done(self, task: asyncio.Task[None]) -> None:
         self.inflight.discard(task)
         if task.cancelled():
@@ -308,9 +415,17 @@ class WorkerService:
                 exc_info=error,
             )
 
-    async def _run_assignment(self, execution: ActiveExecution) -> None:
+    async def _run_assignment(
+        self,
+        execution: ActiveExecution,
+        *,
+        recovered_handle: RuntimeHandle | None = None,
+    ) -> None:
         try:
-            result = await self.executor.execute(execution)
+            result = await self.executor.execute(
+                execution,
+                recovered_handle=recovered_handle,
+            )
             self.logger.info(
                 "task execution finished",
                 task_id=str(execution.task_id),

@@ -65,7 +65,7 @@ Authorization: Bearer mkc_...
 NVIDIA GPU 请求；新旧字段同时提供时必须语义一致，否则请求会被拒绝。A1
 只冻结领域和 API 合同：不能无损映射到现有 NVIDIA Docker 路径的 NPU、多厂商、
 capability 或 Runtime Profile 请求会 fail closed，直到后续 M6 持久化与调度 PR 完成。
-旧字段在 v0.5.0 全周期保留；不得早于 v0.6.0 删除，且删除前必须另行完成使用量审计、
+旧字段在 v0.6.0 全周期继续保留；不得早于后续独立版本删除，且删除前必须另行完成使用量审计、
 迁移指南与独立兼容性评审。
 
 | 资源 | 方法与路径 |
@@ -205,7 +205,7 @@ curl -fsS -H "Authorization: Bearer $API_KEY" \
   "http://localhost:8000/api/v1/tasks/$TASK_ID/artifacts"
 ```
 
-Worker 会在 execution-fenced 私有 workspace 中校验并物化 inputs，把声明文件逐一 mount 给 runtime，在成功退出后、terminal transition 前发布 outputs，最后清理 workspace。Compose named-volume `Subpath` 已通过真实 Docker task artifact E2E；裸机单文件 bind、executor 顺序和 Kubernetes pinned file `hostPath` 有自动化测试。Kubernetes 仍只有 Pod spec 证据，没有 Kind 文件可见性实测。
+Worker 会在 execution-fenced 私有 workspace 中校验并物化 inputs，把声明文件逐一 mount 给 runtime，在成功退出后、terminal transition 前发布 outputs，最后清理 workspace。Compose named-volume `Subpath` 已通过真实 Docker task artifact E2E；裸机单文件 bind、executor 顺序和 Kubernetes development/test pinned file `hostPath` 有自动化测试。production Kubernetes 会在 API 调用前拒绝 artifact-bearing Job；v0.6 不声明跨节点文件数据面。
 
 ## Secret
 

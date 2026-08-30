@@ -1,0 +1,89 @@
+{
+  "profiles": [
+    {
+      "dtypes": [
+        "bfloat16"
+      ],
+      "engine": "vllm-ascend",
+      "evidence_status": "SCHEMA_READY",
+      "features": [
+        "streaming"
+      ],
+      "hardware_families": [
+        "Atlas A2",
+        "Atlas A3"
+      ],
+      "identity": "ascend-vllm-k8s-a2@1.0.0",
+      "kind": "npu",
+      "model_architectures": [],
+      "path": "runtime_profiles/ascend-vllm-k8s.example.yaml",
+      "profile_id": "ascend-vllm-k8s-a2",
+      "profile_version": "1.0.0",
+      "semantic_digest": "sha256:57da1670ff8bf9737d18aabe812bd850c15ad5f68fc1acb3a151dee9c493ed7a",
+      "vendor": "huawei-ascend"
+    },
+    {
+      "dtypes": [
+        "bfloat16"
+      ],
+      "engine": "vllm-ascend",
+      "evidence_status": "REAL_HW_NOT_RUN",
+      "features": [
+        "streaming"
+      ],
+      "hardware_families": [
+        "Atlas A2 (Ascend 910B)"
+      ],
+      "identity": "ascend-vllm-k8s-a2@2.0.0",
+      "kind": "npu",
+      "model_architectures": [],
+      "path": "runtime_profiles/ascend-vllm-k8s.yaml",
+      "profile_id": "ascend-vllm-k8s-a2",
+      "profile_version": "2.0.0",
+      "semantic_digest": "sha256:b128e3eff9e2a7daa7ddefb9edc1f2e2a9f2116f0110e8bb7627e27672669bca",
+      "vendor": "huawei-ascend"
+    },
+    {
+      "dtypes": [
+        "bfloat16"
+      ],
+      "engine": "vllm",
+      "evidence_status": "SCHEMA_READY",
+      "features": [
+        "streaming"
+      ],
+      "hardware_families": [],
+      "identity": "nvidia-vllm-k8s@1.0.0",
+      "kind": "gpu",
+      "model_architectures": [],
+      "path": "runtime_profiles/nvidia-vllm-k8s.example.yaml",
+      "profile_id": "nvidia-vllm-k8s",
+      "profile_version": "1.0.0",
+      "semantic_digest": "sha256:07c85cb848e026238f53a2aa327eb67a52643ca8da85fc81ee71a8a2eee156e5",
+      "vendor": "nvidia"
+    },
+    {
+      "dtypes": [
+        "float16",
+        "bfloat16"
+      ],
+      "engine": "vllm",
+      "evidence_status": "REAL_HW_NOT_RUN",
+      "features": [
+        "streaming"
+      ],
+      "hardware_families": [
+        "NVIDIA CUDA compute capability 8.0+"
+      ],
+      "identity": "nvidia-vllm-k8s@2.0.0",
+      "kind": "gpu",
+      "model_architectures": [],
+      "path": "runtime_profiles/nvidia-vllm-k8s.yaml",
+      "profile_id": "nvidia-vllm-k8s",
+      "profile_version": "2.0.0",
+      "semantic_digest": "sha256:4a4ca1e6458cd7bc331b654eb3dce5b6cf0936a24d7e8b18d33d7917864fc3c2",
+      "vendor": "nvidia"
+    }
+  ],
+  "schema_version": "1.0.0"
+}

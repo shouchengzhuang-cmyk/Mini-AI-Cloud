@@ -105,6 +105,15 @@ class ExecutionSpec:
     model_variant_id: uuid.UUID | None = None
     allocation_authority: str | None = None
     mounts: tuple[RuntimeMount, ...] = ()
+    worker_session_id: uuid.UUID | None = None
+
+
+@dataclass(slots=True)
+class RuntimeObservation:
+    """Mutable, non-identity observations attached to a frozen runtime handle."""
+
+    pod_name: str | None = None
+    pod_uid: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +125,23 @@ class RuntimeHandle:
     object_id: str
     display_id: str
     native: object | None = field(default=None, repr=False, compare=False)
+    namespace: str | None = None
+    resource_uid: str | None = None
+    resource_version: str | None = None
+    controller_session_id: uuid.UUID | None = None
+    spec_hash: str | None = None
+    labels: Mapping[str, str] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+        hash=False,
+    )
+    observation: RuntimeObservation = field(
+        default_factory=RuntimeObservation,
+        repr=False,
+        compare=False,
+        hash=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)

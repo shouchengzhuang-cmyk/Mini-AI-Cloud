@@ -1,187 +1,78 @@
 import asyncio
 import uuid
 from collections.abc import AsyncIterator
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
+from kubernetes_asyncio import client
 from kubernetes_asyncio.client.exceptions import ApiException
 
-from core.enums import ErrorCategory, ErrorCode
+from core.enums import ErrorCode
 from core.runtime_profiles import RuntimeProfileCatalog
 from worker.kubernetes_runtime import (
-    ACCELERATOR_COUNT_ANNOTATION,
-    ACCELERATOR_KIND_LABEL,
-    ACCELERATOR_RESOURCE_ANNOTATION,
-    ACCELERATOR_VENDOR_LABEL,
-    ALLOCATION_AUTHORITY_ANNOTATION,
+    BATCH_JOB_RESOURCE_KIND,
+    CLUSTER_ID_LABEL,
+    CONTROLLER_SESSION_ANNOTATION,
     EXECUTION_ID_LABEL,
     MANAGED_LABEL,
-    NETWORK_POLICY_RESOURCE_KIND,
     PROJECT_ID_LABEL,
     RESOURCE_KIND_LABEL,
-    RUNTIME_PROFILE_DIGEST_ANNOTATION,
-    RUNTIME_PROFILE_ID_LABEL,
-    RUNTIME_PROFILE_VERSION_LABEL,
+    RUNTIME_PROFILE_DIGEST_LABEL,
+    SPEC_HASH_LABEL,
     TASK_ID_LABEL,
     WORKER_ID_LABEL,
+    WORKER_SESSION_ID_LABEL,
+    KubernetesArtifactsUnsupported,
+    KubernetesDeadlineExceeded,
     KubernetesGpuUnavailable,
     KubernetesImagePullFailed,
     KubernetesOomKilled,
     KubernetesRuntime,
     KubernetesRuntimeError,
 )
-from worker.runtime import ComputeRuntime, ExecutionSpec, RuntimeHandle, RuntimeMount
+from worker.runtime import ExecutionSpec, RuntimeHandle, RuntimeMount
+
+pytestmark = pytest.mark.asyncio
 
 REPOSITORY_ROOT = Path(__file__).parents[2]
+WORKER_SESSION_ID = uuid.UUID("44444444-4444-4444-4444-444444444444")
 
 
-def _spec() -> ExecutionSpec:
-    return ExecutionSpec(
+def _spec(**changes: object) -> ExecutionSpec:
+    spec = ExecutionSpec(
         task_id=uuid.UUID("11111111-1111-1111-1111-111111111111"),
         project_id=uuid.UUID("22222222-2222-2222-2222-222222222222"),
         execution_id=uuid.UUID("33333333-3333-3333-3333-333333333333"),
         worker_id="worker-k8s-a",
-        image="python:3.12-slim",
+        worker_session_id=WORKER_SESSION_ID,
+        image="python:3.12-alpine",
         command=("python", "-c", "print('ok')"),
         environment={"Z_VAR": "last", "A_VAR": "first"},
         timeout_seconds=45,
         cpu_limit=1.5,
-        memory_limit_mb=512,
-        gpu_count=2,
-        network_enabled=False,
-        labels={"region": "local"},
-    )
-
-
-def _fake_networking_api() -> SimpleNamespace:
-    policies: dict[str, object] = {}
-
-    async def create_policy(*, namespace: str, body: object) -> object:
-        assert namespace == "runtime-tests"
-        name = str(getattr(getattr(body, "metadata", None), "name", ""))
-        policies[name] = body
-        return body
-
-    async def read_policy(*, name: str, namespace: str) -> object:
-        assert namespace == "runtime-tests"
-        try:
-            return policies[name]
-        except KeyError as exc:
-            raise ApiException(status=404, reason="NotFound") from exc
-
-    async def delete_policy(*, name: str, namespace: str, **_: object) -> None:
-        assert namespace == "runtime-tests"
-        policies.pop(name, None)
-
-    return SimpleNamespace(
-        policies=policies,
-        create_namespaced_network_policy=AsyncMock(side_effect=create_policy),
-        read_namespaced_network_policy=AsyncMock(side_effect=read_policy),
-        delete_namespaced_network_policy=AsyncMock(side_effect=delete_policy),
-    )
-
-
-def _runtime(
-    api: object,
-    *,
-    networking_api: object | None = None,
-    runtime_profile_catalog: RuntimeProfileCatalog | None = None,
-) -> KubernetesRuntime:
-    return KubernetesRuntime(
-        namespace="runtime-tests",
-        node_name="gpu-node-a",
-        cleanup_grace_seconds=7,
-        poll_interval=0.001,
-        api=api,
-        networking_api=networking_api or _fake_networking_api(),
-        runtime_profile_catalog=runtime_profile_catalog,
-    )
-
-
-def _handle() -> RuntimeHandle:
-    spec = _spec()
-    name = KubernetesRuntime.pod_name(spec.task_id, spec.execution_id)
-    return RuntimeHandle(
+        memory_limit_mb=768,
+        gpu_count=0,
+        network_enabled=True,
+        labels={},
         runtime_type="kubernetes",
-        resource_kind="pod",
-        object_id=name,
-        display_id=name,
     )
+    return replace(spec, **changes)  # type: ignore[arg-type]
 
 
-def test_kubernetes_runtime_implements_compute_runtime_protocol() -> None:
-    assert isinstance(_runtime(SimpleNamespace()), ComputeRuntime)
+def _catalog() -> RuntimeProfileCatalog:
+    return RuntimeProfileCatalog.from_path(REPOSITORY_ROOT / "runtime_profiles/manifest.json")
 
 
-async def test_prepare_builds_fenced_pod_with_resources_node_and_deadline() -> None:
-    api = SimpleNamespace(create_namespaced_pod=AsyncMock())
-
-    async def create_pod(*, namespace: str, body: object) -> object:
-        assert namespace == "runtime-tests"
-        return body
-
-    api.create_namespaced_pod.side_effect = create_pod
-    runtime = _runtime(api)
-    spec = _spec()
-
-    handle = await runtime.prepare(spec)
-
-    pod = api.create_namespaced_pod.call_args.kwargs["body"]
-    expected_name = KubernetesRuntime.pod_name(spec.task_id, spec.execution_id)
-    assert pod.metadata.name == expected_name
-    assert pod.metadata.labels == {
-        TASK_ID_LABEL: str(spec.task_id),
-        PROJECT_ID_LABEL: str(spec.project_id),
-        EXECUTION_ID_LABEL: str(spec.execution_id),
-        WORKER_ID_LABEL: spec.worker_id,
-        MANAGED_LABEL: "true",
-    }
-    assert pod.spec.node_name == "gpu-node-a"
-    assert pod.spec.restart_policy == "Never"
-    assert pod.spec.active_deadline_seconds == 45
-    assert pod.spec.automount_service_account_token is False
-    assert pod.spec.security_context.run_as_non_root is True
-    assert pod.spec.security_context.run_as_user == 65532
-    assert pod.spec.security_context.run_as_group == 65532
-    assert pod.spec.security_context.seccomp_profile.type == "RuntimeDefault"
-    container = pod.spec.containers[0]
-    assert container.name == "task"
-    assert container.image == spec.image
-    assert container.command == list(spec.command)
-    assert [(item.name, item.value) for item in container.env] == [
-        ("A_VAR", "first"),
-        ("Z_VAR", "last"),
-    ]
-    expected_resources = {
-        "cpu": "1500m",
-        "memory": "512Mi",
-        "nvidia.com/gpu": "2",
-    }
-    assert container.resources.requests == expected_resources
-    assert container.resources.limits == expected_resources
-    assert container.security_context.allow_privilege_escalation is False
-    assert container.security_context.capabilities.drop == ["ALL"]
-    assert container.security_context.privileged is False
-    assert container.security_context.read_only_root_filesystem is True
-    assert handle.runtime_type == "kubernetes"
-    assert handle.resource_kind == "pod"
-    assert handle.object_id == expected_name
-
-
-async def test_prepare_renders_ascend_resource_from_exact_runtime_profile() -> None:
-    api = SimpleNamespace(create_namespaced_pod=AsyncMock())
-    api.create_namespaced_pod.side_effect = lambda *, namespace, body: body
-    catalog = RuntimeProfileCatalog.from_path(REPOSITORY_ROOT / "runtime_profiles/manifest.json")
-    entry = next(
-        profile
-        for profile in catalog.manifest.profiles
-        if profile.identity == "ascend-vllm-k8s-a2@2.0.0"
-    )
-    spec = replace(
+def _profile_spec(identity: str) -> tuple[RuntimeProfileCatalog, ExecutionSpec]:
+    catalog = _catalog()
+    entry = next(item for item in catalog.manifest.profiles if item.identity == identity)
+    return catalog, replace(
         _spec(),
+        gpu_count=2,
         selected_vendor=entry.vendor.value,
         selected_kind=entry.kind.value,
         runtime_profile_id=entry.profile_id,
@@ -190,380 +81,685 @@ async def test_prepare_renders_ascend_resource_from_exact_runtime_profile() -> N
         allocation_authority="kubernetes_device_plugin",
     )
 
-    await _runtime(api, runtime_profile_catalog=catalog).prepare(spec)
 
-    pod = api.create_namespaced_pod.call_args.kwargs["body"]
-    container = pod.spec.containers[0]
-    assert container.resources.requests["huawei.com/Ascend910"] == "2"
-    assert "nvidia.com/gpu" not in container.resources.requests
-    assert pod.spec.runtime_class_name == "ascend"
-    assert pod.spec.scheduler_name == "volcano"
-    assert pod.spec.node_selector == {"accelerator.mini-ai-cloud/vendor": "huawei-ascend"}
-    assert pod.spec.tolerations[0].key == "huawei.com/Ascend910"
-    assert pod.metadata.labels[ACCELERATOR_VENDOR_LABEL] == "huawei-ascend"
-    assert pod.metadata.labels[ACCELERATOR_KIND_LABEL] == "npu"
-    assert pod.metadata.labels[RUNTIME_PROFILE_ID_LABEL] == entry.profile_id
-    assert pod.metadata.labels[RUNTIME_PROFILE_VERSION_LABEL] == entry.profile_version
-    assert pod.metadata.annotations == {
-        RUNTIME_PROFILE_DIGEST_ANNOTATION: entry.semantic_digest,
-        ACCELERATOR_RESOURCE_ANNOTATION: "huawei.com/Ascend910",
-        ACCELERATOR_COUNT_ANNOTATION: "2",
-        ALLOCATION_AUTHORITY_ANNOTATION: "kubernetes_device_plugin",
-    }
-    visibility = next(item for item in container.env if item.name == "ASCEND_VISIBLE_DEVICES")
-    assert visibility.value_from.field_ref.field_path == (
-        "metadata.annotations['huawei.com/Ascend910']"
+def _job(runtime: KubernetesRuntime, spec: ExecutionSpec, *, uid: str = "job-uid") -> Any:
+    job = runtime._build_job(spec)
+    job.metadata.uid = uid
+    job.metadata.resource_version = "1"
+    return job
+
+
+def _pod(
+    job: Any,
+    *,
+    uid: str = "pod-uid",
+    status: Any | None = None,
+    controller_uid: str | None = None,
+) -> Any:
+    return client.V1Pod(
+        metadata=client.V1ObjectMeta(
+            name="controlled-pod",
+            uid=uid,
+            labels=dict(job.spec.template.metadata.labels),
+            owner_references=[
+                client.V1OwnerReference(
+                    api_version="batch/v1",
+                    kind="Job",
+                    name=job.metadata.name,
+                    uid=controller_uid or job.metadata.uid,
+                    controller=True,
+                    block_owner_deletion=True,
+                )
+            ],
+        ),
+        spec=job.spec.template.spec,
+        status=status,
     )
 
 
-def test_vendor_aware_kubernetes_task_fails_closed_on_profile_drift() -> None:
-    catalog = RuntimeProfileCatalog.from_path(REPOSITORY_ROOT / "runtime_profiles/manifest.json")
-    entry = next(
-        profile for profile in catalog.manifest.profiles if profile.vendor.value == "nvidia"
+def _apis(*, pods: list[object] | None = None) -> tuple[SimpleNamespace, SimpleNamespace]:
+    batch = SimpleNamespace(
+        create_namespaced_job=AsyncMock(),
+        read_namespaced_job=AsyncMock(),
+        delete_namespaced_job=AsyncMock(),
+        patch_namespaced_job=AsyncMock(),
+        list_namespaced_job=AsyncMock(),
     )
-    spec = replace(
-        _spec(),
-        selected_vendor=entry.vendor.value,
-        selected_kind=entry.kind.value,
-        runtime_profile_id=entry.profile_id,
-        runtime_profile_version=entry.profile_version,
-        runtime_profile_digest="sha256:" + "0" * 64,
-        allocation_authority="kubernetes_device_plugin",
+    core = SimpleNamespace(
+        list_namespaced_pod=AsyncMock(return_value=SimpleNamespace(items=pods or [])),
+        read_namespaced_pod_log=AsyncMock(),
+        read_namespaced_pod_status=AsyncMock(),
     )
 
-    with pytest.raises(KubernetesGpuUnavailable, match="digest"):
-        _runtime(SimpleNamespace(), runtime_profile_catalog=catalog)._build_pod(spec)
-
-
-async def test_prepare_creates_task_scoped_deny_all_policy_before_pod() -> None:
-    calls: list[str] = []
-    api = SimpleNamespace(create_namespaced_pod=AsyncMock())
-    networking_api = _fake_networking_api()
-
-    async def create_policy(*, namespace: str, body: object) -> object:
-        calls.append("policy")
+    async def create_job(*, namespace: str, body: Any) -> Any:
         assert namespace == "runtime-tests"
+        body.metadata.uid = "job-uid"
+        body.metadata.resource_version = "1"
+        batch.read_namespaced_job.return_value = body
         return body
 
-    async def create_pod(*, namespace: str, body: object) -> object:
-        calls.append("pod")
-        assert namespace == "runtime-tests"
-        return body
+    batch.create_namespaced_job.side_effect = create_job
+    return batch, core
 
-    networking_api.create_namespaced_network_policy.side_effect = create_policy
-    api.create_namespaced_pod.side_effect = create_pod
+
+class _StreamingLogContent:
+    def __init__(self, *chunks: bytes) -> None:
+        self._chunks = chunks
+
+    async def iter_any(self) -> AsyncIterator[bytes]:
+        for chunk in self._chunks:
+            yield chunk
+
+
+class _StreamingLogResponse:
+    def __init__(self, status: int, reason: str, *chunks: bytes) -> None:
+        self.status = status
+        self.reason = reason
+        self.content = _StreamingLogContent(*chunks)
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _runtime(
+    batch: object,
+    core: object,
+    *,
+    app_env: str = "test",
+    networking_api: object | None = None,
+    runtime_profile_catalog: RuntimeProfileCatalog | None = None,
+) -> KubernetesRuntime:
+    return KubernetesRuntime(
+        namespace="runtime-tests",
+        cluster_id="cluster-a",
+        app_env=app_env,
+        node_name="legacy-node-a",
+        cleanup_grace_seconds=7,
+        poll_interval=0.001,
+        api=batch,
+        core_api=core,
+        networking_api=networking_api,
+        runtime_profile_catalog=runtime_profile_catalog,
+    )
+
+
+async def test_prepare_builds_fenced_cpu_job_without_node_name_or_extended_resource() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core, app_env="production")
     spec = _spec()
 
-    await _runtime(api, networking_api=networking_api).prepare(spec)
+    handle = await runtime.prepare(spec)
 
-    policy = networking_api.create_namespaced_network_policy.call_args.kwargs["body"]
+    job = batch.create_namespaced_job.call_args.kwargs["body"]
+    pod_spec = job.spec.template.spec
+    resources = pod_spec.containers[0].resources
     expected_labels = {
         TASK_ID_LABEL: str(spec.task_id),
         PROJECT_ID_LABEL: str(spec.project_id),
         EXECUTION_ID_LABEL: str(spec.execution_id),
         WORKER_ID_LABEL: spec.worker_id,
+        WORKER_SESSION_ID_LABEL: str(WORKER_SESSION_ID),
+        CLUSTER_ID_LABEL: "cluster-a",
         MANAGED_LABEL: "true",
+        RESOURCE_KIND_LABEL: BATCH_JOB_RESOURCE_KIND,
+        RUNTIME_PROFILE_DIGEST_LABEL: "none",
     }
-    assert calls == ["policy", "pod"]
-    assert policy.metadata.labels == {
-        **expected_labels,
-        RESOURCE_KIND_LABEL: NETWORK_POLICY_RESOURCE_KIND,
-    }
-    assert policy.spec.pod_selector.match_labels == expected_labels
-    assert set(policy.spec.policy_types) == {"Ingress", "Egress"}
-    assert policy.spec.ingress == []
-    assert policy.spec.egress == []
+    assert job.api_version == "batch/v1"
+    assert job.kind == "Job"
+    assert job.spec.backoff_limit == 0
+    assert job.spec.active_deadline_seconds == 45
+    assert job.spec.completions == job.spec.parallelism == 1
+    assert pod_spec.restart_policy == "Never"
+    assert pod_spec.node_name is None
+    assert pod_spec.scheduler_name is None
+    assert resources.requests == resources.limits == {"cpu": "1500m", "memory": "768Mi"}
+    assert all("/" not in key for key in resources.requests)
+    assert job.metadata.labels == job.spec.template.metadata.labels
+    assert {**expected_labels, SPEC_HASH_LABEL: handle.spec_hash} == job.metadata.labels
+    assert handle.resource_kind == "job"
+    assert handle.resource_uid == "job-uid"
+    assert handle.resource_version == "1"
+    assert handle.controller_session_id == WORKER_SESSION_ID
+    assert handle.namespace == "runtime-tests"
+    assert handle.observation.pod_name is None
 
 
-async def test_prepare_skips_policy_when_task_network_is_enabled() -> None:
-    api = SimpleNamespace(create_namespaced_pod=AsyncMock())
-    api.create_namespaced_pod.side_effect = lambda *, namespace, body: body
-    networking_api = _fake_networking_api()
+async def test_prepare_accepts_api_server_defaulted_scheduler_name() -> None:
+    batch, core = _apis()
 
-    await _runtime(api, networking_api=networking_api).prepare(
-        replace(_spec(), network_enabled=True)
-    )
-
-    networking_api.create_namespaced_network_policy.assert_not_awaited()
-
-
-async def test_failed_pod_create_retains_deny_all_policy_for_safe_retry() -> None:
-    api = SimpleNamespace(
-        create_namespaced_pod=AsyncMock(
-            side_effect=ApiException(status=500, reason="control-plane unavailable")
-        )
-    )
-    networking_api = _fake_networking_api()
-
-    with pytest.raises(KubernetesRuntimeError, match="control-plane unavailable"):
-        await _runtime(api, networking_api=networking_api).prepare(_spec())
-
-    assert len(networking_api.policies) == 1
-    networking_api.delete_namespaced_network_policy.assert_not_awaited()
-
-
-async def test_prepare_pins_file_scoped_artifact_host_paths(tmp_path: Path) -> None:
-    input_path = tmp_path / "input.bin"
-    output_path = tmp_path / "output.bin"
-    input_path.write_bytes(b"input")
-    output_path.touch()
-    spec = replace(
-        _spec(),
-        mounts=(
-            RuntimeMount(str(input_path), "/workspace/inputs/input.bin", True),
-            RuntimeMount(str(output_path), "/output/model.bin", False),
-        ),
-    )
-    api = SimpleNamespace(create_namespaced_pod=AsyncMock())
-
-    async def create_pod(*, namespace: str, body: object) -> object:
+    async def create_defaulted_job(*, namespace: str, body: Any) -> Any:
         assert namespace == "runtime-tests"
+        body.metadata.uid = "job-uid"
+        body.metadata.resource_version = "1"
+        body.spec.template.spec.scheduler_name = "default-scheduler"
+        batch.read_namespaced_job.return_value = body
         return body
 
-    api.create_namespaced_pod.side_effect = create_pod
+    batch.create_namespaced_job.side_effect = create_defaulted_job
 
-    await _runtime(api).prepare(spec)
+    handle = await _runtime(batch, core).prepare(_spec())
+    created = cast(Any, handle.native)
 
-    pod = api.create_namespaced_pod.call_args.kwargs["body"]
-    assert pod.spec.node_name == "gpu-node-a"
-    assert [volume.host_path.path for volume in pod.spec.volumes] == [
-        str(input_path.resolve()),
-        str(output_path.resolve()),
-    ]
-    assert [volume.host_path.type for volume in pod.spec.volumes] == ["File", "File"]
-    assert [
-        (mount.name, mount.mount_path, mount.read_only)
-        for mount in pod.spec.containers[0].volume_mounts
-    ] == [
-        ("artifact-0", "/workspace/inputs/input.bin", True),
-        ("artifact-1", "/output/model.bin", False),
-    ]
+    assert handle.resource_uid == "job-uid"
+    assert created.spec.template.spec.scheduler_name == "default-scheduler"
 
 
-async def test_prepare_adopts_same_execution_after_already_exists() -> None:
+@pytest.mark.parametrize(
+    ("identity", "resource_name", "runtime_class", "scheduler"),
+    [
+        ("nvidia-vllm-k8s@2.0.0", "nvidia.com/gpu", "nvidia", None),
+        ("ascend-vllm-k8s-a2@2.0.0", "huawei.com/Ascend910", "ascend", "volcano"),
+    ],
+)
+async def test_profile_drives_accelerator_job_placement_without_node_name(
+    identity: str,
+    resource_name: str,
+    runtime_class: str,
+    scheduler: str | None,
+) -> None:
+    catalog, spec = _profile_spec(identity)
+    batch, core = _apis()
+
+    await _runtime(batch, core, runtime_profile_catalog=catalog).prepare(spec)
+
+    job = batch.create_namespaced_job.call_args.kwargs["body"]
+    pod_spec = job.spec.template.spec
+    resources = pod_spec.containers[0].resources.requests
+    assert resources[resource_name] == "2"
+    assert pod_spec.runtime_class_name == runtime_class
+    assert pod_spec.scheduler_name == scheduler
+    assert pod_spec.node_name is None
+    assert pod_spec.node_selector
+    assert pod_spec.tolerations
+    if identity.startswith("nvidia"):
+        assert pod_spec.affinity is not None
+
+
+async def test_accelerator_job_without_profile_fails_closed_without_nvidia_fallback() -> None:
+    batch, core = _apis()
+    with pytest.raises(KubernetesGpuUnavailable, match="exact Runtime Profile"):
+        await _runtime(batch, core).prepare(replace(_spec(), gpu_count=1))
+    batch.create_namespaced_job.assert_not_awaited()
+
+
+async def test_create_conflict_adopts_only_exact_job() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
     spec = _spec()
-    existing = SimpleNamespace(
-        metadata=SimpleNamespace(
-            labels={
-                TASK_ID_LABEL: str(spec.task_id),
-                PROJECT_ID_LABEL: str(spec.project_id),
-                EXECUTION_ID_LABEL: str(spec.execution_id),
-                WORKER_ID_LABEL: spec.worker_id,
-                MANAGED_LABEL: "true",
-            }
-        )
-    )
-    api = SimpleNamespace(
-        create_namespaced_pod=AsyncMock(
-            side_effect=ApiException(status=409, reason="AlreadyExists")
-        ),
-        read_namespaced_pod=AsyncMock(return_value=existing),
-    )
+    existing = _job(runtime, spec)
+    batch.create_namespaced_job.side_effect = ApiException(status=409, reason="AlreadyExists")
+    batch.read_namespaced_job.return_value = existing
 
-    handle = await _runtime(api).prepare(spec)
+    handle = await runtime.prepare(spec)
 
-    api.read_namespaced_pod.assert_awaited_once_with(
-        name=handle.object_id,
-        namespace="runtime-tests",
-    )
-    assert handle.native is existing
-
-
-async def test_prepare_adopts_only_matching_deny_all_policy_after_conflict() -> None:
-    spec = _spec()
-    api = SimpleNamespace(create_namespaced_pod=AsyncMock())
-    api.create_namespaced_pod.side_effect = lambda *, namespace, body: body
-    networking_api = _fake_networking_api()
-    runtime = _runtime(api, networking_api=networking_api)
-    existing_policy = runtime._build_network_policy(spec)
-    networking_api.create_namespaced_network_policy.side_effect = ApiException(
-        status=409,
-        reason="AlreadyExists",
-    )
-    networking_api.read_namespaced_network_policy.return_value = existing_policy
-    networking_api.read_namespaced_network_policy.side_effect = None
-
-    await runtime.prepare(spec)
-
-    networking_api.read_namespaced_network_policy.assert_awaited_once_with(
-        name=runtime.network_policy_name(runtime.pod_name(spec.task_id, spec.execution_id)),
+    assert handle.resource_uid == "job-uid"
+    batch.read_namespaced_job.assert_any_await(
+        name=runtime.job_name(spec.task_id, spec.execution_id),
         namespace="runtime-tests",
     )
 
 
-async def test_prepare_refuses_conflicting_policy_with_narrower_selector() -> None:
+async def test_create_conflict_adopts_api_server_defaulted_scheduler_name() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
     spec = _spec()
-    api = SimpleNamespace(create_namespaced_pod=AsyncMock())
-    networking_api = _fake_networking_api()
-    runtime = _runtime(api, networking_api=networking_api)
-    conflicting_policy = runtime._build_network_policy(spec)
-    conflicting_policy.spec.pod_selector.match_labels = {
-        **conflicting_policy.spec.pod_selector.match_labels,
-        EXECUTION_ID_LABEL: str(uuid.uuid4()),
-    }
-    networking_api.create_namespaced_network_policy.side_effect = ApiException(status=409)
-    networking_api.read_namespaced_network_policy.return_value = conflicting_policy
-    networking_api.read_namespaced_network_policy.side_effect = None
+    existing = _job(runtime, spec)
+    existing.spec.template.spec.scheduler_name = "default-scheduler"
+    batch.create_namespaced_job.side_effect = ApiException(status=409, reason="AlreadyExists")
+    batch.read_namespaced_job.return_value = existing
 
-    with pytest.raises(KubernetesRuntimeError, match="exact deny-all isolation"):
+    handle = await runtime.prepare(spec)
+    adopted = cast(Any, handle.native)
+
+    assert handle.resource_uid == "job-uid"
+    assert adopted.spec.template.spec.scheduler_name == "default-scheduler"
+
+
+@pytest.mark.parametrize("drift", ["spec", "scheduler", "session"])
+async def test_create_conflict_quarantines_spec_hash_or_session_drift(drift: str) -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
+    spec = _spec()
+    existing = _job(runtime, spec)
+    if drift == "spec":
+        existing.spec.template.spec.containers[0].image = "attacker/image:latest"
+    elif drift == "scheduler":
+        existing.spec.template.spec.scheduler_name = "attacker-scheduler"
+    else:
+        existing.metadata.labels[WORKER_SESSION_ID_LABEL] = str(uuid.uuid4())
+    batch.create_namespaced_job.side_effect = ApiException(status=409)
+    batch.read_namespaced_job.return_value = existing
+
+    with pytest.raises(KubernetesRuntimeError, match="mismatched"):
         await runtime.prepare(spec)
 
-    api.create_namespaced_pod.assert_not_awaited()
 
-
-async def test_prepare_refuses_to_adopt_pod_from_stale_execution() -> None:
+async def test_logs_read_only_controlled_task_container_and_capture_pod_identity() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
     spec = _spec()
-    existing = SimpleNamespace(
-        metadata=SimpleNamespace(
-            labels={
-                TASK_ID_LABEL: str(spec.task_id),
-                PROJECT_ID_LABEL: str(spec.project_id),
-                EXECUTION_ID_LABEL: str(uuid.uuid4()),
-                WORKER_ID_LABEL: spec.worker_id,
-                MANAGED_LABEL: "true",
-            }
-        )
-    )
-    api = SimpleNamespace(
-        create_namespaced_pod=AsyncMock(side_effect=ApiException(status=409)),
-        read_namespaced_pod=AsyncMock(return_value=existing),
-    )
+    job = _job(runtime, spec)
+    pod = _pod(job)
+    core.list_namespaced_pod.return_value = SimpleNamespace(items=[pod])
 
-    with pytest.raises(KubernetesRuntimeError, match="mismatched execution labels"):
-        await _runtime(api).prepare(spec)
+    async def chunks() -> AsyncIterator[bytes]:
+        yield b"one\n"
+        yield b"two\n"
 
-
-async def test_logs_wait_start_stop_and_cleanup_use_pod_lifecycle() -> None:
-    async def chunks() -> AsyncIterator[bytes | str]:
-        yield b"stdout-one\n"
-        yield "stdout-two\n"
-
-    terminated = SimpleNamespace(exit_code=17)
-    pod = SimpleNamespace(
-        status=SimpleNamespace(
-            phase="Succeeded",
-            container_statuses=[SimpleNamespace(state=SimpleNamespace(terminated=terminated))],
-        )
-    )
-    api = SimpleNamespace(
-        read_namespaced_pod=AsyncMock(return_value=pod),
-        read_namespaced_pod_log=AsyncMock(return_value=chunks()),
-        read_namespaced_pod_status=AsyncMock(return_value=pod),
-        delete_namespaced_pod=AsyncMock(),
-    )
-    runtime = _runtime(api)
-    handle = _handle()
+    core.read_namespaced_pod_log.return_value = chunks()
+    handle = await runtime.prepare(spec)
     ready = asyncio.Event()
 
-    await runtime.start(handle)
     logs = [item async for item in runtime.logs(handle, ready=ready)]
-    exit_code = await runtime.wait(handle)
-    await runtime.stop(handle)
-    await runtime.cleanup(handle)
 
     assert ready.is_set()
-    assert [(item.stream, item.content) for item in logs] == [
-        ("stdout", b"stdout-one\n"),
-        ("stdout", b"stdout-two\n"),
-    ]
-    assert exit_code == 17
-    assert api.delete_namespaced_pod.await_count == 2
-    stop_call, cleanup_call = api.delete_namespaced_pod.await_args_list
-    assert stop_call.kwargs["grace_period_seconds"] == 7
-    assert cleanup_call.kwargs["grace_period_seconds"] == 0
-    assert stop_call.kwargs["propagation_policy"] == "Background"
+    assert [item.content for item in logs] == [b"one\n", b"two\n"]
+    assert handle.observation.pod_name == "controlled-pod"
+    assert handle.observation.pod_uid == "pod-uid"
+    assert core.read_namespaced_pod_log.call_args.kwargs["container"] == "task"
 
 
-async def test_cleanup_deletes_only_its_task_scoped_network_policy() -> None:
-    api = SimpleNamespace(
-        create_namespaced_pod=AsyncMock(),
-        delete_namespaced_pod=AsyncMock(),
+async def test_logs_retry_terminal_streaming_400_with_non_follow_read() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
+    spec = _spec()
+    job = _job(runtime, spec)
+    core.list_namespaced_pod.return_value = SimpleNamespace(items=[_pod(job)])
+    core.read_namespaced_pod_status.return_value = _pod(
+        job,
+        status=SimpleNamespace(phase="Succeeded", container_statuses=[]),
     )
-    api.create_namespaced_pod.side_effect = lambda *, namespace, body: body
-    networking_api = _fake_networking_api()
-    runtime = _runtime(api, networking_api=networking_api)
+    waiting = _StreamingLogResponse(400, "Bad Request", b"container is waiting\n")
+    completed = _StreamingLogResponse(200, "OK", b"KIND_BATCH_SUCCESS\n")
+    core.read_namespaced_pod_log.side_effect = [waiting, completed]
+    handle = await runtime.prepare(spec)
+    ready = asyncio.Event()
 
-    handle = await runtime.prepare(_spec())
-    assert networking_api.policies
+    logs = [item async for item in runtime.logs(handle, ready=ready)]
 
-    await runtime.cleanup(handle)
-
-    assert networking_api.policies == {}
-    networking_api.delete_namespaced_network_policy.assert_awaited_once()
-
-
-async def test_cleanup_refuses_to_delete_non_managed_policy() -> None:
-    api = SimpleNamespace(delete_namespaced_pod=AsyncMock())
-    networking_api = _fake_networking_api()
-    runtime = _runtime(api, networking_api=networking_api)
-    policy = runtime._build_network_policy(_spec())
-    policy.metadata.labels.pop(RESOURCE_KIND_LABEL)
-    networking_api.read_namespaced_network_policy.return_value = policy
-    networking_api.read_namespaced_network_policy.side_effect = None
-
-    with pytest.raises(KubernetesRuntimeError, match="mismatched execution labels"):
-        await runtime.cleanup(_handle())
-
-    networking_api.delete_namespaced_network_policy.assert_not_awaited()
+    assert ready.is_set()
+    assert [item.content for item in logs] == [b"KIND_BATCH_SUCCESS\n"]
+    assert waiting.closed
+    assert completed.closed
+    calls = core.read_namespaced_pod_log.call_args_list
+    assert [call.kwargs["follow"] for call in calls] == [True, False]
 
 
-async def test_wait_polls_until_failed_and_classifies_exit_137_as_oom() -> None:
-    running = SimpleNamespace(status=SimpleNamespace(phase="Running"))
-    failed = SimpleNamespace(
-        status=SimpleNamespace(
-            phase="Failed",
-            container_statuses=[
-                SimpleNamespace(state=SimpleNamespace(terminated=SimpleNamespace(exit_code=137)))
-            ],
-        )
+async def test_logs_retry_pending_streaming_400_without_persisting_error_body() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
+    spec = _spec()
+    job = _job(runtime, spec)
+    core.list_namespaced_pod.return_value = SimpleNamespace(items=[_pod(job)])
+    core.read_namespaced_pod_status.return_value = _pod(
+        job,
+        status=SimpleNamespace(phase="Pending", container_statuses=[]),
     )
-    api = SimpleNamespace(read_namespaced_pod_status=AsyncMock(side_effect=[running, failed]))
+    waiting = _StreamingLogResponse(400, "Bad Request", b"container is waiting\n")
+    running = _StreamingLogResponse(200, "OK", b"KIND_BATCH_SUCCESS\n")
+    core.read_namespaced_pod_log.side_effect = [waiting, running]
+    handle = await runtime.prepare(spec)
+    ready = asyncio.Event()
 
-    with pytest.raises(KubernetesOomKilled) as caught:
-        await _runtime(api).wait(_handle())
+    logs = [item async for item in runtime.logs(handle, ready=ready)]
 
-    assert caught.value.exit_code == 137
-    assert caught.value.error_category == ErrorCategory.RESOURCE_ERROR
-    assert caught.value.error_code == ErrorCode.OOM_KILLED
-    assert api.read_namespaced_pod_status.await_count == 2
+    assert ready.is_set()
+    assert [item.content for item in logs] == [b"KIND_BATCH_SUCCESS\n"]
+    assert waiting.closed
+    assert running.closed
+    calls = core.read_namespaced_pod_log.call_args_list
+    assert [call.kwargs["follow"] for call in calls] == [True, True]
 
 
-async def test_wait_classifies_image_pull_backoff() -> None:
-    waiting = SimpleNamespace(
-        status=SimpleNamespace(
-            phase="Pending",
-            container_statuses=[
-                SimpleNamespace(
-                    state=SimpleNamespace(waiting=SimpleNamespace(reason="ImagePullBackOff"))
+async def test_logs_reject_unchecked_streaming_http_error() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
+    spec = _spec()
+    job = _job(runtime, spec)
+    core.list_namespaced_pod.return_value = SimpleNamespace(items=[_pod(job)])
+    forbidden = _StreamingLogResponse(403, "Forbidden", b"not task output\n")
+    core.read_namespaced_pod_log.return_value = forbidden
+    handle = await runtime.prepare(spec)
+    ready = asyncio.Event()
+
+    with pytest.raises(KubernetesRuntimeError, match="Forbidden"):
+        _ = [item async for item in runtime.logs(handle, ready=ready)]
+
+    assert ready.is_set()
+    assert forbidden.closed
+
+
+async def test_pod_from_foreign_job_controller_is_never_adopted() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
+    spec = _spec()
+    job = _job(runtime, spec)
+    core.list_namespaced_pod.return_value = SimpleNamespace(
+        items=[_pod(job, controller_uid="foreign-job-uid")]
+    )
+    batch.read_namespaced_job.return_value = job
+    handle = RuntimeHandle(
+        runtime_type="kubernetes",
+        resource_kind="job",
+        object_id=job.metadata.name,
+        display_id=job.metadata.name,
+        namespace="runtime-tests",
+        resource_uid="job-uid",
+        resource_version="1",
+        controller_session_id=WORKER_SESSION_ID,
+        spec_hash=job.metadata.labels[SPEC_HASH_LABEL],
+        labels=job.metadata.labels,
+    )
+
+    with pytest.raises(KubernetesRuntimeError, match="no controlled Pod"):
+        await runtime._controlled_pod(handle, required=True)
+
+
+@pytest.mark.parametrize(("exit_code", "terminal"), [(0, "complete"), (9, "failed")])
+async def test_wait_maps_job_terminal_state(exit_code: int, terminal: str) -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
+    spec = _spec()
+    handle = await runtime.prepare(spec)
+    job = cast(Any, handle.native)
+    condition_type = "Complete" if terminal == "complete" else "Failed"
+    job.status = SimpleNamespace(
+        conditions=[SimpleNamespace(type=condition_type, status="True", reason="")]
+    )
+    pod_status = SimpleNamespace(
+        phase="Succeeded" if exit_code == 0 else "Failed",
+        container_statuses=[
+            SimpleNamespace(
+                state=SimpleNamespace(
+                    waiting=None,
+                    terminated=SimpleNamespace(exit_code=exit_code, reason="Completed"),
                 )
-            ],
-        )
+            )
+        ],
     )
-    api = SimpleNamespace(read_namespaced_pod_status=AsyncMock(return_value=waiting))
+    core.list_namespaced_pod.return_value = SimpleNamespace(items=[_pod(job, status=pod_status)])
+    batch.read_namespaced_job.return_value = job
 
-    with pytest.raises(KubernetesImagePullFailed) as caught:
-        await _runtime(api).wait(_handle())
-
-    assert caught.value.error_category == ErrorCategory.INFRA_ERROR
-    assert caught.value.error_code == ErrorCode.IMAGE_PULL_FAILED
+    assert await runtime.wait(handle) == exit_code
 
 
-@pytest.mark.parametrize("operation", ["stop", "cleanup"])
-async def test_delete_is_idempotent_when_pod_is_already_gone(operation: str) -> None:
-    api = SimpleNamespace(delete_namespaced_pod=AsyncMock(side_effect=ApiException(status=404)))
-    runtime = _runtime(api)
+async def test_wait_classifies_oom_image_pull_and_deadline() -> None:
+    for status, error in (
+        (
+            SimpleNamespace(
+                phase="Failed",
+                container_statuses=[
+                    SimpleNamespace(
+                        state=SimpleNamespace(
+                            waiting=None,
+                            terminated=SimpleNamespace(exit_code=137, reason="OOMKilled"),
+                        )
+                    )
+                ],
+            ),
+            KubernetesOomKilled,
+        ),
+        (
+            SimpleNamespace(
+                phase="Pending",
+                container_statuses=[
+                    SimpleNamespace(
+                        state=SimpleNamespace(
+                            waiting=SimpleNamespace(reason="ImagePullBackOff"),
+                            terminated=None,
+                        )
+                    )
+                ],
+            ),
+            KubernetesImagePullFailed,
+        ),
+    ):
+        batch, core = _apis()
+        runtime = _runtime(batch, core)
+        spec = _spec()
+        handle = await runtime.prepare(spec)
+        job = cast(Any, handle.native)
+        job.status = SimpleNamespace(active=1, conditions=[])
+        core.list_namespaced_pod.return_value = SimpleNamespace(items=[_pod(job, status=status)])
+        batch.read_namespaced_job.return_value = job
+        with pytest.raises(error):
+            await runtime.wait(handle)
 
-    await getattr(runtime, operation)(_handle())
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
+    handle = await runtime.prepare(_spec())
+    job = cast(Any, handle.native)
+    job.status = SimpleNamespace(
+        conditions=[SimpleNamespace(type="Failed", status="True", reason="DeadlineExceeded")]
+    )
+    batch.read_namespaced_job.return_value = job
+    with pytest.raises(KubernetesDeadlineExceeded):
+        await runtime.wait(handle)
 
 
-async def test_runtime_rejects_foreign_handle() -> None:
-    runtime = _runtime(SimpleNamespace())
-    foreign = RuntimeHandle(
-        runtime_type="docker",
-        resource_kind="container",
-        object_id="container-id",
-        display_id="container",
+async def test_wait_ignores_failed_pod_count_until_deadline_condition_arrives() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
+    spec = _spec()
+    handle = await runtime.prepare(spec)
+
+    failed_pod_observation = _job(runtime, spec)
+    failed_pod_observation.status = SimpleNamespace(failed=1, conditions=[])
+    deadline_observation = _job(runtime, spec)
+    deadline_observation.status = SimpleNamespace(
+        failed=1,
+        conditions=[
+            SimpleNamespace(type="FailureTarget", status="True", reason="DeadlineExceeded")
+        ],
+    )
+    batch.read_namespaced_job.reset_mock()
+    batch.read_namespaced_job.side_effect = [
+        failed_pod_observation,
+        failed_pod_observation,
+        deadline_observation,
+    ]
+
+    with pytest.raises(KubernetesDeadlineExceeded):
+        await runtime.wait(handle)
+
+    assert batch.read_namespaced_job.await_count == 3
+
+
+async def test_wait_prioritizes_deadline_failure_target_over_oom_shaped_pod() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
+    spec = _spec()
+    handle = await runtime.prepare(spec)
+    job = cast(Any, handle.native)
+    job.status = SimpleNamespace(
+        failed=1,
+        conditions=[
+            SimpleNamespace(type="FailureTarget", status="True", reason="DeadlineExceeded")
+        ],
+    )
+    pod_status = SimpleNamespace(
+        phase="Failed",
+        container_statuses=[
+            SimpleNamespace(
+                state=SimpleNamespace(
+                    waiting=None,
+                    terminated=SimpleNamespace(exit_code=137, reason="OOMKilled"),
+                )
+            )
+        ],
+    )
+    core.list_namespaced_pod.return_value = SimpleNamespace(items=[_pod(job, status=pod_status)])
+    core.list_namespaced_pod.reset_mock()
+    batch.read_namespaced_job.return_value = job
+
+    with pytest.raises(KubernetesDeadlineExceeded):
+        await runtime.wait(handle)
+
+    core.list_namespaced_pod.assert_not_awaited()
+
+
+async def test_wait_reports_bounded_unschedulable_reason_without_long_tail() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
+    handle = await runtime.prepare(_spec())
+    job = cast(Any, handle.native)
+    job.status = SimpleNamespace(active=1, conditions=[])
+    long_tail = "DO-NOT-PERSIST-THIS-TAIL"
+    scheduling_message = "no matching accelerator node; " + "x" * 2048 + long_tail
+    pod_status = SimpleNamespace(
+        phase="Pending",
+        container_statuses=[],
+        conditions=[
+            SimpleNamespace(
+                reason="Unschedulable",
+                message=scheduling_message,
+            )
+        ],
+    )
+    batch.read_namespaced_job.return_value = job
+    core.list_namespaced_pod.return_value = SimpleNamespace(items=[_pod(job, status=pod_status)])
+
+    with pytest.raises(KubernetesRuntimeError) as caught:
+        await runtime.wait(handle)
+
+    assert caught.value.error_code == ErrorCode.CONTAINER_START_FAILED
+    assert len(str(caught.value)) == 512
+    assert long_tail not in str(caught.value)
+
+
+async def test_missing_job_is_classified_as_worker_lost() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
+    handle = await runtime.prepare(_spec())
+    batch.read_namespaced_job.side_effect = ApiException(status=404, reason="NotFound")
+
+    with pytest.raises(KubernetesRuntimeError) as caught:
+        await runtime.wait(handle)
+
+    assert caught.value.error_code == ErrorCode.WORKER_LOST
+    assert "is missing" in str(caught.value)
+
+
+async def test_cancel_uses_job_uid_precondition_and_refuses_recreated_job() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
+    spec = _spec()
+    handle = await runtime.prepare(spec)
+    live = batch.create_namespaced_job.call_args.kwargs["body"]
+    batch.read_namespaced_job.return_value = live
+
+    await runtime.stop(handle)
+
+    body = batch.delete_namespaced_job.call_args.kwargs["body"]
+    assert body.preconditions.uid == "job-uid"
+    assert body.preconditions.resource_version == "1"
+    assert body.grace_period_seconds == 7
+    assert body.propagation_policy == "Foreground"
+
+    live.metadata.uid = "replacement-uid"
+    with pytest.raises(KubernetesRuntimeError, match="UID fence mismatch"):
+        await runtime.stop(handle)
+
+
+async def test_controller_transfer_cas_blocks_stale_delete_after_db_gate() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
+    spec = _spec()
+    stale_handle = await runtime.prepare(spec)
+    original = stale_handle.native
+    batch.read_namespaced_job.return_value = original
+    next_session = uuid.uuid4()
+    patched = _job(runtime, spec)
+    patched.metadata.annotations[CONTROLLER_SESSION_ANNOTATION] = str(next_session)
+    patched.metadata.resource_version = "2"
+    batch.patch_namespaced_job.return_value = patched
+
+    current_handle = await runtime.transfer_controller(
+        stale_handle,
+        controller_session_id=next_session,
     )
 
-    with pytest.raises(KubernetesRuntimeError, match="docker"):
-        await runtime.cleanup(foreign)
+    patch_body = batch.patch_namespaced_job.call_args.kwargs["body"]
+    assert patch_body == {
+        "metadata": {
+            "resourceVersion": "1",
+            "annotations": {CONTROLLER_SESSION_ANNOTATION: str(next_session)},
+        }
+    }
+    assert current_handle.controller_session_id == next_session
+    assert current_handle.resource_version == "2"
+    assert current_handle.spec_hash == stale_handle.spec_hash
+
+    # The old process may already have passed its DB gate.  The mutable Job
+    # annotation is a second fence checked immediately before deletion.
+    batch.read_namespaced_job.return_value = patched
+    with pytest.raises(KubernetesRuntimeError, match="mismatched controller session"):
+        await runtime.stop(stale_handle)
+    batch.delete_namespaced_job.assert_not_awaited()
+
+    await runtime.stop(current_handle)
+    preconditions = batch.delete_namespaced_job.call_args.kwargs["body"].preconditions
+    assert preconditions.uid == "job-uid"
+    assert preconditions.resource_version == "2"
+
+
+async def test_list_managed_recovers_exact_job_and_pod_after_restart() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
+    job = _job(runtime, _spec())
+    pod = _pod(job)
+    batch.list_namespaced_job.return_value = SimpleNamespace(items=[job])
+    batch.read_namespaced_job.return_value = job
+    core.list_namespaced_pod.return_value = SimpleNamespace(items=[pod])
+
+    recovered = await runtime.list_managed(worker_id="worker-k8s-a")
+
+    assert len(recovered) == 1
+    assert recovered[0].resource_uid == "job-uid"
+    assert recovered[0].observation.pod_uid == "pod-uid"
+    assert runtime.recovery_conflicts == ()
+    selector = batch.list_namespaced_job.call_args.kwargs["label_selector"]
+    assert f"{RESOURCE_KIND_LABEL}={BATCH_JOB_RESOURCE_KIND}" in selector
+
+
+async def test_list_managed_quarantines_spec_drift_without_adoption() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
+    job = _job(runtime, _spec())
+    job.spec.template.spec.containers[0].command = ["malicious"]
+    batch.list_namespaced_job.return_value = SimpleNamespace(items=[job])
+    batch.read_namespaced_job.return_value = job
+
+    assert await runtime.list_managed(worker_id="worker-k8s-a") == ()
+    assert len(runtime.recovery_conflicts) == 1
+    assert "spec hash" in runtime.recovery_conflicts[0].reason
+
+
+async def test_production_artifact_request_fails_closed_before_api_call(tmp_path: Path) -> None:
+    source = tmp_path / "input.bin"
+    source.write_bytes(b"input")
+    spec = replace(
+        _spec(),
+        mounts=(RuntimeMount(str(source), "/workspace/input.bin", True),),
+    )
+    batch, core = _apis()
+
+    with pytest.raises(KubernetesArtifactsUnsupported) as caught:
+        await _runtime(batch, core, app_env="production").prepare(spec)
+
+    assert caught.value.error_code == ErrorCode.KUBERNETES_ARTIFACTS_UNSUPPORTED
+    batch.create_namespaced_job.assert_not_awaited()
+
+
+async def test_retry_execution_gets_distinct_job_name_and_handle_identity_is_frozen() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
+    first = await runtime.prepare(_spec())
+    second_spec = replace(_spec(), execution_id=uuid.uuid4())
+    second = await runtime.prepare(second_spec)
+
+    assert first.object_id != second.object_id
+    assert first.labels[EXECUTION_ID_LABEL] != second.labels[EXECUTION_ID_LABEL]
+    with pytest.raises(FrozenInstanceError):
+        first.object_id = "mutated"  # type: ignore[misc]

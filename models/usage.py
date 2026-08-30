@@ -179,6 +179,20 @@ class TaskExecution(Base):
             "observed_vendor IS NULL OR observed_vendor = requested_vendor",
             name="observed_vendor",
         ),
+        CheckConstraint(
+            "(runtime_namespace IS NULL AND runtime_resource_kind IS NULL "
+            "AND runtime_resource_name IS NULL AND runtime_resource_uid IS NULL "
+            "AND runtime_spec_hash IS NULL AND runtime_worker_session_id IS NULL) OR "
+            "(runtime_namespace IS NOT NULL AND runtime_resource_kind IS NOT NULL "
+            "AND runtime_resource_name IS NOT NULL AND runtime_resource_uid IS NOT NULL "
+            "AND runtime_spec_hash IS NOT NULL AND runtime_worker_session_id IS NOT NULL)",
+            name="runtime_resource_observation",
+        ),
+        CheckConstraint(
+            "(observed_pod_name IS NULL AND observed_pod_uid IS NULL) OR "
+            "(observed_pod_name IS NOT NULL AND observed_pod_uid IS NOT NULL)",
+            name="observed_pod_identity",
+        ),
         UniqueConstraint("task_id", "attempt", name="uq_task_executions_task_attempt"),
         Index("ix_task_executions_project_started", "project_id", "started_at"),
         Index("ix_task_executions_variant_status", "model_variant_id", "status"),
@@ -223,6 +237,14 @@ class TaskExecution(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     runtime_type: Mapped[str] = mapped_column(String(32))
     runtime_object_id: Mapped[str | None] = mapped_column(String(512))
+    runtime_namespace: Mapped[str | None] = mapped_column(String(253))
+    runtime_resource_kind: Mapped[str | None] = mapped_column(String(32))
+    runtime_resource_name: Mapped[str | None] = mapped_column(String(253))
+    runtime_resource_uid: Mapped[str | None] = mapped_column(String(128))
+    runtime_worker_session_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True))
+    observed_pod_name: Mapped[str | None] = mapped_column(String(253))
+    observed_pod_uid: Mapped[str | None] = mapped_column(String(128))
+    runtime_spec_hash: Mapped[str | None] = mapped_column(String(64))
     error_category: Mapped[str | None] = mapped_column(String(64))
     error_code: Mapped[str | None] = mapped_column(String(64))
     error_message: Mapped[str | None] = mapped_column(Text)

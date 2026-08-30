@@ -49,6 +49,16 @@ class _BlockingRuntime:
         await asyncio.Event().wait()
 
 
+class _StoppingRuntime(_RuntimeStub):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.stop_calls = 0
+
+    async def stop(self, handle: RuntimeHandle) -> None:
+        del handle
+        self.stop_calls += 1
+
+
 def _executor(
     runtime: _RuntimeStub | _BlockingRuntime,
     *,
@@ -79,6 +89,34 @@ def _handle() -> RuntimeHandle:
         object_id="test-object-id",
         display_id="test-object",
     )
+
+
+async def test_stale_controller_never_reaches_destructive_runtime_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _StoppingRuntime()
+    executor = _executor(runtime)
+    handle = RuntimeHandle(
+        runtime_type="kubernetes",
+        resource_kind="job",
+        object_id="mini-ai-job-a",
+        display_id="mini-ai-job-a",
+        namespace="mini-ai-runtime",
+        resource_uid="job-uid-a",
+        spec_hash="a" * 32,
+    )
+
+    async def ownership_lost(
+        observed: RuntimeHandle,
+        execution: ActiveExecution,
+    ) -> bool:
+        del observed, execution
+        return False
+
+    monkeypatch.setattr(executor, "_runtime_cleanup_owned", ownership_lost)
+    await executor._best_effort_stop(handle, execution=_execution())
+
+    assert runtime.stop_calls == 0
 
 
 def _capture_persisted(

@@ -65,6 +65,13 @@ class ExecutionResult:
     retry_scheduled: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class RecoverableRuntimeExecution:
+    task_id: uuid.UUID
+    execution_id: uuid.UUID
+    worker_session_id: uuid.UUID
+
+
 def retry_delay_seconds(
     retry_count: int,
     maximum: float = 60.0,
@@ -211,6 +218,109 @@ class TaskRepository:
         if for_update:
             query = query.with_for_update()
         return await session.scalar(query)
+
+    @staticmethod
+    async def transfer_recoverable_kubernetes_executions(
+        session: AsyncSession,
+        *,
+        worker_id: str,
+        new_worker_session_id: uuid.UUID,
+        lease_seconds: float,
+        observations: list[dict[str, str | None]],
+    ) -> list[RecoverableRuntimeExecution]:
+        """CAS-transfer persisted Job executions to a newly registered Worker session."""
+
+        recovered: list[RecoverableRuntimeExecution] = []
+        worker = await session.get(Worker, worker_id, with_for_update=True)
+        if worker is None or worker.worker_session_id != new_worker_session_id:
+            return recovered
+        for observed in observations:
+            try:
+                task_id = uuid.UUID(observed["task_id"] or "")
+                execution_id = uuid.UUID(observed["execution_id"] or "")
+                runtime_worker_session_id = uuid.UUID(observed["worker_session_id"] or "")
+                controller_session_id = uuid.UUID(observed["controller_session_id"] or "")
+            except (TypeError, ValueError):
+                continue
+            if controller_session_id != new_worker_session_id:
+                continue
+            task = await TaskRepository.get(session, task_id, for_update=True)
+            execution = await session.get(TaskExecution, execution_id, with_for_update=True)
+            reservation = await session.scalar(
+                select(ResourceReservation)
+                .where(
+                    ResourceReservation.execution_id == execution_id,
+                    ResourceReservation.released_at.is_(None),
+                )
+                .with_for_update()
+            )
+            persisted = task.runtime_handle if task is not None else None
+            if not isinstance(persisted, dict):
+                continue
+            expected = {
+                "runtime_type": "kubernetes",
+                "runtime_namespace": observed["namespace"],
+                "runtime_resource_kind": "job",
+                "runtime_resource_name": observed["resource_name"],
+                "runtime_resource_uid": observed["resource_uid"],
+                "runtime_worker_session_id": str(runtime_worker_session_id),
+                "runtime_spec_hash": observed["spec_hash"],
+            }
+            if (
+                task is None
+                or execution is None
+                or reservation is None
+                or task.status not in ACTIVE_TASK_STATUSES
+                or task.worker_id != worker_id
+                or task.execution_id != execution_id
+                or task.runtime_type.value != "kubernetes"
+                or execution.task_id != task_id
+                or execution.worker_id != worker_id
+                or execution.runtime_worker_session_id != runtime_worker_session_id
+                or reservation.worker_id != worker_id
+                or execution.worker_session_id is None
+                or reservation.worker_session_id != execution.worker_session_id
+                or any(persisted.get(key) != value for key, value in expected.items())
+                or execution.runtime_namespace != observed["namespace"]
+                or execution.runtime_resource_kind != "job"
+                or execution.runtime_resource_name != observed["resource_name"]
+                or execution.runtime_resource_uid != observed["resource_uid"]
+                or execution.runtime_spec_hash != observed["spec_hash"]
+            ):
+                continue
+            observed_pod_name = observed.get("observed_pod_name")
+            observed_pod_uid = observed.get("observed_pod_uid")
+            if (
+                (observed_pod_name is None) != (observed_pod_uid is None)
+                or (
+                    persisted.get("observed_pod_name") is not None
+                    and (
+                        persisted.get("observed_pod_name") != observed_pod_name
+                        or persisted.get("observed_pod_uid") != observed_pod_uid
+                    )
+                )
+                or (
+                    execution.observed_pod_name is not None
+                    and (
+                        execution.observed_pod_name != observed_pod_name
+                        or execution.observed_pod_uid != observed_pod_uid
+                    )
+                )
+            ):
+                continue
+            now = await database_utcnow(session)
+            execution.worker_session_id = new_worker_session_id
+            reservation.worker_session_id = new_worker_session_id
+            task.lease_expires_at = now + timedelta(seconds=lease_seconds)
+            task.version += 1
+            recovered.append(
+                RecoverableRuntimeExecution(
+                    task_id=task_id,
+                    execution_id=execution_id,
+                    worker_session_id=new_worker_session_id,
+                )
+            )
+        return recovered
 
     @staticmethod
     async def get_by_idempotency_key(
@@ -955,12 +1065,154 @@ class TaskRepository:
             execution_id=execution_id,
             worker_session_id=worker_session_id,
         )
+        if task.status in {TaskStatus.PULLING, TaskStatus.STARTING, TaskStatus.RUNNING}:
+            now = await database_utcnow(session)
+            task.lease_expires_at = now + timedelta(seconds=lease_seconds)
+            task.version += 1
+            return task
         if task.status not in {TaskStatus.ASSIGNED, TaskStatus.PREPARING}:
             raise StaleExecutionError("task is no longer assigned to this execution")
         now = await database_utcnow(session)
         _transition(session, task, TaskStatus.PULLING, now)
         task.lease_expires_at = now + timedelta(seconds=lease_seconds)
         return task
+
+    @staticmethod
+    async def record_runtime_handle(
+        session: AsyncSession,
+        *,
+        task_id: uuid.UUID,
+        worker_id: str,
+        execution_id: uuid.UUID,
+        runtime_type: str,
+        resource_kind: str,
+        resource_name: str,
+        namespace: str | None,
+        resource_uid: str | None,
+        runtime_worker_session_id: uuid.UUID | None,
+        spec_hash: str | None,
+        observed_pod_name: str | None,
+        observed_pod_uid: str | None,
+        worker_session_id: uuid.UUID | None = None,
+    ) -> Task:
+        """Persist a runtime observation behind the full execution/session fence."""
+
+        task = await TaskRepository._owned_task(
+            session,
+            task_id=task_id,
+            worker_id=worker_id,
+            execution_id=execution_id,
+            worker_session_id=worker_session_id,
+        )
+        execution = await session.get(TaskExecution, execution_id, with_for_update=True)
+        if execution is None or execution.task_id != task_id or execution.worker_id != worker_id:
+            raise StaleExecutionError("runtime handle execution record is stale")
+        if worker_session_id is not None and execution.worker_session_id != worker_session_id:
+            raise StaleExecutionError("runtime handle controller session is stale")
+        if execution.runtime_type != runtime_type:
+            raise StaleExecutionError("runtime handle type does not match the execution")
+        if (observed_pod_name is None) != (observed_pod_uid is None):
+            raise ValueError("observed Pod name and UID must be recorded together")
+        if execution.observed_pod_name is not None and (
+            execution.observed_pod_name != observed_pod_name
+            or execution.observed_pod_uid != observed_pod_uid
+        ):
+            raise StaleExecutionError("observed Kubernetes Pod identity is immutable")
+        existing_handle = task.runtime_handle
+        if (
+            isinstance(existing_handle, dict)
+            and existing_handle.get("observed_pod_name") is not None
+            and (
+                existing_handle.get("observed_pod_name") != observed_pod_name
+                or existing_handle.get("observed_pod_uid") != observed_pod_uid
+            )
+        ):
+            raise StaleExecutionError("persisted Kubernetes Pod identity is immutable")
+        if runtime_type == "kubernetes":
+            if (
+                resource_kind != "job"
+                or not namespace
+                or not resource_name
+                or not resource_uid
+                or runtime_worker_session_id is None
+                or not spec_hash
+            ):
+                raise ValueError("Kubernetes runtime handle has incomplete Job fencing identity")
+            if (
+                execution.runtime_worker_session_id is not None
+                and execution.runtime_worker_session_id != runtime_worker_session_id
+            ):
+                raise StaleExecutionError("Kubernetes Job creation session is immutable")
+
+        persisted: dict[str, object] = {
+            "runtime_type": runtime_type,
+            "runtime_namespace": namespace,
+            "runtime_resource_kind": resource_kind,
+            "runtime_resource_name": resource_name,
+            "runtime_resource_uid": resource_uid,
+            "runtime_worker_session_id": (
+                str(runtime_worker_session_id) if runtime_worker_session_id is not None else None
+            ),
+            "observed_pod_name": observed_pod_name,
+            "observed_pod_uid": observed_pod_uid,
+            "runtime_spec_hash": spec_hash,
+        }
+        task.runtime_handle = persisted
+        task.version += 1
+        execution.runtime_object_id = resource_name
+        if runtime_type == "kubernetes":
+            execution.runtime_namespace = namespace
+            execution.runtime_resource_kind = resource_kind
+            execution.runtime_resource_name = resource_name
+            execution.runtime_resource_uid = resource_uid
+            execution.runtime_worker_session_id = runtime_worker_session_id
+            execution.observed_pod_name = observed_pod_name
+            execution.observed_pod_uid = observed_pod_uid
+            execution.runtime_spec_hash = spec_hash
+        return task
+
+    @staticmethod
+    async def runtime_cleanup_owned(
+        session: AsyncSession,
+        *,
+        task_id: uuid.UUID,
+        worker_id: str,
+        execution_id: uuid.UUID,
+        worker_session_id: uuid.UUID,
+        runtime_type: str,
+        resource_name: str,
+        resource_uid: str | None,
+        spec_hash: str | None,
+    ) -> bool:
+        """Gate destructive runtime operations on current DB controller ownership."""
+
+        worker = await session.get(Worker, worker_id)
+        execution = await session.get(TaskExecution, execution_id)
+        reservation = await session.scalar(
+            select(ResourceReservation).where(ResourceReservation.execution_id == execution_id)
+        )
+        if (
+            worker is None
+            or execution is None
+            or reservation is None
+            or worker.worker_session_id != worker_session_id
+            or execution.task_id != task_id
+            or execution.worker_id != worker_id
+            or execution.worker_session_id != worker_session_id
+            or reservation.worker_id != worker_id
+            or reservation.worker_session_id != worker_session_id
+            or execution.runtime_type != runtime_type
+            or execution.runtime_object_id != resource_name
+        ):
+            return False
+        if runtime_type == "kubernetes":
+            return (
+                execution.runtime_resource_kind == "job"
+                and execution.runtime_resource_name == resource_name
+                and execution.runtime_resource_uid == resource_uid
+                and execution.runtime_spec_hash == spec_hash
+            )
+        return True
 
     @staticmethod
     async def mark_running(
@@ -979,6 +1231,11 @@ class TaskRepository:
             execution_id=execution_id,
             worker_session_id=worker_session_id,
         )
+        if task.status == TaskStatus.RUNNING:
+            now = await database_utcnow(session)
+            task.lease_expires_at = now + timedelta(seconds=lease_seconds)
+            task.version += 1
+            return task
         if task.status not in {TaskStatus.PULLING, TaskStatus.STARTING}:
             raise StaleExecutionError("task is no longer starting for this execution")
         now = await database_utcnow(session)
@@ -1003,6 +1260,11 @@ class TaskRepository:
             execution_id=execution_id,
             worker_session_id=worker_session_id,
         )
+        if task.status in {TaskStatus.STARTING, TaskStatus.RUNNING}:
+            now = await database_utcnow(session)
+            task.lease_expires_at = now + timedelta(seconds=lease_seconds)
+            task.version += 1
+            return task
         if task.status != TaskStatus.PULLING:
             raise StaleExecutionError("task is no longer pulling for this execution")
         now = await database_utcnow(session)

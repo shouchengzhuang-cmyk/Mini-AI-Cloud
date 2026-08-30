@@ -133,12 +133,21 @@ class ServiceCreate(RequestModel):
 
     @model_validator(mode="after")
     def validate_initial_replica_count(self) -> "ServiceCreate":
-        gpu_count, gpu_memory_mb, gpu_model = reconcile_legacy_gpu_fields(
-            accelerator=self.accelerator,
-            gpu_count=self.gpu_count,
-            gpu_memory_mb=self.gpu_memory_mb,
-            gpu_model=self.gpu_model,
-            fields_set=self.model_fields_set,
+        defer_registry_gpu_defaults = (
+            self.registered_model_id is not None
+            and self.accelerator is None
+            and "gpu_count" not in self.model_fields_set
+        )
+        gpu_count, gpu_memory_mb, gpu_model = (
+            (self.gpu_count, self.gpu_memory_mb, self.gpu_model)
+            if defer_registry_gpu_defaults
+            else reconcile_legacy_gpu_fields(
+                accelerator=self.accelerator,
+                gpu_count=self.gpu_count,
+                gpu_memory_mb=self.gpu_memory_mb,
+                gpu_model=self.gpu_model,
+                fields_set=self.model_fields_set,
+            )
         )
         object.__setattr__(self, "gpu_count", gpu_count)
         object.__setattr__(self, "gpu_memory_mb", gpu_memory_mb)
