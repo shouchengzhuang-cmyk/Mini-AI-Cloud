@@ -15,6 +15,7 @@ from kubernetes_asyncio import client, config
 from kubernetes_asyncio.client.exceptions import ApiException
 
 from core.enums import AllocationAuthority, ErrorCategory, ErrorCode
+from core.kubernetes_names import validate_kubernetes_dns_subdomain
 from core.runtime_profiles import (
     RuntimeProfile,
     RuntimeProfileCatalog,
@@ -125,6 +126,8 @@ class KubernetesRuntime:
         cleanup_grace_seconds: int = 30,
         kubeconfig: str | None = None,
         in_cluster: bool = False,
+        service_account_name: str | None = None,
+        image_pull_secrets: Sequence[str] = (),
         poll_interval: float = 0.25,
         api: Any | None = None,
         core_api: Any | None = None,
@@ -141,6 +144,26 @@ class KubernetesRuntime:
             raise ValueError("cleanup_grace_seconds must not be negative")
         if poll_interval <= 0:
             raise ValueError("poll_interval must be greater than zero")
+        normalized_service_account = (
+            service_account_name.strip()
+            if service_account_name is not None and service_account_name.strip()
+            else None
+        )
+        if normalized_service_account is not None:
+            validate_kubernetes_dns_subdomain(
+                normalized_service_account,
+                field_name="service_account_name",
+            )
+        normalized_image_pull_secrets: list[str] = []
+        for item in image_pull_secrets:
+            normalized = item.strip()
+            if not normalized or normalized in normalized_image_pull_secrets:
+                continue
+            validate_kubernetes_dns_subdomain(
+                normalized,
+                field_name="image_pull_secrets",
+            )
+            normalized_image_pull_secrets.append(normalized)
         self.namespace = namespace.strip()
         self.cluster_id = cluster_id.strip()
         self.app_env = app_env
@@ -148,6 +171,8 @@ class KubernetesRuntime:
         self.cleanup_grace_seconds = cleanup_grace_seconds
         self.kubeconfig = kubeconfig
         self.in_cluster = in_cluster
+        self.service_account_name = normalized_service_account
+        self.image_pull_secrets = tuple(normalized_image_pull_secrets)
         self.poll_interval = poll_interval
         self._api = api
         self._core_api = core_api
@@ -959,6 +984,12 @@ class KubernetesRuntime:
                     dict(profile.kubernetes.node_selector) if profile is not None else None
                 ),
                 restart_policy="Never",
+                service_account_name=self.service_account_name,
+                image_pull_secrets=(
+                    [client.V1LocalObjectReference(name=name) for name in self.image_pull_secrets]
+                    if self.image_pull_secrets
+                    else None
+                ),
                 runtime_class_name=(
                     profile.kubernetes.runtime_class_name if profile is not None else None
                 ),
@@ -1276,6 +1307,8 @@ def _job_contract(job: object) -> dict[str, object]:
     template_labels = getattr(template_metadata, "labels", None) or {}
     template_annotations = getattr(template_metadata, "annotations", None) or {}
     pod_spec = getattr(template, "spec", None)
+    service_account_name = getattr(pod_spec, "service_account_name", None)
+    image_pull_secrets = getattr(pod_spec, "image_pull_secrets", None) or []
     containers = getattr(pod_spec, "containers", None) or []
     container = containers[0] if len(containers) == 1 else None
     resources = getattr(container, "resources", None)
@@ -1310,6 +1343,14 @@ def _job_contract(job: object) -> dict[str, object]:
             "node_name": getattr(pod_spec, "node_name", None),
             "node_selector": _string_mapping(getattr(pod_spec, "node_selector", None)),
             "restart_policy": getattr(pod_spec, "restart_policy", None),
+            **(
+                {
+                    "service_account_name": service_account_name,
+                    "image_pull_secrets": _model_contract(image_pull_secrets),
+                }
+                if service_account_name not in (None, "default") or image_pull_secrets
+                else {}
+            ),
             "runtime_class_name": getattr(pod_spec, "runtime_class_name", None),
             # The Kubernetes API defaults an omitted schedulerName to
             # ``default-scheduler`` before returning the created Job.  Treat the

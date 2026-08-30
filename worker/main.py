@@ -124,6 +124,8 @@ class WorkerService:
                 cleanup_grace_seconds=settings.kubernetes_cleanup_grace_seconds,
                 kubeconfig=settings.kubernetes_kubeconfig,
                 in_cluster=settings.kubernetes_in_cluster,
+                service_account_name=settings.kubernetes_serving_service_account_name,
+                image_pull_secrets=settings.kubernetes_serving_image_pull_secrets,
                 runtime_profile_catalog=runtime_profile_catalog,
             )
             runtimes["kubernetes"] = self.kubernetes_runtime

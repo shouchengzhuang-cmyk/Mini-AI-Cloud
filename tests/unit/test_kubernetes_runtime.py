@@ -1,6 +1,6 @@
 import asyncio
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -167,6 +167,8 @@ def _runtime(
     core: object,
     *,
     app_env: str = "test",
+    service_account_name: str | None = None,
+    image_pull_secrets: Sequence[str] = (),
     networking_api: object | None = None,
     runtime_profile_catalog: RuntimeProfileCatalog | None = None,
 ) -> KubernetesRuntime:
@@ -180,6 +182,8 @@ def _runtime(
         api=batch,
         core_api=core,
         networking_api=networking_api,
+        service_account_name=service_account_name,
+        image_pull_secrets=image_pull_secrets,
         runtime_profile_catalog=runtime_profile_catalog,
     )
 
@@ -223,6 +227,25 @@ async def test_prepare_builds_fenced_cpu_job_without_node_name_or_extended_resou
     assert handle.controller_session_id == WORKER_SESSION_ID
     assert handle.namespace == "runtime-tests"
     assert handle.observation.pod_name is None
+
+
+async def test_prepare_applies_workload_credentials_to_batch_job() -> None:
+    batch, core = _apis()
+    runtime = _runtime(
+        batch,
+        core,
+        service_account_name="task-runtime",
+        image_pull_secrets=("registry-pull", "secondary-registry", "registry-pull"),
+    )
+
+    await runtime.prepare(_spec())
+
+    pod_spec = batch.create_namespaced_job.call_args.kwargs["body"].spec.template.spec
+    assert pod_spec.service_account_name == "task-runtime"
+    assert [item.name for item in pod_spec.image_pull_secrets] == [
+        "registry-pull",
+        "secondary-registry",
+    ]
 
 
 async def test_prepare_accepts_api_server_defaulted_scheduler_name() -> None:
@@ -300,12 +323,13 @@ async def test_create_conflict_adopts_only_exact_job() -> None:
     )
 
 
-async def test_create_conflict_adopts_api_server_defaulted_scheduler_name() -> None:
+async def test_create_conflict_adopts_api_server_defaulted_pod_fields() -> None:
     batch, core = _apis()
     runtime = _runtime(batch, core)
     spec = _spec()
     existing = _job(runtime, spec)
     existing.spec.template.spec.scheduler_name = "default-scheduler"
+    existing.spec.template.spec.service_account_name = "default"
     batch.create_namespaced_job.side_effect = ApiException(status=409, reason="AlreadyExists")
     batch.read_namespaced_job.return_value = existing
 
@@ -314,6 +338,7 @@ async def test_create_conflict_adopts_api_server_defaulted_scheduler_name() -> N
 
     assert handle.resource_uid == "job-uid"
     assert adopted.spec.template.spec.scheduler_name == "default-scheduler"
+    assert adopted.spec.template.spec.service_account_name == "default"
 
 
 @pytest.mark.parametrize("drift", ["spec", "scheduler", "session"])
