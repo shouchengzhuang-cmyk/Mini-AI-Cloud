@@ -88,3 +88,27 @@ async def test_workbench_service_runtime_controls_restore_a_valid_pair() -> None
     assert "runtimeType.disabled = true;" in js_response.text
     assert 'if (runtimeType.value === "fake") runtimeType.value = "docker";' in js_response.text
     assert "runtime_type: String(form.elements.runtime_type.value" in js_response.text
+
+
+async def test_workbench_idempotency_key_supports_insecure_http_contexts() -> None:
+    async with _client() as client:
+        js_response = await client.get("/workbench/assets/workbench.js")
+
+    assert "function createIdempotencyKey()" in js_response.text
+    assert 'typeof cryptoApi.randomUUID === "function"' in js_response.text
+    assert "cryptoApi.getRandomValues(entropy);" in js_response.text
+    assert 'headers: { "Idempotency-Key": createIdempotencyKey() }' in js_response.text
+    assert "crypto.randomUUID()" not in js_response.text
+
+
+async def test_workbench_tensor_parallelism_tracks_accelerator_count() -> None:
+    async with _client() as client:
+        index_response = await client.get("/workbench")
+        js_response = await client.get("/workbench/assets/workbench.js")
+
+    assert re.search(r'<input[^>]+name="tensor_parallel_size"[^>]+readonly', index_response.text)
+    assert "function syncTensorParallelSize(form)" in js_response.text
+    assert "Math.max(1, acceleratorCount)" in js_response.text
+    assert 'acceleratorCount.value = "0";' in js_response.text
+    assert "acceleratorCount.disabled = true;" in js_response.text
+    assert 'elements.accelerator_count.addEventListener("input"' in js_response.text

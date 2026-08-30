@@ -212,6 +212,20 @@
     return window.location.origin;
   }
 
+  function createIdempotencyKey() {
+    const cryptoApi = window.crypto;
+    if (cryptoApi && typeof cryptoApi.randomUUID === "function") {
+      return `workbench-${cryptoApi.randomUUID()}`;
+    }
+    if (cryptoApi && typeof cryptoApi.getRandomValues === "function") {
+      const entropy = new Uint32Array(4);
+      cryptoApi.getRandomValues(entropy);
+      const suffix = Array.from(entropy, (value) => value.toString(16).padStart(8, "0")).join("");
+      return `workbench-${suffix}`;
+    }
+    return `workbench-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  }
+
   function sessionGet(key) {
     try {
       return window.sessionStorage.getItem(key) || "";
@@ -1095,7 +1109,7 @@
       const created = await api("/api/v1/tasks", {
         method: "POST",
         body: payload,
-        headers: { "Idempotency-Key": `workbench-${crypto.randomUUID()}` },
+        headers: { "Idempotency-Key": createIdempotencyKey() },
         channel: "action:create-task",
       });
       query("#run-task-dialog").close();
@@ -1328,18 +1342,27 @@
     }
   }
 
+  function syncTensorParallelSize(form) {
+    const acceleratorCount = Number(form.elements.accelerator_count.value || 0);
+    form.elements.tensor_parallel_size.value = String(Math.max(1, acceleratorCount));
+  }
+
   function syncServingRuntime(form) {
     const runtime = form.elements.runtime.value;
     const runtimeType = form.elements.runtime_type;
+    const acceleratorCount = form.elements.accelerator_count;
     if (runtime === "fake") {
       runtimeType.value = "fake";
       runtimeType.disabled = true;
-      form.elements.accelerator_count.value = "0";
-      form.elements.tensor_parallel_size.value = "1";
+      acceleratorCount.value = "0";
+      acceleratorCount.disabled = true;
+      syncTensorParallelSize(form);
       return;
     }
     runtimeType.disabled = false;
+    acceleratorCount.disabled = false;
     if (runtimeType.value === "fake") runtimeType.value = "docker";
+    syncTensorParallelSize(form);
   }
 
   function openDeployService() {
@@ -1755,6 +1778,9 @@
     const deployServiceForm = query("#deploy-service-form");
     deployServiceForm.elements.runtime.addEventListener("change", () => {
       syncServingRuntime(deployServiceForm);
+    });
+    deployServiceForm.elements.accelerator_count.addEventListener("input", () => {
+      syncTensorParallelSize(deployServiceForm);
     });
     syncServingRuntime(deployServiceForm);
     document.addEventListener("keydown", (event) => {

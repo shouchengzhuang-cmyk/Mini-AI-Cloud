@@ -291,7 +291,11 @@
           <label><span>CPU millicores</span><input name="cpu_millicores" type="number" min="1" value="1000" required></label>
           <label><span>Memory MB</span><input name="memory_mb" type="number" min="16" value="1024" required></label>
           <label><span>Accelerators</span><input name="accelerator_count" type="number" min="0" max="64" value="0" required></label>
-          <label><span>Tensor parallel size</span><input name="tensor_parallel_size" type="number" min="1" max="64" value="1" required></label>
+          <label>
+            <span>Tensor parallel size</span>
+            <input name="tensor_parallel_size" type="number" min="1" max="64" value="1" required readonly aria-readonly="true">
+            <small>Automatically matches the accelerator count, with a minimum of 1.</small>
+          </label>
           <label><span>dtype</span><select name="dtype"><option>auto</option><option>half</option><option>float16</option><option>bfloat16</option><option>float32</option></select></label>
           <label><span>GPU memory utilization</span><input name="gpu_memory_utilization" type="number" min="0.01" max="1" step="0.01" value="0.9" required></label>
           <label><span>Max model length</span><input name="max_model_len" type="number" min="1" placeholder="Runtime default"></label>
