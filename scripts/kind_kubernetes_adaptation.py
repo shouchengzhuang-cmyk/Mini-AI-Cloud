@@ -133,6 +133,11 @@ def application_reference(tag: str, digest: str) -> str:
     return f"{APP_REPOSITORY}:{tag}@{digest}"
 
 
+def application_containerd_aliases(tag: str, digest: str) -> tuple[str, str]:
+    policy_reference = application_reference(tag, digest)
+    return policy_reference, f"{APP_REPOSITORY}@{digest}"
+
+
 def chart_fullname(release_name: str) -> str:
     return release_name if "mini-ai-cloud" in release_name else f"{release_name}-mini-ai-cloud"
 
@@ -879,6 +884,10 @@ class KindAdaptationHarness:
                 timeout_seconds=600,
             )
         canonical_tag = f"{APP_REPOSITORY}:{self.app_tag}"
+        policy_app_image, canonical_app_image = application_containerd_aliases(
+            self.app_tag,
+            self.app_image.rsplit("@", 1)[1],
+        )
         self._record(
             outcomes,
             claim,
@@ -894,7 +903,7 @@ class KindAdaptationHarness:
                 "tag",
                 "--force",
                 canonical_tag,
-                self.app_image,
+                policy_app_image,
             ),
         )
         self._record(
@@ -910,7 +919,42 @@ class KindAdaptationHarness:
                 "k8s.io",
                 "images",
                 "inspect",
-                self.app_image,
+                policy_app_image,
+            ),
+        )
+        # Kubelet resolves repo:tag@digest through the CRI as repo@digest.
+        self._record(
+            outcomes,
+            claim,
+            "tag-application-canonical-digest-in-containerd",
+            (
+                self.config.tools.docker,
+                "exec",
+                node,
+                "ctr",
+                "--namespace",
+                "k8s.io",
+                "images",
+                "tag",
+                "--force",
+                canonical_tag,
+                canonical_app_image,
+            ),
+        )
+        self._record(
+            outcomes,
+            claim,
+            "verify-application-canonical-digest-in-containerd",
+            (
+                self.config.tools.docker,
+                "exec",
+                node,
+                "ctr",
+                "--namespace",
+                "k8s.io",
+                "images",
+                "inspect",
+                canonical_app_image,
             ),
         )
         for alias in self.image_aliases:

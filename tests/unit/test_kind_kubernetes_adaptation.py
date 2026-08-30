@@ -20,6 +20,7 @@ from scripts.kind_kubernetes_adaptation import (
     KindEvidenceError,
     PhaseFailure,
     ToolPaths,
+    application_containerd_aliases,
     application_reference,
     build_upgrade_sentinels,
     chart_fullname,
@@ -154,8 +155,16 @@ def test_application_digest_comes_from_build_metadata_and_keeps_policy_tag() -> 
     assert application_reference("m7-1234abcd", digest) == (
         f"{APP_REPOSITORY}:m7-1234abcd@{digest}"
     )
+    policy_reference, canonical_reference = application_containerd_aliases("m7-1234abcd", digest)
+    assert policy_reference == f"{APP_REPOSITORY}:m7-1234abcd@{digest}"
+    assert canonical_reference == f"{APP_REPOSITORY}@{digest}"
+    assert policy_reference.rsplit("@", 1)[1] == canonical_reference.rsplit("@", 1)[1]
     with pytest.raises(KindEvidenceError, match="manifest digest"):
         parse_build_digest({"containerimage.digest": "sha256:short"})
+    with pytest.raises(KindEvidenceError, match="safely bounded"):
+        application_containerd_aliases("m7-nothex", digest)
+    with pytest.raises(KindEvidenceError, match="safely bounded"):
+        application_containerd_aliases("m7-1234abcd", "sha256:short")
 
 
 def test_upgrade_sentinels_are_uid_trackable_and_hardened() -> None:
