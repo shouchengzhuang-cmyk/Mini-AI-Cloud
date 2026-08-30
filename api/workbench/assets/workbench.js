@@ -4,6 +4,8 @@
   const SESSION_API_KEY = "mini_ai_cloud_workbench_key";
   const LIST_PAGE_SIZE = 100;
   const TASK_LOG_PAGE_SIZE = 500;
+  const TASK_LOG_MAX_PAGES_PER_REFRESH = 2;
+  const TASK_LOG_RETAIN_LIMIT = 1000;
   const TERMINAL_TASK_STATUSES = new Set([
     "succeeded",
     "failed",
@@ -314,6 +316,14 @@
   function abortAllRequests() {
     for (const controller of state.requestControllers.values()) controller.abort();
     state.requestControllers.clear();
+  }
+
+  function abortReadRequests() {
+    for (const [channel, controller] of state.requestControllers.entries()) {
+      if (channel.startsWith("action:")) continue;
+      controller.abort();
+      state.requestControllers.delete(channel);
+    }
   }
 
   function formatApiError(error) {
@@ -913,7 +923,8 @@
   async function fetchTaskLogs(taskId) {
     if (state.taskLogs.taskId !== taskId) resetTaskLogs(taskId);
 
-    while (true) {
+    let pagesFetched = 0;
+    while (pagesFetched < TASK_LOG_MAX_PAGES_PER_REFRESH) {
       const offset = state.taskLogs.offset;
       const page = await api(
         `/api/v1/tasks/${encodeURIComponent(taskId)}/logs?limit=${TASK_LOG_PAGE_SIZE}&offset=${offset}`,
@@ -932,7 +943,11 @@
         throw new ApiError(0, "INVALID_LOG_PAGE", "Task log sequence did not advance.", null, null);
       }
       state.taskLogs.entries.push(...logs);
+      if (state.taskLogs.entries.length > TASK_LOG_RETAIN_LIMIT) {
+        state.taskLogs.entries.splice(0, state.taskLogs.entries.length - TASK_LOG_RETAIN_LIMIT);
+      }
       state.taskLogs.offset = nextOffset;
+      pagesFetched += 1;
       if (logs.length < TASK_LOG_PAGE_SIZE) break;
     }
 
@@ -1119,7 +1134,10 @@
       state.logsAutoScroll = autoScroll.checked;
     });
     const toolbar = node("div", { className: "log-toolbar" }, [
-      node("span", { className: "muted", text: `${logs.length} lines · stdout/stderr/system` }),
+      node("span", {
+        className: "muted",
+        text: `${logs.length} retained lines · through sequence ${state.taskLogs.offset} · stdout/stderr/system`,
+      }),
       node("label", { className: "toggle-label" }, [autoScroll, node("span", { text: "Auto scroll" })]),
     ]);
     if (!logs.length) {
@@ -1996,7 +2014,7 @@
       if (document.hidden) {
         if (state.refreshTimer) window.clearTimeout(state.refreshTimer);
         state.refreshTimer = null;
-        abortAllRequests();
+        abortReadRequests();
       } else if (state.apiKey) {
         refreshCurrentPage().catch(showGlobalError);
       }

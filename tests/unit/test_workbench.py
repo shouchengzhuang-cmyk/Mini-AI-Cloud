@@ -164,10 +164,23 @@ async def test_workbench_task_logs_follow_sequence_cursor() -> None:
         js_response = await client.get("/workbench/assets/workbench.js")
 
     assert "const TASK_LOG_PAGE_SIZE = 500;" in js_response.text
+    assert "const TASK_LOG_MAX_PAGES_PER_REFRESH = 2;" in js_response.text
+    assert "const TASK_LOG_RETAIN_LIMIT = 1000;" in js_response.text
     assert "async function fetchTaskLogs(taskId)" in js_response.text
     assert "&offset=${offset}`" in js_response.text
     assert "state.taskLogs.offset = nextOffset;" in js_response.text
+    assert "pagesFetched < TASK_LOG_MAX_PAGES_PER_REFRESH" in js_response.text
+    assert "state.taskLogs.entries.length - TASK_LOG_RETAIN_LIMIT" in js_response.text
     assert "if (logs.length < TASK_LOG_PAGE_SIZE) break;" in js_response.text
+
+
+async def test_workbench_visibility_changes_do_not_abort_mutations() -> None:
+    async with _client() as client:
+        js_response = await client.get("/workbench/assets/workbench.js")
+
+    assert "function abortReadRequests()" in js_response.text
+    assert 'if (channel.startsWith("action:")) continue;' in js_response.text
+    assert "state.refreshTimer = null;\n        abortReadRequests();" in js_response.text
 
 
 async def test_workbench_resource_lists_follow_api_cursors() -> None:
