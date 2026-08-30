@@ -1,4 +1,5 @@
 import uuid
+from datetime import timedelta
 from pathlib import Path
 from typing import TypedDict
 
@@ -556,6 +557,83 @@ async def test_kubernetes_restart_handoff_preserves_creation_fence_and_blocks_zo
             resource_name=str(runtime_identity["resource_name"]),
             resource_uid=str(runtime_identity["resource_uid"]),
             spec_hash=str(runtime_identity["spec_hash"]),
+        )
+
+
+async def test_kubernetes_handoff_lease_blocks_retry_until_job_deadline(
+    database: Database,
+) -> None:
+    worker_id = "worker-kubernetes-handoff-lease"
+    worker_session_id = uuid.uuid4()
+    await _register(
+        database,
+        worker_id=worker_id,
+        worker_session_id=worker_session_id,
+        runtime_types=["kubernetes"],
+    )
+    task_id = await _create_task(database, runtime_type="kubernetes")
+    execution_id = await _claim(
+        database,
+        task_id=task_id,
+        worker_id=worker_id,
+        worker_session_id=worker_session_id,
+    )
+    runtime_identity: _RuntimeIdentity = {
+        "runtime_type": "kubernetes",
+        "resource_kind": "job",
+        "resource_name": f"mini-ai-job-{task_id.hex[:12]}-{execution_id.hex[:12]}",
+        "namespace": "mini-ai-runtime",
+        "resource_uid": "job-uid-handoff",
+        "runtime_worker_session_id": worker_session_id,
+        "spec_hash": "b" * 32,
+        "observed_pod_name": "controlled-pod-handoff",
+        "observed_pod_uid": "pod-uid-handoff",
+    }
+    async with database.session() as session, session.begin():
+        await TaskRepository.mark_pulling(
+            session,
+            task_id=task_id,
+            worker_id=worker_id,
+            execution_id=execution_id,
+            worker_session_id=worker_session_id,
+            lease_seconds=30,
+        )
+        await TaskRepository.mark_running(
+            session,
+            task_id=task_id,
+            worker_id=worker_id,
+            execution_id=execution_id,
+            worker_session_id=worker_session_id,
+            lease_seconds=30,
+        )
+        await TaskRepository.record_runtime_handle(
+            session,
+            task_id=task_id,
+            worker_id=worker_id,
+            execution_id=execution_id,
+            worker_session_id=worker_session_id,
+            **runtime_identity,
+        )
+        held = await TaskRepository.preserve_kubernetes_handoff_lease(
+            session,
+            task_id=task_id,
+            worker_id=worker_id,
+            execution_id=execution_id,
+            worker_session_id=worker_session_id,
+            cleanup_grace_seconds=30,
+        )
+        assert held.lease_expires_at is not None
+        assert held.started_at is not None
+        assert held.lease_expires_at - held.started_at >= timedelta(seconds=55)
+
+    async with database.session() as session, session.begin():
+        assert (
+            await TaskRepository.recover_expired(
+                session,
+                limit=10,
+                max_recovery_attempts=1,
+            )
+            == []
         )
 
 

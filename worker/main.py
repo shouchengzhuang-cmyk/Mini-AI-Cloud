@@ -16,7 +16,7 @@ from core.enums import ACTIVE_TASK_STATUSES, WorkerStatus
 from core.logging import configure_logging, get_logger
 from core.redis import RedisQueue
 from core.runtime_profiles import RuntimeProfileCatalog
-from repositories.tasks import RecoverableRuntimeExecution, TaskRepository
+from repositories.tasks import RecoverableRuntimeExecution, StaleExecutionError, TaskRepository
 from repositories.workers import WorkerRepository
 from scheduler import Scheduler, TaskAssignment
 from worker.artifact_workspace import ArtifactWorkspaceManager
@@ -605,6 +605,11 @@ class WorkerService:
             )
             if pending:
                 relinquish_kubernetes = await self._replacement_worker_expected()
+                relinquished_task_ids = (
+                    await self._preserve_kubernetes_handoff_leases()
+                    if relinquish_kubernetes
+                    else set()
+                )
                 self.logger.warning(
                     "shutdown deadline reached; stopping local runtimes and relinquishing "
                     "durable Kubernetes Jobs",
@@ -612,11 +617,7 @@ class WorkerService:
                     active_tasks=[str(task_id) for task_id in self.active],
                 )
                 for execution in self.active.values():
-                    if (
-                        relinquish_kubernetes
-                        and execution.runtime_type == "kubernetes"
-                        and execution.runtime_handle_durable.is_set()
-                    ):
+                    if execution.task_id in relinquished_task_ids:
                         execution.relinquish_requested.set()
                     else:
                         execution.ownership_lost.set()
@@ -665,6 +666,37 @@ class WorkerService:
                 error=str(exc),
             )
             return False
+
+    async def _preserve_kubernetes_handoff_leases(self) -> set[uuid.UUID]:
+        """Fence reaper retries before preserving Jobs for a rolling restart."""
+
+        preserved: set[uuid.UUID] = set()
+        for execution in self.active.values():
+            if (
+                execution.runtime_type != "kubernetes"
+                or not execution.runtime_handle_durable.is_set()
+            ):
+                continue
+            try:
+                async with self.database.session() as session, session.begin():
+                    await TaskRepository.preserve_kubernetes_handoff_lease(
+                        session,
+                        task_id=execution.task_id,
+                        worker_id=self.worker_id,
+                        execution_id=execution.execution_id,
+                        worker_session_id=self.worker_session_id,
+                        cleanup_grace_seconds=self.settings.kubernetes_cleanup_grace_seconds,
+                    )
+            except StaleExecutionError as exc:
+                self.logger.warning(
+                    "Kubernetes Job handoff lease could not be fenced; Job will be stopped",
+                    task_id=str(execution.task_id),
+                    execution_id=str(execution.execution_id),
+                    error=str(exc),
+                )
+            else:
+                preserved.add(execution.task_id)
+        return preserved
 
     async def _best_effort_worker_status(self, status: WorkerStatus) -> None:
         try:

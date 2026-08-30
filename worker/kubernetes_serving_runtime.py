@@ -1124,12 +1124,6 @@ def _pod_contract(pod: object) -> dict[str, object]:
     contract_label_keys = _BASE_CONTRACT_LABEL_KEYS + (
         _ACCELERATOR_CONTRACT_LABEL_KEYS if accelerator_contract else ()
     )
-    service_account_name = getattr(pod_spec, "service_account_name", None)
-    image_pull_secrets = tuple(
-        getattr(item, "name", None)
-        for item in (getattr(pod_spec, "image_pull_secrets", None) or ())
-    )
-
     return {
         "fencing_labels": {key: labels.get(key) for key in contract_label_keys},
         **(
@@ -1150,14 +1144,6 @@ def _pod_contract(pod: object) -> dict[str, object]:
         "pod": {
             "automount_service_account_token": getattr(
                 pod_spec, "automount_service_account_token", None
-            ),
-            **(
-                {
-                    "service_account_name": service_account_name,
-                    "image_pull_secrets": image_pull_secrets,
-                }
-                if service_account_name not in (None, "default") or image_pull_secrets
-                else {}
             ),
             "hostname": getattr(pod_spec, "hostname", None),
             "host_ipc": getattr(pod_spec, "host_ipc", None) is True,

@@ -248,6 +248,8 @@ class TaskExecutor:
                 "log_limit_exceeded",
             }:
                 await self._stop_owned(handle, execution)
+            if outcome.reason == "relinquish":
+                await self._preserve_kubernetes_handoff_lease(execution, task, handle)
             if outcome.reason in {"ownership_lost", "relinquish"}:
                 self.logger.warning(
                     (
@@ -529,6 +531,27 @@ class TaskExecutor:
                 execution_id=execution.execution_id,
                 lease_seconds=self.settings.task_lease_seconds,
                 worker_session_id=self.worker_session_id,
+            )
+
+    async def _preserve_kubernetes_handoff_lease(
+        self,
+        execution: ActiveExecution,
+        task: Task,
+        handle: RuntimeHandle,
+    ) -> None:
+        if handle.runtime_type != "kubernetes" or self.worker_session_id is None:
+            raise StaleExecutionError("only a fenced Kubernetes Job can be relinquished")
+        # Kubernetes enforces the task timeout as Job.activeDeadlineSeconds. Keep
+        # the database lease through that deadline and Pod termination grace so
+        # lease recovery cannot start an overlapping retry.
+        async with self.database.session() as session, session.begin():
+            await TaskRepository.preserve_kubernetes_handoff_lease(
+                session,
+                task_id=execution.task_id,
+                worker_id=self.worker_id,
+                execution_id=execution.execution_id,
+                worker_session_id=self.worker_session_id,
+                cleanup_grace_seconds=self.settings.kubernetes_cleanup_grace_seconds,
             )
 
     async def _mark_starting(self, execution: ActiveExecution) -> None:

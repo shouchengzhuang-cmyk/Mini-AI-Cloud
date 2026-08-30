@@ -169,11 +169,12 @@ async def test_handle_persistence_failure_compensates_suspended_job(
         execution_id=execution_id,
         runtime_type="kubernetes",
     )
+    task = _task(task_id=task_id, execution_id=execution_id, worker_id=worker_id)
     await _stub_execution_dependencies(
         executor,
         monkeypatch,
         active=active,
-        task=_task(task_id=task_id, execution_id=execution_id, worker_id=worker_id),
+        task=task,
     )
 
     async def fail_record(execution: ActiveExecution, handle: RuntimeHandle) -> None:
@@ -208,11 +209,12 @@ async def test_relinquish_preserves_durable_running_job_for_recovery(
         execution_id=execution_id,
         runtime_type="kubernetes",
     )
+    task = _task(task_id=task_id, execution_id=execution_id, worker_id=worker_id)
     await _stub_execution_dependencies(
         executor,
         monkeypatch,
         active=active,
-        task=_task(task_id=task_id, execution_id=execution_id, worker_id=worker_id),
+        task=task,
     )
 
     async def record(execution: ActiveExecution, handle: RuntimeHandle) -> None:
@@ -225,6 +227,15 @@ async def test_relinquish_preserves_durable_running_job_for_recovery(
 
     async def mark_state(execution: ActiveExecution) -> None:
         assert execution is active
+
+    preserved: list[tuple[ActiveExecution, Task, RuntimeHandle]] = []
+
+    async def preserve_handoff(
+        execution: ActiveExecution,
+        task: Task,
+        handle: RuntimeHandle,
+    ) -> None:
+        preserved.append((execution, task, handle))
 
     async def relinquish(
         handle: RuntimeHandle,
@@ -241,6 +252,7 @@ async def test_relinquish_preserves_durable_running_job_for_recovery(
     monkeypatch.setattr(executor, "_pre_start_stop_reason", no_stop_reason)
     monkeypatch.setattr(executor, "_mark_starting", mark_state)
     monkeypatch.setattr(executor, "_mark_running", mark_state)
+    monkeypatch.setattr(executor, "_preserve_kubernetes_handoff_lease", preserve_handoff)
     monkeypatch.setattr(executor, "_wait_for_outcome", relinquish)
 
     result = await executor.execute(active)
@@ -248,6 +260,7 @@ async def test_relinquish_preserves_durable_running_job_for_recovery(
     assert result.accepted is False
     assert runtime.events == ["prepare", "start"]
     assert active.runtime_handle_durable.is_set()
+    assert preserved == [(active, task, runtime.handle)]
 
 
 @pytest.mark.parametrize(
@@ -294,6 +307,9 @@ async def test_shutdown_relinquishes_only_durable_kubernetes_jobs(
     service.queue = SimpleNamespace(close=AsyncMock())
     service.database = SimpleNamespace(dispose=AsyncMock())
     service._best_effort_worker_status = AsyncMock()
+    service._preserve_kubernetes_handoff_leases = AsyncMock(
+        return_value={execution.task_id} if expected_relinquish else set()
+    )
 
     async def heartbeat() -> None:
         await service.heartbeat_stop.wait()
@@ -309,6 +325,10 @@ async def test_shutdown_relinquishes_only_durable_kubernetes_jobs(
         )
     else:
         service.kubernetes_runtime.replacement_worker_expected.assert_not_awaited()
+    if durable and replacement_expected:
+        service._preserve_kubernetes_handoff_leases.assert_awaited_once_with()
+    else:
+        service._preserve_kubernetes_handoff_leases.assert_not_awaited()
     service._best_effort_worker_status.assert_any_await(WorkerStatus.DRAINING)
     service._best_effort_worker_status.assert_any_await(WorkerStatus.OFFLINE)
 

@@ -1313,6 +1313,43 @@ class TaskRepository:
         return task
 
     @staticmethod
+    async def preserve_kubernetes_handoff_lease(
+        session: AsyncSession,
+        *,
+        task_id: uuid.UUID,
+        worker_id: str,
+        execution_id: uuid.UUID,
+        worker_session_id: uuid.UUID,
+        cleanup_grace_seconds: int,
+    ) -> Task:
+        """Keep a running Kubernetes Job exclusive while its Worker restarts.
+
+        Kubernetes enforces a task timeout with ``activeDeadlineSeconds``. A
+        normal Worker lease is much shorter, so a graceful rollout must extend
+        that lease through the Job's lifetime before relinquishing it. Otherwise
+        the generic reaper can schedule a second execution while the original
+        Pod is still running.
+        """
+
+        task = await TaskRepository._owned_task(
+            session,
+            task_id=task_id,
+            worker_id=worker_id,
+            execution_id=execution_id,
+            worker_session_id=worker_session_id,
+        )
+        if task.runtime_type.value != "kubernetes" or task.runtime_handle is None:
+            raise StaleExecutionError("Kubernetes handoff runtime handle is no longer owned")
+        if cleanup_grace_seconds < 0:
+            raise ValueError("Kubernetes handoff cleanup grace must not be negative")
+        now = await database_utcnow(session)
+        task.lease_expires_at = now + timedelta(
+            seconds=task.timeout_seconds + cleanup_grace_seconds
+        )
+        task.version += 1
+        return task
+
+    @staticmethod
     async def mark_starting(
         session: AsyncSession,
         *,
