@@ -1054,10 +1054,7 @@ def _assert_pod_contract(
         container = containers[0]
         if not isinstance(container, dict):
             raise KindServingE2EError("inference Pod container spec is invalid")
-        accepted_images = {image, f"docker.io/library/{image}"}
-        if container.get("image") not in accepted_images or str(container.get("image")).endswith(
-            ":latest"
-        ):
+        if not _image_references_match(container.get("image"), image):
             raise KindServingE2EError("inference Pod did not use the fixed Kind application image")
         security = container.get("securityContext")
         if not isinstance(security, dict):
@@ -1107,6 +1104,17 @@ def _assert_pod_contract(
             raise KindServingE2EError("inference Pod uses a credential or persistent host volume")
     if len(names) != len(pods):
         raise KindServingE2EError("serving Pod names collided")
+
+
+def _image_references_match(observed_image: object, expected_image: str) -> bool:
+    if not isinstance(observed_image, str):
+        return False
+    try:
+        observed = canonicalize_image_reference(observed_image)
+        expected = canonicalize_image_reference(expected_image)
+    except ImageReferenceError:
+        return False
+    return observed.canonical == expected.canonical
 
 
 def _assert_chat_body(payload: dict[str, Any]) -> None:

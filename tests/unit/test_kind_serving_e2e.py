@@ -22,6 +22,7 @@ from scripts.kind_serving_e2e import (
     _bad_image_reference,
     _bounded_backoff_window,
     _configure_kind_image_policy,
+    _image_references_match,
 )
 
 
@@ -184,6 +185,31 @@ async def test_image_policy_pins_app_digest_and_bad_image_tag() -> None:
     assert "tag_glob" not in rules[0]
     assert rules[1]["tag_glob"] == "m7-p4-1234"
     assert _bad_image_reference("m7-p4-1234") == ("invalid.local/mini-ai-cloud/missing:m7-p4-1234")
+
+
+def test_pod_image_contract_accepts_server_canonical_digest_reference() -> None:
+    digest = f"sha256:{'a' * 64}"
+
+    assert _image_references_match(
+        f"docker.io/library/mini-ai-cloud@{digest}",
+        f"docker.io/library/mini-ai-cloud:m7-p4-1234@{digest}",
+    )
+
+
+@pytest.mark.parametrize(
+    "observed_image",
+    [
+        f"docker.io/library/mini-ai-cloud@sha256:{'b' * 64}",
+        "docker.io/library/mini-ai-cloud:latest",
+        None,
+    ],
+)
+def test_pod_image_contract_rejects_different_or_malformed_reference(
+    observed_image: object,
+) -> None:
+    expected = f"docker.io/library/mini-ai-cloud:m7-p4-1234@sha256:{'a' * 64}"
+
+    assert not _image_references_match(observed_image, expected)
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
