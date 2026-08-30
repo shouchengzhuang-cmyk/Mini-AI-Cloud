@@ -232,6 +232,7 @@ class KubernetesRuntime:
         self._validate_handle(handle)
         api = await self._ensure_core_api()
         source: object | None = None
+        final_read = False
         try:
             while True:
                 pod = await self._controlled_pod(handle, required=False)
@@ -258,9 +259,14 @@ class KubernetesRuntime:
                         name=handle.observation.pod_name,
                         namespace=self.namespace,
                         container=TASK_CONTAINER_NAME,
-                        follow=True,
+                        follow=not final_read,
                         _preload_content=False,
                     )
+                    response_error = _log_response_error(source)
+                    if response_error is not None:
+                        await _close_log_source(source)
+                        source = None
+                        raise response_error
                     break
                 except ApiException as exc:
                     if exc.status != 400:
@@ -278,9 +284,11 @@ class KubernetesRuntime:
                         raise failure from exc
                     phase = getattr(status, "phase", None)
                     if phase in {"Succeeded", "Failed"}:
-                        if ready is not None:
-                            ready.set()
-                        return
+                        if final_read:
+                            if ready is not None:
+                                ready.set()
+                            return
+                        final_read = True
                     await asyncio.sleep(self.poll_interval)
 
             if ready is not None:
@@ -1488,6 +1496,16 @@ async def _iter_log_chunks(source: object) -> AsyncIterator[bytes]:
             yield _as_bytes(chunk)
         return
     raise TypeError("Kubernetes log response is not streamable")
+
+
+def _log_response_error(source: object) -> ApiException | None:
+    """Surface non-2xx streaming responses that kubernetes-asyncio leaves unchecked."""
+
+    status = getattr(source, "status", None)
+    if not isinstance(status, int) or 200 <= status < 300:
+        return None
+    reason = str(getattr(source, "reason", "") or "")
+    return ApiException(status=status, reason=reason or None)
 
 
 async def _close_log_source(source: object) -> None:

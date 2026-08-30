@@ -142,6 +142,26 @@ def _apis(*, pods: list[object] | None = None) -> tuple[SimpleNamespace, SimpleN
     return batch, core
 
 
+class _StreamingLogContent:
+    def __init__(self, *chunks: bytes) -> None:
+        self._chunks = chunks
+
+    async def iter_any(self) -> AsyncIterator[bytes]:
+        for chunk in self._chunks:
+            yield chunk
+
+
+class _StreamingLogResponse:
+    def __init__(self, status: int, reason: str, *chunks: bytes) -> None:
+        self.status = status
+        self.reason = reason
+        self.content = _StreamingLogContent(*chunks)
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def _runtime(
     batch: object,
     core: object,
@@ -338,6 +358,76 @@ async def test_logs_read_only_controlled_task_container_and_capture_pod_identity
     assert handle.observation.pod_name == "controlled-pod"
     assert handle.observation.pod_uid == "pod-uid"
     assert core.read_namespaced_pod_log.call_args.kwargs["container"] == "task"
+
+
+async def test_logs_retry_terminal_streaming_400_with_non_follow_read() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
+    spec = _spec()
+    job = _job(runtime, spec)
+    core.list_namespaced_pod.return_value = SimpleNamespace(items=[_pod(job)])
+    core.read_namespaced_pod_status.return_value = _pod(
+        job,
+        status=SimpleNamespace(phase="Succeeded", container_statuses=[]),
+    )
+    waiting = _StreamingLogResponse(400, "Bad Request", b"container is waiting\n")
+    completed = _StreamingLogResponse(200, "OK", b"KIND_BATCH_SUCCESS\n")
+    core.read_namespaced_pod_log.side_effect = [waiting, completed]
+    handle = await runtime.prepare(spec)
+    ready = asyncio.Event()
+
+    logs = [item async for item in runtime.logs(handle, ready=ready)]
+
+    assert ready.is_set()
+    assert [item.content for item in logs] == [b"KIND_BATCH_SUCCESS\n"]
+    assert waiting.closed
+    assert completed.closed
+    calls = core.read_namespaced_pod_log.call_args_list
+    assert [call.kwargs["follow"] for call in calls] == [True, False]
+
+
+async def test_logs_retry_pending_streaming_400_without_persisting_error_body() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
+    spec = _spec()
+    job = _job(runtime, spec)
+    core.list_namespaced_pod.return_value = SimpleNamespace(items=[_pod(job)])
+    core.read_namespaced_pod_status.return_value = _pod(
+        job,
+        status=SimpleNamespace(phase="Pending", container_statuses=[]),
+    )
+    waiting = _StreamingLogResponse(400, "Bad Request", b"container is waiting\n")
+    running = _StreamingLogResponse(200, "OK", b"KIND_BATCH_SUCCESS\n")
+    core.read_namespaced_pod_log.side_effect = [waiting, running]
+    handle = await runtime.prepare(spec)
+    ready = asyncio.Event()
+
+    logs = [item async for item in runtime.logs(handle, ready=ready)]
+
+    assert ready.is_set()
+    assert [item.content for item in logs] == [b"KIND_BATCH_SUCCESS\n"]
+    assert waiting.closed
+    assert running.closed
+    calls = core.read_namespaced_pod_log.call_args_list
+    assert [call.kwargs["follow"] for call in calls] == [True, True]
+
+
+async def test_logs_reject_unchecked_streaming_http_error() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
+    spec = _spec()
+    job = _job(runtime, spec)
+    core.list_namespaced_pod.return_value = SimpleNamespace(items=[_pod(job)])
+    forbidden = _StreamingLogResponse(403, "Forbidden", b"not task output\n")
+    core.read_namespaced_pod_log.return_value = forbidden
+    handle = await runtime.prepare(spec)
+    ready = asyncio.Event()
+
+    with pytest.raises(KubernetesRuntimeError, match="Forbidden"):
+        _ = [item async for item in runtime.logs(handle, ready=ready)]
+
+    assert ready.is_set()
+    assert forbidden.closed
 
 
 async def test_pod_from_foreign_job_controller_is_never_adopted() -> None:
