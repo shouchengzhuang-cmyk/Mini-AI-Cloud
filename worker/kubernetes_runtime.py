@@ -1806,4 +1806,3 @@ def _as_bytes(value: object) -> bytes:
     if isinstance(value, bytearray | memoryview):
         return bytes(value)
     raise TypeError(f"unsupported Kubernetes log chunk type: {type(value).__name__}")
-

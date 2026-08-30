@@ -2096,4 +2096,3 @@ async def _complete_preemption_plans(
     for plan in plans:
         plan.state = "completed"
         plan.completed_at = now
-

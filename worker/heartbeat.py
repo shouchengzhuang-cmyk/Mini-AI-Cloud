@@ -104,4 +104,3 @@ class Heartbeat:
                     worker_id=self.worker_id,
                     error=str(exc),
                 )
-

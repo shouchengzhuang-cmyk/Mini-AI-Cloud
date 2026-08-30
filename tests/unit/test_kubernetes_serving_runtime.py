@@ -1101,4 +1101,3 @@ async def test_version_and_close_only_close_owned_client() -> None:
     await owned.close()
     owned_close.assert_awaited_once()
     assert owned._api is None
-

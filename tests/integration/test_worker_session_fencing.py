@@ -767,4 +767,3 @@ async def test_reregistration_fences_artifact_materialize_and_publish(
     assert artifacts[0].state == "failed"
     assert [path for path in (tmp_path / "objects").rglob("*") if path.is_file()] == []
     await manager.cleanup(workspace)
-

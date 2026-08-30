@@ -1043,4 +1043,3 @@ async def test_retry_execution_gets_distinct_job_name_and_handle_identity_is_fro
     assert first.labels[EXECUTION_ID_LABEL] != second.labels[EXECUTION_ID_LABEL]
     with pytest.raises(FrozenInstanceError):
         first.object_id = "mutated"  # type: ignore[misc]
-

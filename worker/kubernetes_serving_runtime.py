@@ -1768,4 +1768,3 @@ def _bounded(value: str | None) -> str | None:
     if value is None:
         return None
     return value[:_MAX_ERROR_LENGTH]
-

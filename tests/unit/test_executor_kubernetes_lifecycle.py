@@ -357,4 +357,3 @@ async def test_shutdown_replacement_probe_failure_is_fail_closed() -> None:
 
     assert await service._replacement_worker_expected() is False
     service.logger.error.assert_called_once()
-
