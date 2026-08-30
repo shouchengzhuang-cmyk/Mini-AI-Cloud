@@ -18,7 +18,7 @@ Workbench 由 FastAPI 同源托管，不需要 Node、npm、CDN 或单独的前�
 
 ## 认证
 
-连接页默认使用当前 origin，也可以填写另一个 API Base URL。输入 Project API Key 后，Workbench 会调用：
+Workbench 只连接托管当前页面的同源 Mini AI Cloud API。连接页会显示并锁定当前 API origin，不支持填写远程 API Base URL。输入 Project API Key 后，Workbench 会调用：
 
 - `GET /api/v1/auth/whoami`
 - `GET /api/v1/projects/current`
@@ -40,7 +40,7 @@ Workbench 由 FastAPI 同源托管，不需要 Node、npm、CDN 或单独的前�
 
 Workbench 不增加认证机制，也不绕过 RBAC、quota、image policy、admission 或 scheduler。所有操作仍由现有 API 做权限检查和业务校验。Task environment values 始终以 `MASKED` 显示，结构化 API 错误会保留 code、message、details 和 request ID，Cancel、Scale、Stop 都需要确认。
 
-动态 API 数据通过 DOM `textContent` 和节点 API 渲染。静态页面禁止外部脚本、样式和对象资源，并使用 `no-store`，避免浏览器长期缓存连接页面。
+动态 API 数据通过 DOM `textContent` 和节点 API 渲染。静态页面禁止外部脚本、样式、对象资源和跨 origin API 连接，并使用 `no-store`，避免浏览器长期缓存连接页面。
 
 ## 已知限制
 

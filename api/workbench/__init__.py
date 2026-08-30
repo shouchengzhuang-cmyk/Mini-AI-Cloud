@@ -22,7 +22,7 @@ def install_workbench(app: FastAPI) -> None:
                     "script-src 'self'; "
                     "style-src 'self'; "
                     "img-src 'self' data:; "
-                    "connect-src 'self' http: https:; "
+                    "connect-src 'self'; "
                     "object-src 'none'; "
                     "base-uri 'none'; "
                     "frame-ancestors 'none'"

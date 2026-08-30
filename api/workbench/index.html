@@ -24,8 +24,9 @@
         </p>
         <form id="connection-form" class="form-stack">
           <label>
-            <span>API Base URL</span>
-            <input id="api-base" name="api-base" type="url" required autocomplete="url">
+            <span>API origin (same origin)</span>
+            <input id="api-base" name="api-base" type="url" required readonly aria-readonly="true">
+            <small>Workbench connects only to the control plane serving this page.</small>
           </label>
           <label>
             <span>Project API Key</span>
@@ -285,7 +286,7 @@
           <label><span>Name</span><input name="name" required placeholder="demo-model"></label>
           <label><span>Model</span><input name="model" placeholder="org/model or use Logical model ID"></label>
           <label><span>Serving runtime</span><select name="runtime"><option value="vllm">vLLM</option><option value="fake">Fake</option></select></label>
-          <label><span>Runtime type</span><select name="runtime_type"><option value="docker">docker</option><option value="kubernetes">kubernetes</option><option value="fake">fake</option></select></label>
+          <label><span>Runtime type</span><select name="runtime_type"><option value="docker">docker</option><option value="kubernetes">kubernetes</option><option value="fake" disabled>fake</option></select></label>
           <label><span>Replicas</span><input name="replicas" type="number" min="0" max="1000" value="1" required></label>
           <label><span>CPU millicores</span><input name="cpu_millicores" type="number" min="1" value="1000" required></label>
           <label><span>Memory MB</span><input name="memory_mb" type="number" min="16" value="1024" required></label>

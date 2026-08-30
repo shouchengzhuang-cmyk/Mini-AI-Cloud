@@ -1,7 +1,6 @@
 (() => {
   "use strict";
 
-  const SESSION_BASE_KEY = "mini_ai_cloud_workbench_base";
   const SESSION_API_KEY = "mini_ai_cloud_workbench_key";
   const TERMINAL_TASK_STATUSES = new Set([
     "succeeded",
@@ -20,7 +19,7 @@
   };
 
   const state = {
-    apiBase: "",
+    apiBase: window.location.origin,
     apiKey: "",
     principal: null,
     project: null,
@@ -207,9 +206,10 @@
     if (url.username || url.password) {
       throw new Error("API Base URL must not contain credentials.");
     }
-    url.hash = "";
-    url.search = "";
-    return url.href.replace(/\/$/, "");
+    if (url.origin !== window.location.origin) {
+      throw new Error("Workbench API origin must match the page origin.");
+    }
+    return window.location.origin;
   }
 
   function sessionGet(key) {
@@ -538,7 +538,6 @@
     ]);
     state.principal = principal;
     state.project = project;
-    sessionSet(SESSION_BASE_KEY, state.apiBase);
     sessionSet(SESSION_API_KEY, state.apiKey);
     query("#api-key").value = "";
     query("#current-project").textContent = `${project.name} (${project.slug})`;
@@ -551,7 +550,6 @@
   function disconnect() {
     abortAllRequests();
     if (state.refreshTimer) window.clearTimeout(state.refreshTimer);
-    sessionRemove(SESSION_BASE_KEY);
     sessionRemove(SESSION_API_KEY);
     state.apiKey = "";
     state.principal = null;
@@ -559,7 +557,7 @@
     closeDrawer();
     query("#connection-view").classList.remove("hidden");
     query("#app-view").classList.add("hidden");
-    query("#api-base").value = state.apiBase || window.location.origin;
+    query("#api-base").value = window.location.origin;
     query("#api-key").value = "";
     query("#connection-error").classList.add("hidden");
   }
@@ -1330,10 +1328,25 @@
     }
   }
 
+  function syncServingRuntime(form) {
+    const runtime = form.elements.runtime.value;
+    const runtimeType = form.elements.runtime_type;
+    if (runtime === "fake") {
+      runtimeType.value = "fake";
+      runtimeType.disabled = true;
+      form.elements.accelerator_count.value = "0";
+      form.elements.tensor_parallel_size.value = "1";
+      return;
+    }
+    runtimeType.disabled = false;
+    if (runtimeType.value === "fake") runtimeType.value = "docker";
+  }
+
   function openDeployService() {
     const error = query("#deploy-service-error");
     error.textContent = "";
     error.classList.add("hidden");
+    syncServingRuntime(query("#deploy-service-form"));
     query("#deploy-service-dialog").showModal();
   }
 
@@ -1352,7 +1365,7 @@
       const payload = {
         name: String(formData.get("name") || "").trim(),
         runtime: String(formData.get("runtime") || "vllm"),
-        runtime_type: String(formData.get("runtime_type") || "docker"),
+        runtime_type: String(form.elements.runtime_type.value || "docker"),
         replicas: Number(formData.get("replicas")),
         cpu_millicores: Number(formData.get("cpu_millicores")),
         memory_mb: Number(formData.get("memory_mb")),
@@ -1739,13 +1752,11 @@
     for (const button of document.querySelectorAll('[data-dialog-close]')) {
       button.addEventListener("click", () => button.closest("dialog").close());
     }
-    query('#deploy-service-form select[name="runtime"]').addEventListener("change", (event) => {
-      if (event.target.value !== "fake") return;
-      const form = event.target.form;
-      form.elements.runtime_type.value = "fake";
-      form.elements.accelerator_count.value = "0";
-      form.elements.tensor_parallel_size.value = "1";
+    const deployServiceForm = query("#deploy-service-form");
+    deployServiceForm.elements.runtime.addEventListener("change", () => {
+      syncServingRuntime(deployServiceForm);
     });
+    syncServingRuntime(deployServiceForm);
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape" && state.detail) closeDrawer();
     });
@@ -1762,12 +1773,11 @@
 
   async function initialize() {
     bindEvents();
-    const savedBase = sessionGet(SESSION_BASE_KEY) || window.location.origin;
     const savedKey = sessionGet(SESSION_API_KEY);
-    query("#api-base").value = savedBase;
+    query("#api-base").value = window.location.origin;
     if (!savedKey) return;
     try {
-      await connect(savedBase, savedKey);
+      await connect(window.location.origin, savedKey);
     } catch (error) {
       state.apiKey = "";
       sessionRemove(SESSION_API_KEY);
