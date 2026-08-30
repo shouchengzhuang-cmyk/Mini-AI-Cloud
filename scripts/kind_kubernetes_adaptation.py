@@ -180,6 +180,55 @@ def local_image_cleanup_argv(docker: str, tags: Sequence[str]) -> tuple[str, ...
     return (docker, "image", "rm", "--force", *unique_tags)
 
 
+def image_archive_path(temp_root: Path, component: str) -> Path:
+    if not re.fullmatch(r"[a-z]+(?:-[a-z]+)*", component):
+        raise KindEvidenceError("image archive component is not safely bounded")
+    resolved_temp = temp_root.resolve(strict=True)
+    archive_root = (resolved_temp / "image-archives").resolve()
+    if archive_root.parent != resolved_temp:
+        raise KindEvidenceError("image archive root escaped the private harness directory")
+    archive = (archive_root / f"{component}.tar").resolve()
+    if archive.parent != archive_root:
+        raise KindEvidenceError("image archive path escaped the private archive directory")
+    return archive
+
+
+def docker_image_save_argv(
+    docker: str,
+    alias: PinnedImageAlias,
+    archive: Path,
+) -> tuple[str, ...]:
+    if archive.name != f"{alias.component}.tar" or archive.suffix != ".tar":
+        raise KindEvidenceError("image archive name does not match its pinned component")
+    return (
+        docker,
+        "image",
+        "save",
+        "--platform",
+        "linux/amd64",
+        "--output",
+        str(archive),
+        alias.local_tag,
+    )
+
+
+def kind_image_archive_load_argv(
+    kind: str,
+    cluster_name: str,
+    archive: Path,
+) -> tuple[str, ...]:
+    if not archive.is_absolute() or archive.suffix != ".tar":
+        raise KindEvidenceError("Kind image archive must be an absolute tar path")
+    return (
+        kind,
+        "load",
+        "image-archive",
+        "--name",
+        cluster_name,
+        str(archive),
+    )
+
+
 def build_upgrade_sentinels(identity: RunIdentity, app_image: str) -> dict[str, object]:
     validate_pinned_image(app_image, description="upgrade sentinel application image")
     labels = {
@@ -406,6 +455,8 @@ class KindAdaptationHarness:
         self.batch_credentials_file = self.temp_root / "batch-credentials.json"
         self.bin_root = self.temp_root / "bin"
         self.bin_root.mkdir(mode=0o700)
+        self.image_archive_root = self.temp_root / "image-archives"
+        self.image_archive_root.mkdir(mode=0o700)
         self._install_kubectl_shim()
         self.bundle = EvidenceBundle(config.evidence_root, self.identity)
         self.recorder = CommandRecorder(self.bundle.root, config.repository_root)
@@ -427,6 +478,7 @@ class KindAdaptationHarness:
             redis_image=config.redis_image,
         )
         self.created_local_image_tags: list[str] = []
+        self.image_archives: dict[str, Path] = {}
         self.cluster_created = False
         self.release_installed = False
         self.cleanup_complete = False
@@ -742,6 +794,20 @@ class KindAdaptationHarness:
                 ),
             )
             self.created_local_image_tags.append(alias.local_tag)
+            archive = image_archive_path(self.temp_root, alias.component)
+            self._record(
+                outcomes,
+                claim,
+                f"save-{alias.component}-single-platform-archive",
+                docker_image_save_argv(self.config.tools.docker, alias, archive),
+                timeout_seconds=900,
+            )
+            if not archive.is_file() or archive.is_symlink() or archive.stat().st_size == 0:
+                raise PhaseFailure(
+                    f"{alias.component} single-platform image archive is invalid", outcomes
+                )
+            os.chmod(archive, stat.S_IRUSR | stat.S_IWUSR)
+            self.image_archives[alias.component] = archive
         self._record(
             outcomes,
             claim,
@@ -780,22 +846,35 @@ class KindAdaptationHarness:
         )
         if node_image.stdout.strip() != KIND_NODE_IMAGE:
             raise PhaseFailure("Kind node container does not use the pinned image", outcomes)
-        load_images = (
-            (self.local_app_tag, "application"),
-            *((alias.local_tag, alias.component) for alias in self.image_aliases),
+        self._record(
+            outcomes,
+            claim,
+            "load-application-image",
+            (
+                self.config.tools.kind,
+                "load",
+                "docker-image",
+                "--name",
+                self.identity.cluster_name,
+                self.local_app_tag,
+            ),
+            timeout_seconds=600,
         )
-        for image, component in load_images:
+        for alias in self.image_aliases:
+            try:
+                archive = self.image_archives[alias.component]
+            except KeyError as error:
+                raise PhaseFailure(
+                    f"{alias.component} single-platform image archive was not prepared", outcomes
+                ) from error
             self._record(
                 outcomes,
                 claim,
-                f"load-{component}-image",
-                (
+                f"load-{alias.component}-image-archive",
+                kind_image_archive_load_argv(
                     self.config.tools.kind,
-                    "load",
-                    "docker-image",
-                    "--name",
                     self.identity.cluster_name,
-                    image,
+                    archive,
                 ),
                 timeout_seconds=600,
             )

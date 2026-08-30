@@ -23,6 +23,9 @@ from scripts.kind_kubernetes_adaptation import (
     application_reference,
     build_upgrade_sentinels,
     chart_fullname,
+    docker_image_save_argv,
+    image_archive_path,
+    kind_image_archive_load_argv,
     local_image_cleanup_argv,
     parse_build_digest,
     pinned_image_aliases,
@@ -72,7 +75,9 @@ def test_fixed_images_and_kind_port_contract_are_immutable() -> None:
     assert NODE_PORT == 30080
 
 
-def test_pinned_external_images_use_unique_single_platform_tags_and_digest_aliases() -> None:
+def test_pinned_external_images_use_single_platform_archives_and_digest_aliases(
+    tmp_path: Path,
+) -> None:
     aliases = pinned_image_aliases(
         _identity(),
         postgres_image=DEFAULT_POSTGRES_IMAGE,
@@ -88,9 +93,29 @@ def test_pinned_external_images_use_unique_single_platform_tags_and_digest_alias
     assert len({alias.local_tag for alias in aliases}) == 4
     assert len({alias.containerd_tag for alias in aliases}) == 4
     for alias in aliases:
-        assert alias.digest_reference.endswith(alias.digest_reference.rsplit("@", 1)[1])
+        assert "@sha256:" in alias.digest_reference
         assert alias.local_tag.endswith(":m7-1234abcd")
         assert alias.containerd_tag == f"docker.io/library/{alias.local_tag}"
+        archive = image_archive_path(tmp_path, alias.component)
+        assert archive == tmp_path / "image-archives" / f"{alias.component}.tar"
+        assert docker_image_save_argv("docker", alias, archive) == (
+            "docker",
+            "image",
+            "save",
+            "--platform",
+            "linux/amd64",
+            "--output",
+            str(archive),
+            alias.local_tag,
+        )
+        assert kind_image_archive_load_argv("kind", "mac-m7-1234abcd", archive) == (
+            "kind",
+            "load",
+            "image-archive",
+            "--name",
+            "mac-m7-1234abcd",
+            str(archive),
+        )
 
     cleanup = local_image_cleanup_argv(
         "docker",
@@ -103,6 +128,8 @@ def test_pinned_external_images_use_unique_single_platform_tags_and_digest_alias
     )
     with pytest.raises(KindEvidenceError, match="outside the run-specific tag"):
         local_image_cleanup_argv("docker", ("postgres:16-alpine",))
+    with pytest.raises(KindEvidenceError, match="safely bounded"):
+        image_archive_path(tmp_path, "../postgres")
 
 
 def test_kind_config_renders_only_the_run_host_port() -> None:
