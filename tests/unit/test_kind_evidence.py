@@ -94,9 +94,7 @@ def _identity() -> RunIdentity:
     )
 
 
-def _environment(
-    *, server_version: str | None = None, dirty: bool = True
-) -> dict[str, object]:
+def _environment(*, server_version: str | None = None, dirty: bool = True) -> dict[str, object]:
     return build_environment_payload(
         git_state=GitState(sha="d" * 40, dirty=dirty),
         chart_state=ChartState(

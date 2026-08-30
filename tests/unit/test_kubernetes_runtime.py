@@ -403,9 +403,7 @@ async def test_wait_classifies_oom_image_pull_and_deadline() -> None:
     handle = await runtime.prepare(_spec())
     job = cast(Any, handle.native)
     job.status = SimpleNamespace(
-        conditions=[
-            SimpleNamespace(type="Failed", status="True", reason="DeadlineExceeded")
-        ]
+        conditions=[SimpleNamespace(type="Failed", status="True", reason="DeadlineExceeded")]
     )
     batch.read_namespaced_job.return_value = job
     with pytest.raises(KubernetesDeadlineExceeded):
@@ -431,9 +429,7 @@ async def test_wait_reports_bounded_unschedulable_reason_without_long_tail() -> 
         ],
     )
     batch.read_namespaced_job.return_value = job
-    core.list_namespaced_pod.return_value = SimpleNamespace(
-        items=[_pod(job, status=pod_status)]
-    )
+    core.list_namespaced_pod.return_value = SimpleNamespace(items=[_pod(job, status=pod_status)])
 
     with pytest.raises(KubernetesRuntimeError) as caught:
         await runtime.wait(handle)
