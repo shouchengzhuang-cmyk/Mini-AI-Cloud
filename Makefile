@@ -20,6 +20,7 @@ DUAL_BACKEND_OUTPUT ?= build/dual-backend-report.json
 P4_EVIDENCE_ROOT ?= build/kind-evidence
 P4_POSTGRES_IMAGE ?= docker.io/library/postgres@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
 P4_REDIS_IMAGE ?= docker.io/library/redis@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+P4_EVIDENCE_BUNDLE ?=
 
 .PHONY: help install format lint typecheck validate-evidence evidence test test-unit test-integration test-docker \
 	test-e2e test-serving check config build up down ps logs migrate migrate-local run-api run-worker \
@@ -59,7 +60,8 @@ evidence: ## Collect a credential-safe evidence bundle bound to the current comm
 
 release-validate: ## Validate version, action pins, dependencies, secrets, container, and contracts.
 	$(UV) lock --check
-	$(UV) run python scripts/release_gate.py validate
+	$(UV) run python scripts/release_gate.py validate \
+		$(if $(strip $(P4_EVIDENCE_BUNDLE)),--p4-evidence "$(P4_EVIDENCE_BUNDLE)",)
 
 test: ## Run the complete pytest suite.
 	$(PYTEST)
@@ -220,12 +222,14 @@ test-dr: ## Run isolated destructive DR rehearsal; requires CONFIRM_DR=YES.
 	@test "$(CONFIRM_DR)" = "YES" || { echo "CONFIRM_DR=YES is required" >&2; exit 2; }
 	$(UV) run python scripts/dr_rehearsal.py
 
-test-release: release-validate lint typecheck validate-evidence config ## Run the v0.5.0 release gate.
+test-release: release-validate lint typecheck validate-evidence config ## Run the v0.6.0 release gate.
+	@test -n "$(P4_EVIDENCE_BUNDLE)" || { \
+		echo "P4_EVIDENCE_BUNDLE=<real KIND_K8S_PASS bundle> is required" >&2; exit 2; }
 	$(UV) run pytest
 	$(UV) build --wheel --out-dir $(RELEASE_WHEEL_DIR)
 	$(UV) run python scripts/release_gate.py wheel-smoke --dist-dir $(RELEASE_WHEEL_DIR)
 	docker build --file docker/Dockerfile --tag $(RELEASE_IMAGE) .
-	docker run --rm $(RELEASE_IMAGE) python -c "import importlib.metadata; assert importlib.metadata.version('mini-ai-cloud') == '0.5.0'"
-	bash -ec 'trap "bash scripts/kind_serving.sh down" EXIT; bash scripts/kind_serving.sh up; bash scripts/kind_serving.sh test'
+	docker run --rm $(RELEASE_IMAGE) python -c "import importlib.metadata; assert importlib.metadata.version('mini-ai-cloud') == '0.6.0'"
 	$(UV) run mini-cloud evidence collect
-	$(UV) run python scripts/release_gate.py prepare
+	$(UV) run python scripts/release_gate.py prepare \
+		--p4-evidence "$(P4_EVIDENCE_BUNDLE)"

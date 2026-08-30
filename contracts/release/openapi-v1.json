@@ -1571,7 +1571,8 @@
             "UPSTREAM_CONNECT_TIMEOUT",
             "INFERENCE_REQUEST_TIMEOUT",
             "UPSTREAM_DISCONNECTED",
-            "GPU_ALLOCATION_FAILED"
+            "GPU_ALLOCATION_FAILED",
+            "KUBERNETES_ARTIFACTS_UNSUPPORTED"
           ],
           "title": "ErrorCode",
           "type": "string"
@@ -7582,7 +7583,7 @@
     "info": {
       "description": "Project-scoped distributed compute jobs, artifacts, datasets and model services. API failures use one machine-readable error envelope.",
       "title": "Mini AI Cloud",
-      "version": "0.5.0"
+      "version": "0.6.0"
     },
     "openapi": "3.1.0",
     "paths": {
@@ -26505,6 +26506,6 @@
       }
     }
   },
-  "release_version": "0.5.0",
+  "release_version": "0.6.0",
   "schema_version": "1.0.0"
 }

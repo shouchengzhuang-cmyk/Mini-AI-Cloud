@@ -2,4 +2,4 @@ config:
   appEnvironment: production
   servingEnabled: true
   servingFakeEnabled: true
-  servingImage: registry.example.test/mini-ai-cloud-fake:0.5.0
+  servingImage: registry.example.test/mini-ai-cloud-fake:0.6.0

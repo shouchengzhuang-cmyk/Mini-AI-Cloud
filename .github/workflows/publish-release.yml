@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
-      RELEASE_VERSION: 0.5.0
+      RELEASE_VERSION: 0.6.0
       KIND_VERSION: v0.27.0
       KUBECTL_VERSION: v1.32.2
       GH_TOKEN: ${{ github.token }}
@@ -134,7 +134,25 @@ jobs:
           chmod 0755 "${tool_dir}/kind" "${tool_dir}/kubectl"
           echo "${tool_dir}" >>"${GITHUB_PATH}"
 
-      - name: Run complete release gate including real Kind acceptance
+      - name: Run commit-bound Kubernetes adaptation acceptance
+        id: p4-evidence
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p build
+          make test-kind-kubernetes-adaptation | tee build/p4-kubernetes-adaptation.log
+          mapfile -t bundle_lines < <(
+            grep '^EVIDENCE_BUNDLE=' build/p4-kubernetes-adaptation.log
+          )
+          test "${#bundle_lines[@]}" -eq 1
+          bundle="${bundle_lines[0]#EVIDENCE_BUNDLE=}"
+          test -n "${bundle}" && test -d "${bundle}"
+          test "${bundle}" = "$(realpath "${bundle}")"
+          echo "bundle=${bundle}" >>"${GITHUB_OUTPUT}"
+
+      - name: Run complete release gate using the exact P4 bundle
+        env:
+          P4_EVIDENCE_BUNDLE: ${{ steps.p4-evidence.outputs.bundle }}
         run: make test-release
 
       - name: Run bounded restart and fencing soak
@@ -256,6 +274,9 @@ jobs:
           test -f "${release_dir}/release-preparation.json"
           test -f "${release_dir}/cyclonedx-sbom.json"
           test -f "${release_dir}/SHA256SUMS"
+          test -f "${release_dir}/p4-kind-evidence/manifest.json"
+          test -f "${release_dir}/p4-kind-evidence/environment.json"
+          test -f "${release_dir}/p4-kind-evidence/checksums.txt"
           test -f "${evidence_dir}/manifest.json"
           test -n "$(find build/soak -type f -print -quit)"
           test -n "$(find build/dr-rehearsal -type f -print -quit)"
@@ -272,11 +293,28 @@ jobs:
               "This file prepares release notes; it does **not** create a GitHub Release or deploy anything.",
               "This GitHub Release was created by the repository's owner-approved publication workflow. It does **not** deploy anything.",
           )
-          text = text.replace("GitHub Release: **NOT CREATED**.", "GitHub Release: **CREATED BY APPROVED WORKFLOW**.")
+          text = text.replace(
+              "GitHub Release: **NOT_RELEASED**.",
+              "GitHub Release: **CREATED BY APPROVED WORKFLOW**.",
+          )
+          text = text.replace(
+              "- GitHub Release state: **NOT_RELEASED**",
+              "- GitHub Release state: **CREATED BY APPROVED WORKFLOW**",
+          )
+          text = text.replace(
+              "- Tag state: **NOT_TAGGED**",
+              "- Tag state: **CREATED BY APPROVED WORKFLOW**",
+          )
+          text = text.replace(
+              "Git tag: **NOT_TAGGED**.",
+              "Git tag: **CREATED BY APPROVED WORKFLOW**.",
+          )
           text += "\n## Publication record\n\n"
           text += f"- Published from exact default-branch commit: `{sha}`\n"
-          text += "- Real NVIDIA/vLLM GPU acceptance: **NOT RUN**.\n"
-          text += "- Production deployment: **NOT DEPLOYED**.\n"
+          text += "- Real non-Kind Kubernetes acceptance (E1): **NOT_RUN**.\n"
+          text += "- Real NVIDIA/vLLM GPU acceptance: **REAL_HW_NOT_RUN**.\n"
+          text += "- Real Huawei Ascend/vLLM-Ascend acceptance: **REAL_HW_NOT_RUN**.\n"
+          text += "- Production deployment: **NOT_DEPLOYED**.\n"
           text += "- Bounded soak, isolated DR rehearsal, real PostgreSQL tests, Docker gates and real Kind acceptance were rerun before publication.\n"
           Path("build/final-release-notes.md").write_text(text, encoding="utf-8", newline="\n")
           PY
@@ -568,6 +606,10 @@ jobs:
 
               evidence = read_json(f"evidence/{sha}/manifest.json")
               preparation = read_json(f"release/{sha}/release-preparation.json")
+              p4_manifest = read_json(f"release/{sha}/p4-kind-evidence/manifest.json")
+              p4_environment = read_json(
+                  f"release/{sha}/p4-kind-evidence/environment.json"
+              )
               cyclonedx = read_json(f"release/{sha}/cyclonedx-sbom.json")
               soak_summaries = sorted(
                   name for name in names if name.startswith("soak/") and name.endswith("/summary.json")
@@ -599,8 +641,22 @@ jobs:
           assert preparation["git_sha"] == sha
           assert preparation["dirty_tree"] is False
           assert preparation["version"] == version
-          assert preparation["real_gpu"] == "NOT_RUN"
+          assert preparation["authorization_status"] == "READY_FOR_OWNER_AUTHORIZATION"
+          assert preparation["tag_status"] == "NOT_TAGGED"
+          assert preparation["release_status"] == "NOT_RELEASED"
+          assert preparation["real_gpu"] == "REAL_HW_NOT_RUN"
+          assert preparation["real_non_kind_kubernetes"] == "E1_NOT_RUN"
           assert preparation["deployment_status"] == "NOT_DEPLOYED"
+          assert preparation["p4_evidence_bundle"] == "p4-kind-evidence"
+          assert preparation["p4_evidence"]["status"] == "KIND_K8S_PASS"
+          assert preparation["p4_evidence"]["git_sha"] == sha
+          assert p4_manifest["status"] == "KIND_K8S_PASS"
+          assert p4_manifest["real_hardware_status"] == "REAL_HW_NOT_RUN"
+          assert p4_environment["git_sha"] == sha
+          assert p4_environment["git_dirty"] is False
+          assert p4_environment["chart_version"] == version
+          assert p4_environment["chart_app_version"] == version
+          assert p4_environment["chart_digest"] == preparation["p4_evidence"]["chart_digest"]
           assert soak["git_sha"] == sha
           assert soak["rounds_requested"] == 3 and soak["rounds_completed"] == 3
           assert soak["status"] == "PASS" and soak["cleanup"] == "PASS"
@@ -686,7 +742,7 @@ jobs:
         run: |
           gh issue comment "${{ github.event.issue.number }}" \
             --repo "${GITHUB_REPOSITORY}" \
-            --body "✅ Published Mini AI Cloud v${RELEASE_VERSION} from \`${{ steps.approval.outputs.target_sha }}\` with wheel, SBOMs and commit-bound evidence. Production deployment remains **NOT DEPLOYED**; real NVIDIA/vLLM acceptance remains **NOT RUN**."
+            --body "✅ Published Mini AI Cloud v${RELEASE_VERSION} from \`${{ steps.approval.outputs.target_sha }}\` with wheel, SBOMs and commit-bound evidence. Production deployment remains **NOT_DEPLOYED**; real NVIDIA and Ascend acceptance remains **REAL_HW_NOT_RUN**."
 
       - name: Record publication failure
         if: failure()

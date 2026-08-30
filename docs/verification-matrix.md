@@ -29,7 +29,7 @@ Unit、manifest、mock Kubernetes client、Fake GPU 和 Fake inference 都只能
 | Kubernetes serving metrics state semantics | PASS：只导出有观测依据的 bounded states | N/A | NOT RUN：未采集真实容器时序 | NOT RUN：Kind 验收未抓取 Prometheus 时序 | N/A |
 | GPU gang scheduling 与具体 device reservation | PASS：Fake GPU inventory 下的单节点 tensor-parallel placement | NOT RUN：该场景未在 live PostgreSQL 重跑 | NOT RUN：Fake vLLM runtime 不算 Docker vLLM | N/A：Phase IV-A Kind 只运行 Fake inference Pod | NOT RUN |
 | vLLM real inference | PASS：launch spec、controller 与 policy tests；没有真实推理证据 | N/A | NOT RUN | N/A：本阶段不在 Kind 运行 vLLM | NOT RUN |
-| Task artifact input/output | PASS：workspace fencing、hash、size 与 mount contract tests | N/A | PASS：named-volume `Subpath` input 到 container 到 output | NOT RUN：pinned `hostPath(type=File)` 文件可见性未测 | N/A |
+| Task artifact input/output | PASS：workspace fencing、hash、size、mount contract 与 production fail-closed tests | N/A | PASS：named-volume `Subpath` input 到 container 到 output | PENDING：v0.6 production 路径拒绝 artifact；legacy development/test `hostPath(type=File)` 文件可见性未测 | N/A |
 
 ## Phase IV-A.1 验收状态
 
@@ -57,7 +57,7 @@ Unit、manifest、mock Kubernetes client、Fake GPU 和 Fake inference 都只能
 
 1. 没有真实 NVIDIA GPU、NVIDIA Container Toolkit 或 vLLM 推理证据。Fake GPU 只验证调度逻辑，Fake inference 只验证服务生命周期和 Gateway 协议。
 2. 没有跨物理节点 tensor parallel、多节点网络分区、Kubernetes node loss、HA PostgreSQL/Redis 或生产集群安全审计。
-3. Batch task 的 pinned `hostPath(type=File)` 只有 spec 测试，没有 Kind 文件可见性 E2E。生产多节点数据面仍需 object store、PVC 或 CSI 方案。
+3. Batch task 的 legacy development/test `hostPath(type=File)` 只有 spec 测试，没有 Kind 文件可见性 E2E；production 已 fail closed。生产多节点数据面仍需 object store、PVC 或 CSI 方案。
 4. Worker 直接连接 PostgreSQL/Redis，节点 mTLS、独立平台管理员边界、镜像签名/扫描和细粒度 egress policy 尚未实现。
 
 ## 最终验收命令

@@ -6,6 +6,27 @@
 
 暂无。
 
+## [0.6.0] - 2026-08-30
+
+### Added
+
+- 单集群 Helm Chart，包含单副本 control plane、Worker、migration hook、外部 PostgreSQL/Redis/Secret 接线，以及 system/workload namespace 的有界 RBAC。
+- 以 `batch/v1` Job 执行 Kubernetes batch task，并保留 execution fencing、restart adoption、精确 UID 删除和漂移隔离合同。
+- 将 release-pinned Runtime Profile manifest 正式挂载到 workload renderer，提供 NVIDIA 与 Huawei Ascend 的静态 placement contract、vendor preflight 和 OpenAI-compatible serving 路径。
+- v0.6 Kubernetes adaptation 权威文档、发布准备状态与支持证据矩阵，以及要求 exact SHA、Chart digest、claim、cleanup 和 checksum 的 P4 evidence gate。
+
+### Changed
+
+- production Kubernetes task 在 API 调用前拒绝 artifact-bearing Job；不再把 development/test 的 pinned `hostPath` 路径外推成生产跨节点 artifact 数据面。
+- release gate 的版本基线升级为 `0.6.0`，前序 tag 固定为 `v0.5.0`；Helm Chart、应用身份、锁文件、发布工作流与兼容快照保持一致。
+- Owner 授权发布流程必须先取得真实、clean、commit-bound 的 `KIND_K8S_PASS` bundle，再准备或发布 release assets。
+
+### Evidence boundary
+
+- 当前 P5 状态为 `READY_FOR_OWNER_AUTHORIZATION`，但最终 P4 Kind bundle 引用仍是 `PENDING_FINAL_P4_EVIDENCE`；缺少或漂移的 bundle 会阻止 `prepare`。
+- 真实 NVIDIA 与真实 Huawei Ascend 硬件均为 `REAL_HW_NOT_RUN`，不声明真实推理、吞吐、延迟或故障切换表现。
+- 本条目是 `NOT_TAGGED`、`NOT_RELEASED`、`NOT_DEPLOYED` 的发布准备，不代表 tag、GitHub Release 或生产部署已经发生。
+
 ## [0.5.0] - 2026-08-29
 
 ### Added
@@ -14,7 +35,7 @@
 - 不可变 Runtime Profile、logical model / physical variant、NVIDIA vLLM 与 Huawei Ascend A2 profile 和验收记录。
 - accelerator-aware Kubernetes serving renderer、vendor-aware admission/quota/fencing，以及 strict、preferred、balanced 双厂商路由、fallback、circuit 和物理用量归因。
 - NVIDIA + Huawei Ascend 双后端 benchmark harness，覆盖 buffered/SSE、语义校验、TTFT 和独立 fallback drill 阶段。
-- A1–A11、post-A11 correctness hardening、benchmark review fixes 与开放堆叠 PR #20–#27 的机器可检覆盖表。
+- A1-A11、post-A11 correctness hardening、benchmark review fixes 与开放堆叠 PR #20-#27 的机器可检覆盖表。
 
 ### Changed
 

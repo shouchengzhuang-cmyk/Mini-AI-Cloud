@@ -1,9 +1,9 @@
 # Mini AI Cloud Helm Chart
 
-This Chart installs the Mini AI Cloud v0.5 application as a single-cluster,
-single-control-plane Kubernetes deployment. It is the M7 P1 packaging layer: batch Job
-adaptation, vendor serving integration, HA, and production artifact transport are separate
-milestones.
+This Chart installs the Mini AI Cloud v0.6 application as a single-cluster,
+single-control-plane Kubernetes deployment. It packages the v0.6 fenced batch Job runtime and
+Runtime-Profile-driven NVIDIA/Ascend serving integration. HA and a production Kubernetes
+artifact transport remain outside this release.
 
 ## What the Chart owns
 
@@ -89,8 +89,8 @@ The workload namespace is one static allowlist entry. Both the control plane and
 Roles in that namespace; there are no ClusterRoles, wildcard resources, wildcard verbs, or
 permissions to discover arbitrary namespaces.
 
-The Worker can manage Pods, Pod logs/status, and the per-execution NetworkPolicies already
-used by the v0.5 Kubernetes runtime. The control plane can manage serving Pods. Managed task
+The Worker can manage Jobs, Pods, Pod logs/status, and the per-execution NetworkPolicies used
+by the v0.6 Kubernetes runtime. The control plane can manage serving Pods. Managed task
 and serving Pods created by the application set `automountServiceAccountToken=false`.
 
 Because P1 deliberately does not split the Web API from the controller, the externally

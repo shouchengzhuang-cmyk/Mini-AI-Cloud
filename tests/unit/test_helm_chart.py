@@ -13,7 +13,7 @@ def test_chart_metadata_has_no_bundled_dependencies() -> None:
 
     assert metadata["apiVersion"] == "v2"
     assert metadata["type"] == "application"
-    assert metadata["version"] != metadata["appVersion"]
+    assert metadata["version"] == metadata["appVersion"] == "0.6.0"
     assert "dependencies" not in metadata
 
 
