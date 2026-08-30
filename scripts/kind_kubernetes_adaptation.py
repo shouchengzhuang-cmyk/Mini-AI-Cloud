@@ -10,6 +10,7 @@ import secrets
 import shutil
 import socket
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -439,8 +440,43 @@ def _items(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     return [item for item in raw if isinstance(item, dict)]
 
 
-def _is_kubectl_denial(outcome: CommandOutcome) -> bool:
-    return outcome.returncode == 1 and outcome.stdout.strip() == "no"
+def _is_kubectl_denial(returncode: int, stdout: str) -> bool:
+    return returncode == 1 and stdout.strip() == "no"
+
+
+def verify_kubectl_denial(
+    *,
+    kubectl: str,
+    kubeconfig: Path,
+    verb: str,
+    resource: str,
+    namespace: str,
+    service_account: str,
+) -> None:
+    completed = subprocess.run(
+        (
+            kubectl,
+            "--kubeconfig",
+            str(kubeconfig),
+            "auth",
+            "can-i",
+            verb,
+            resource,
+            "--namespace",
+            namespace,
+            "--as",
+            service_account,
+        ),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if not _is_kubectl_denial(completed.returncode, completed.stdout):
+        raise KindEvidenceError(
+            f"kubectl did not prove the expected RBAC denial (exit_code={completed.returncode})"
+        )
+    print("KUBECTL_RBAC_DENIAL_PASS")
 
 
 class KindAdaptationHarness:
@@ -662,10 +698,7 @@ class KindAdaptationHarness:
         input_text: str | None = None,
         environment: Mapping[str, str] | None = None,
         timeout_seconds: float = 900,
-        expected_returncodes: Sequence[int] = (0,),
     ) -> CommandOutcome:
-        if not expected_returncodes:
-            raise ValueError("expected_returncodes must not be empty")
         outcome = self.recorder.record(
             label,
             argv,
@@ -675,11 +708,10 @@ class KindAdaptationHarness:
             timeout_seconds=timeout_seconds,
         )
         outcomes.append(outcome)
-        if outcome.returncode not in expected_returncodes:
-            expected = ", ".join(str(code) for code in expected_returncodes)
+        if outcome.returncode != 0:
             raise PhaseFailure(
                 f"{label} failed with exit code {outcome.returncode}; "
-                f"expected one of [{expected}]; inspect redacted evidence logs",
+                "inspect redacted evidence logs",
                 outcomes.copy(),
             )
         return outcome
@@ -1341,22 +1373,27 @@ class KindAdaptationHarness:
                 claim,
                 f"deny-{service_account}-outside-allowlist",
                 (
+                    self.config.tools.uv,
+                    "run",
+                    "python",
+                    "scripts/kind_kubernetes_adaptation.py",
+                    "verify-rbac-denial",
+                    "--kubectl",
                     self.config.tools.kubectl,
                     "--kubeconfig",
                     str(self.kubeconfig),
-                    "auth",
-                    "can-i",
+                    "--verb",
                     verb,
+                    "--resource",
                     resource,
                     "--namespace",
                     "default",
-                    "--as",
+                    "--service-account",
                     f"system:serviceaccount:{self.identity.system_namespace}:{service_account}",
                 ),
-                expected_returncodes=(1,),
             )
-            if not _is_kubectl_denial(denial):
-                raise PhaseFailure("namespaced RBAC crossed the allowlist boundary", outcomes)
+            if denial.stdout.strip() != "KUBECTL_RBAC_DENIAL_PASS":
+                raise PhaseFailure("RBAC denial verifier returned ambiguous output", outcomes)
         return outcomes
 
     def _upgrade(self) -> list[CommandOutcome]:
@@ -1992,6 +2029,13 @@ def _parser() -> argparse.ArgumentParser:
     delete.add_argument("--uid", required=True)
     delete.add_argument("--run-id", required=True)
     delete.add_argument("--role", choices=("system", "workload"), required=True)
+    denial = subparsers.add_parser("verify-rbac-denial", help=argparse.SUPPRESS)
+    denial.add_argument("--kubectl", required=True)
+    denial.add_argument("--kubeconfig", type=Path, required=True)
+    denial.add_argument("--verb", required=True)
+    denial.add_argument("--resource", required=True)
+    denial.add_argument("--namespace", required=True)
+    denial.add_argument("--service-account", required=True)
     return parser
 
 
@@ -2012,6 +2056,16 @@ def main() -> None:
                     run_id=args.run_id,
                     role=args.role,
                 )
+            )
+            return
+        if args.command == "verify-rbac-denial":
+            verify_kubectl_denial(
+                kubectl=args.kubectl,
+                kubeconfig=args.kubeconfig.resolve(strict=True),
+                verb=args.verb,
+                resource=args.resource,
+                namespace=args.namespace,
+                service_account=args.service_account,
             )
             return
         config = HarnessConfig(
