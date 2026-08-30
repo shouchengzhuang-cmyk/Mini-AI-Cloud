@@ -16,7 +16,7 @@ from core.enums import ACTIVE_TASK_STATUSES, WorkerStatus
 from core.logging import configure_logging, get_logger
 from core.redis import RedisQueue
 from core.runtime_profiles import RuntimeProfileCatalog
-from repositories.tasks import RecoverableRuntimeExecution, StaleExecutionError, TaskRepository
+from repositories.tasks import RecoverableRuntimeExecution, TaskRepository
 from repositories.workers import WorkerRepository
 from scheduler import Scheduler, TaskAssignment
 from worker.artifact_workspace import ArtifactWorkspaceManager
@@ -687,7 +687,7 @@ class WorkerService:
                         worker_session_id=self.worker_session_id,
                         cleanup_grace_seconds=self.settings.kubernetes_cleanup_grace_seconds,
                     )
-            except StaleExecutionError as exc:
+            except Exception as exc:
                 self.logger.warning(
                     "Kubernetes Job handoff lease could not be fenced; Job will be stopped",
                     task_id=str(execution.task_id),
@@ -735,3 +735,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

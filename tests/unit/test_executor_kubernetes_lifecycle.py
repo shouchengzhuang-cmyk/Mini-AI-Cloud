@@ -264,12 +264,18 @@ async def test_relinquish_preserves_durable_running_job_for_recovery(
 
 
 @pytest.mark.parametrize(
-    ("durable", "replacement_expected", "expected_relinquish"),
-    [(True, True, True), (True, False, False), (False, True, False)],
+    ("durable", "replacement_expected", "preserve_fails", "expected_relinquish"),
+    [
+        (True, True, False, True),
+        (True, True, True, False),
+        (True, False, False, False),
+        (False, True, False, False),
+    ],
 )
 async def test_shutdown_relinquishes_only_durable_kubernetes_jobs(
     durable: bool,
     replacement_expected: bool,
+    preserve_fails: bool,
     expected_relinquish: bool,
 ) -> None:
     service = cast(Any, object.__new__(WorkerService))
@@ -308,7 +314,10 @@ async def test_shutdown_relinquishes_only_durable_kubernetes_jobs(
     service.database = SimpleNamespace(dispose=AsyncMock())
     service._best_effort_worker_status = AsyncMock()
     service._preserve_kubernetes_handoff_leases = AsyncMock(
-        return_value={execution.task_id} if expected_relinquish else set()
+        side_effect=RuntimeError("database unavailable")
+        if preserve_fails
+        else None,
+        return_value={execution.task_id} if expected_relinquish else set(),
     )
 
     async def heartbeat() -> None:
@@ -350,3 +359,4 @@ async def test_shutdown_replacement_probe_failure_is_fail_closed() -> None:
 
     assert await service._replacement_worker_expected() is False
     service.logger.error.assert_called_once()
+
