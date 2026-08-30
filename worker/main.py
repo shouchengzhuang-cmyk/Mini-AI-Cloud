@@ -392,6 +392,7 @@ class WorkerService:
         recovered: RecoverableRuntimeExecution,
         handle: RuntimeHandle,
     ) -> None:
+        handle.observation.log_cursor_bytes = recovered.runtime_log_cursor_bytes
         execution = ActiveExecution(
             task_id=recovered.task_id,
             execution_id=recovered.execution_id,

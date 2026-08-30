@@ -23,6 +23,12 @@ class StreamingSecretRedactor:
             return b""
         return self._consume(final=True)
 
+    @property
+    def pending_bytes(self) -> int:
+        """Raw suffix retained until it can no longer complete a secret."""
+
+        return len(self._pending)
+
     def _consume(self, *, final: bool) -> bytes:
         data = bytes(self._pending)
         output = bytearray()

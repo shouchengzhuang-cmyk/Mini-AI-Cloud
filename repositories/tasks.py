@@ -70,6 +70,7 @@ class RecoverableRuntimeExecution:
     task_id: uuid.UUID
     execution_id: uuid.UUID
     worker_session_id: uuid.UUID
+    runtime_log_cursor_bytes: int
 
 
 def retry_delay_seconds(
@@ -257,6 +258,13 @@ class TaskRepository:
             persisted = task.runtime_handle if task is not None else None
             if not isinstance(persisted, dict):
                 continue
+            runtime_log_cursor_bytes = persisted.get("runtime_log_cursor_bytes", 0)
+            if (
+                not isinstance(runtime_log_cursor_bytes, int)
+                or isinstance(runtime_log_cursor_bytes, bool)
+                or runtime_log_cursor_bytes < 0
+            ):
+                continue
             expected = {
                 "runtime_type": "kubernetes",
                 "runtime_namespace": observed["namespace"],
@@ -318,6 +326,7 @@ class TaskRepository:
                     task_id=task_id,
                     execution_id=execution_id,
                     worker_session_id=new_worker_session_id,
+                    runtime_log_cursor_bytes=runtime_log_cursor_bytes,
                 )
             )
         return recovered
@@ -1156,6 +1165,11 @@ class TaskRepository:
             "observed_pod_name": observed_pod_name,
             "observed_pod_uid": observed_pod_uid,
             "runtime_spec_hash": spec_hash,
+            "runtime_log_cursor_bytes": (
+                existing_handle.get("runtime_log_cursor_bytes", 0)
+                if isinstance(existing_handle, dict)
+                else 0
+            ),
         }
         task.runtime_handle = persisted
         task.version += 1
@@ -1169,6 +1183,61 @@ class TaskRepository:
             execution.observed_pod_name = observed_pod_name
             execution.observed_pod_uid = observed_pod_uid
             execution.runtime_spec_hash = spec_hash
+        return task
+
+    @staticmethod
+    async def advance_runtime_log_cursor(
+        session: AsyncSession,
+        *,
+        task_id: uuid.UUID,
+        worker_id: str,
+        execution_id: uuid.UUID,
+        cursor_bytes: int,
+        resource_name: str,
+        resource_uid: str,
+        spec_hash: str,
+        worker_session_id: uuid.UUID,
+    ) -> Task:
+        """Advance a Kubernetes log cursor in the log-write transaction."""
+
+        if cursor_bytes < 0:
+            raise ValueError("runtime log cursor must not be negative")
+        task = await TaskRepository._owned_task(
+            session,
+            task_id=task_id,
+            worker_id=worker_id,
+            execution_id=execution_id,
+            worker_session_id=worker_session_id,
+        )
+        execution = await session.get(TaskExecution, execution_id, with_for_update=True)
+        persisted = task.runtime_handle
+        if (
+            execution is None
+            or execution.task_id != task_id
+            or execution.worker_id != worker_id
+            or execution.worker_session_id != worker_session_id
+            or execution.runtime_type != "kubernetes"
+            or execution.runtime_resource_name != resource_name
+            or execution.runtime_resource_uid != resource_uid
+            or execution.runtime_spec_hash != spec_hash
+            or not isinstance(persisted, dict)
+            or persisted.get("runtime_type") != "kubernetes"
+            or persisted.get("runtime_resource_name") != resource_name
+            or persisted.get("runtime_resource_uid") != resource_uid
+            or persisted.get("runtime_spec_hash") != spec_hash
+        ):
+            raise StaleExecutionError("runtime log cursor execution fence is stale")
+        current = persisted.get("runtime_log_cursor_bytes", 0)
+        if not isinstance(current, int) or isinstance(current, bool) or current < 0:
+            raise StaleExecutionError("persisted runtime log cursor is invalid")
+        if cursor_bytes < current:
+            raise StaleExecutionError("runtime log cursor must be monotonic")
+        if cursor_bytes == current:
+            return task
+        updated = dict(persisted)
+        updated["runtime_log_cursor_bytes"] = cursor_bytes
+        task.runtime_handle = updated
+        task.version += 1
         return task
 
     @staticmethod

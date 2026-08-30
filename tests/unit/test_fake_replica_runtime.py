@@ -134,7 +134,9 @@ async def _wait_for_process_exit(process: asyncio.subprocess.Process) -> int:
 
 
 async def _wait_for_listening_port(port: int) -> None:
-    deadline = time.monotonic() + 3
+    # This recovery test only needs a live pre-existing subprocess. Shared
+    # development filesystems can take longer than three seconds to import it.
+    deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
         try:
             _reader, writer = await asyncio.open_connection("127.0.0.1", port)

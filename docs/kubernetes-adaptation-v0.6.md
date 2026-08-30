@@ -150,9 +150,12 @@ The complete schema is [values.schema.json](../deploy/helm/mini-ai-cloud/values.
 
 ## Namespace and RBAC boundary
 
-The control plane and Worker run in the system namespace. Their Roles can act only in the one
-configured workload namespace. The Chart contains no ClusterRole, wildcard verb, wildcard
-resource, or namespace discovery permission.
+The control plane and Worker run in the system namespace. Their write-capable Roles can act only
+in the one configured workload namespace. Accelerator admission uses the `kubernetes-node`
+inventory provider, so the Worker additionally has a read-only ClusterRole with exactly Node
+`get` and Pod `list`. The Pod list is cluster-wide only to deduct external accelerator requests
+from Device Plugin allocatable capacity on the Worker's node. No `watch`, write, Secret,
+wildcard-resource, or wildcard-verb permission is granted at cluster scope.
 
 The Worker Role manages the fenced batch Jobs, their Pods and logs/status, and deny-all
 NetworkPolicies. The control-plane Role manages serving Pods and the pre-created headless

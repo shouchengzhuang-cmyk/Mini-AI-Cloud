@@ -95,18 +95,18 @@ def _secret_references(value: Any) -> set[tuple[str, str]]:
 
 
 def _assert_security(documents: list[dict[str, Any]]) -> None:
-    forbidden_kinds = {"ClusterRole", "ClusterRoleBinding", "Namespace", "Secret"}
+    forbidden_kinds = {"Namespace", "Secret"}
     observed_kinds = {str(document.get("kind")) for document in documents}
     unexpected = observed_kinds & forbidden_kinds
     if unexpected:
         raise RuntimeError(f"Chart rendered forbidden Kubernetes kinds: {sorted(unexpected)}")
 
     for document in documents:
-        if document.get("kind") != "Role":
+        if document.get("kind") not in {"Role", "ClusterRole"}:
             continue
         for rule in document.get("rules", []):
             if "*" in rule.get("resources", []) or "*" in rule.get("verbs", []):
-                raise RuntimeError("namespaced RBAC must not contain wildcard resources or verbs")
+                raise RuntimeError("RBAC must not contain wildcard resources or verbs")
 
     roles = {
         str(document["metadata"]["name"]): document
@@ -159,6 +159,30 @@ def _assert_security(documents: list[dict[str, Any]]) -> None:
     ]:
         raise RuntimeError("worker lifecycle Role must only read its exact StatefulSet")
 
+    inventory_roles = [document for document in documents if document.get("kind") == "ClusterRole"]
+    inventory_bindings = [
+        document for document in documents if document.get("kind") == "ClusterRoleBinding"
+    ]
+    if len(inventory_roles) != 1 or len(inventory_bindings) != 1:
+        raise RuntimeError("Chart must render one Worker inventory ClusterRole and binding")
+    inventory_role = inventory_roles[0]
+    inventory_name = str(inventory_role["metadata"]["name"])
+    if canonical_rules(inventory_role) != {
+        (("",), ("nodes",), ("get",)),
+        (("",), ("pods",), ("list",)),
+    }:
+        raise RuntimeError("Worker inventory ClusterRole exceeds its read-only contract")
+    binding = inventory_bindings[0]
+    if binding.get("roleRef") != {
+        "apiGroup": "rbac.authorization.k8s.io",
+        "kind": "ClusterRole",
+        "name": inventory_name,
+    }:
+        raise RuntimeError("Worker inventory binding references an unexpected role")
+    subjects = binding.get("subjects", [])
+    if len(subjects) != 1 or not str(subjects[0].get("name", "")).endswith("-worker"):
+        raise RuntimeError("Worker inventory binding must target only the Worker ServiceAccount")
+
     for pod_spec in _pod_specs(documents):
         for forbidden_field in ("hostNetwork", "hostPID", "hostIPC"):
             if pod_spec.get(forbidden_field) is True:
@@ -200,7 +224,7 @@ def _assert_snapshot(documents: list[dict[str, Any]]) -> None:
     if dict(sorted(counts.items())) != expected["objectKindCounts"]:
         raise RuntimeError(f"rendered kind snapshot changed: {dict(sorted(counts.items()))}")
     if set(counts) & set(expected["forbiddenKinds"]):
-        raise RuntimeError("no-secret snapshot contains an owned Secret or cluster-scoped object")
+        raise RuntimeError("no-secret snapshot contains an owned Secret or Namespace")
     references = _secret_references(documents)
     names = {name for name, _key in references}
     keys = sorted({key for _name, key in references})
@@ -270,13 +294,25 @@ def validate(helm: str) -> None:
         namespace=namespace,
         values=POSITIVE_VALUES,
     )
-    namespaces = {document.get("metadata", {}).get("namespace") for document in documents}
+    namespaces = {
+        document.get("metadata", {}).get("namespace")
+        for document in documents
+        if document.get("kind") not in {"ClusterRole", "ClusterRoleBinding"}
+    }
     if namespaces != {namespace, "mini-ai-cloud-ci-workloads"}:
         raise RuntimeError(f"random namespace render escaped the allowlist: {sorted(namespaces)}")
 
     _assert_security(documents)
     _assert_snapshot(documents)
     _assert_runtime_profiles(documents)
+    application_config = next(
+        document
+        for document in documents
+        if document.get("kind") == "ConfigMap"
+        and not str(document["metadata"]["name"]).endswith("-runtime-profiles")
+    )
+    if application_config["data"].get("ACCELERATOR_INVENTORY_PROVIDERS") != "kubernetes-node":
+        raise RuntimeError("Helm Workers must publish Kubernetes Device Plugin inventory")
 
     deployments = {
         document["metadata"]["name"]: document

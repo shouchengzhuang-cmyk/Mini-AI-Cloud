@@ -389,6 +389,26 @@ async def test_kubernetes_restart_handoff_preserves_creation_fence_and_blocks_zo
             worker_session_id=creation_session,
             **runtime_identity,
         )
+        await TaskRepository.append_log(
+            session,
+            task_id=task_id,
+            execution_id=execution_id,
+            stream=LogStream.STDOUT,
+            content="durable-prefix",
+            worker_id=worker_id,
+            worker_session_id=creation_session,
+        )
+        await TaskRepository.advance_runtime_log_cursor(
+            session,
+            task_id=task_id,
+            worker_id=worker_id,
+            execution_id=execution_id,
+            cursor_bytes=len(b"durable-prefix"),
+            resource_name=str(runtime_identity["resource_name"]),
+            resource_uid=str(runtime_identity["resource_uid"]),
+            spec_hash=str(runtime_identity["spec_hash"]),
+            worker_session_id=creation_session,
+        )
 
     await _register(
         database,
@@ -405,6 +425,7 @@ async def test_kubernetes_restart_handoff_preserves_creation_fence_and_blocks_zo
             observations=[observation],
         )
     assert [(item.task_id, item.execution_id) for item in recovered] == [(task_id, execution_id)]
+    assert [item.runtime_log_cursor_bytes for item in recovered] == [len(b"durable-prefix")]
 
     async with database.session() as session, session.begin():
         assert not await TaskRepository.runtime_cleanup_owned(
@@ -440,6 +461,7 @@ async def test_kubernetes_restart_handoff_preserves_creation_fence_and_blocks_zo
         assert execution.runtime_worker_session_id == creation_session
         assert task.runtime_handle is not None
         assert task.runtime_handle["runtime_worker_session_id"] == str(creation_session)
+        assert task.runtime_handle["runtime_log_cursor_bytes"] == len(b"durable-prefix")
 
     async with database.session() as session, session.begin():
         with pytest.raises(StaleExecutionError, match="worker session is stale"):

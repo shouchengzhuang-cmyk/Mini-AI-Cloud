@@ -114,6 +114,7 @@ class RuntimeObservation:
 
     pod_name: str | None = None
     pod_uid: str | None = None
+    log_cursor_bytes: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +149,7 @@ class RuntimeHandle:
 class RuntimeLog:
     stream: str
     content: bytes
+    cursor_bytes: int | None = None
 
 
 @runtime_checkable

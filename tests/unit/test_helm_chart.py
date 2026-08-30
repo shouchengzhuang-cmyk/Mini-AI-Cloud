@@ -50,15 +50,21 @@ def test_schema_fails_closed_for_ha_and_unknown_security_options() -> None:
     assert "podSecurity" not in schema["properties"]
 
 
-def test_chart_never_owns_secrets_namespaces_or_cluster_rbac() -> None:
+def test_chart_keeps_inventory_and_workload_rbac_bounded() -> None:
     templates = "\n".join(
         path.read_text(encoding="utf-8") for path in sorted((CHART / "templates").glob("*.yaml"))
     )
 
     assert "kind: Secret\n" not in templates
     assert "kind: Namespace\n" not in templates
-    assert "kind: ClusterRole\n" not in templates
-    assert "kind: ClusterRoleBinding\n" not in templates
+    assert templates.count("\nkind: ClusterRole\n") == 1
+    assert templates.count("\nkind: ClusterRoleBinding\n") == 1
+    assert 'resources: ["nodes"]\n    verbs: ["get"]' in templates
+    assert 'resources: ["pods"]\n    verbs: ["list"]' in templates
+    assert 'ACCELERATOR_INVENTORY_PROVIDERS: "kubernetes-node"' in templates
+    assert 'resources: ["secrets"]' not in templates
+    assert 'verbs: ["*"]' not in templates
+    assert 'resources: ["*"]' not in templates
     assert "hostPath:" not in templates
     assert "privileged: true" not in templates
     assert 'resources: ["services"]' in templates

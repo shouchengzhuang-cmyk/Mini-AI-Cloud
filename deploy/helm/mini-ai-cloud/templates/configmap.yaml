@@ -30,7 +30,7 @@ data:
   WORKER_RUNTIME_TYPES: "kubernetes"
   WORKER_CONCURRENCY: {{ .Values.worker.concurrency | quote }}
   WORKER_LABELS: "runtime=kubernetes"
-  ACCELERATOR_INVENTORY_PROVIDERS: "none"
+  ACCELERATOR_INVENTORY_PROVIDERS: "kubernetes-node"
   ARTIFACT_BACKEND: {{ .Values.config.artifactBackend | quote }}
   ARTIFACT_LOCAL_ROOT: "/var/lib/mini-ai-cloud/artifacts"
   ARTIFACT_WORKSPACE_ROOT: "/var/lib/mini-ai-cloud/workspaces"

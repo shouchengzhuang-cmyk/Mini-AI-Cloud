@@ -72,6 +72,8 @@ service/reservation commitment 统一计费，避免重复扣减。Pod 列表不
 
 因此运行 `kubernetes-node` provider 的 Kubernetes 身份必须同时拥有目标 Node 的
 `get` 权限和所有 namespace Pod 的 `list` 权限；使用 kubeconfig 时也必须授予等价权限。
+Helm Chart 默认启用该 provider，并只为 Worker ServiceAccount 创建包含这两个只读动作
+的 ClusterRole/ClusterRoleBinding；它不授予 watch、写入、Secret 或通配符权限。
 
 ## 证据边界
 

@@ -622,14 +622,32 @@ class TaskExecutor:
             LogStream.STDOUT: StreamingSecretRedactor(secret_values),
             LogStream.STDERR: StreamingSecretRedactor(secret_values),
         }
+        cursor_mode = handle.runtime_type == "kubernetes"
+        latest_cursor = {
+            LogStream.STDOUT: handle.observation.log_cursor_bytes,
+            LogStream.STDERR: handle.observation.log_cursor_bytes,
+        }
+        saw_durable_cursor = False
 
         async def finish_redactors() -> None:
             for stream in (LogStream.STDOUT, LogStream.STDERR):
                 tail = redactors[stream].finish()
-                if tail:
+                if (
+                    cursor_mode
+                    and saw_durable_cursor
+                    and (tail or latest_cursor[stream] > handle.observation.log_cursor_bytes)
+                ):
+                    await self._persist_cursor_log(
+                        handle,
+                        execution,
+                        stream,
+                        tail,
+                        cursor_bytes=latest_cursor[stream],
+                    )
+                elif tail:
                     await coalescer.add(stream, tail)
 
-        total = 0
+        total = handle.observation.log_cursor_bytes if cursor_mode else 0
         logs = self.runtime.logs(handle, ready=ready).__aiter__()
 
         async def next_log() -> RuntimeLog:
@@ -659,20 +677,40 @@ class TaskExecutor:
                     break
                 pending_item = None
                 stream = LogStream.STDOUT if item.stream == "stdout" else LogStream.STDERR
-                remaining = self.settings.max_task_log_bytes - total
+                remaining = max(0, self.settings.max_task_log_bytes - total)
                 accepted = item.content[:remaining]
                 if accepted:
                     redacted = redactors[stream].feed(accepted)
-                    if redacted:
+                    if item.cursor_bytes is not None:
+                        if not cursor_mode:
+                            raise RuntimeError("only Kubernetes logs may carry a durable cursor")
+                        saw_durable_cursor = True
+                        accepted_cursor = item.cursor_bytes - (len(item.content) - len(accepted))
+                        if accepted_cursor < latest_cursor[stream]:
+                            raise RuntimeError("Kubernetes log cursor moved backwards")
+                        latest_cursor[stream] = accepted_cursor
+                        safe_cursor = accepted_cursor - redactors[stream].pending_bytes
+                        if redacted or safe_cursor > handle.observation.log_cursor_bytes:
+                            await self._persist_cursor_log(
+                                handle,
+                                execution,
+                                stream,
+                                redacted,
+                                cursor_bytes=safe_cursor,
+                            )
+                    elif cursor_mode and handle.observation.log_cursor_bytes:
+                        raise RuntimeError("adopted Kubernetes logs require a durable cursor")
+                    elif redacted:
                         await coalescer.add(stream, redacted)
                     total += len(accepted)
-                    if coalescer.has_pending and flush_deadline is None:
+                    if not cursor_mode and coalescer.has_pending and flush_deadline is None:
                         flush_deadline = time.monotonic() + _LOG_COALESCE_FLUSH_INTERVAL_SECONDS
-                    elif not coalescer.has_pending:
+                    elif not cursor_mode and not coalescer.has_pending:
                         flush_deadline = None
                 if len(accepted) < len(item.content) or total >= self.settings.max_task_log_bytes:
                     await finish_redactors()
-                    await coalescer.flush_all()
+                    if not cursor_mode:
+                        await coalescer.flush_all()
                     await self._system_log(
                         execution,
                         "task log limit reached; stopping container to protect the control plane",
@@ -690,7 +728,8 @@ class TaskExecutor:
             # Async-generator completion, executor cancellation, and drain timeout
             # all pass through here, so a sub-threshold tail is still durable.
             await finish_redactors()
-            await coalescer.flush_all()
+            if not cursor_mode:
+                await coalescer.flush_all()
 
     async def _drain_log_task(
         self, log_task: asyncio.Task[None], execution: ActiveExecution
@@ -735,6 +774,66 @@ class TaskExecutor:
                 task_id=str(execution.task_id),
                 error=str(exc),
             )
+
+    async def _persist_cursor_log(
+        self,
+        handle: RuntimeHandle,
+        execution: ActiveExecution,
+        stream: LogStream,
+        content: bytes,
+        *,
+        cursor_bytes: int,
+    ) -> None:
+        if (
+            self.worker_session_id is None
+            or handle.resource_uid is None
+            or handle.spec_hash is None
+        ):
+            raise StaleExecutionError("Kubernetes log cursor is missing an execution fence")
+        if cursor_bytes < handle.observation.log_cursor_bytes:
+            raise StaleExecutionError("Kubernetes log cursor must be monotonic")
+        chunks = [
+            content[offset : offset + self.settings.max_log_chunk_bytes]
+            for offset in range(0, len(content), self.settings.max_log_chunk_bytes)
+        ]
+        persisted_logs = []
+        async with self.database.session() as session, session.begin():
+            for chunk in chunks:
+                persisted_logs.append(
+                    await TaskRepository.append_log(
+                        session,
+                        task_id=execution.task_id,
+                        execution_id=execution.execution_id,
+                        stream=stream,
+                        content=chunk.decode("utf-8", "replace"),
+                        worker_id=self.worker_id,
+                        worker_session_id=self.worker_session_id,
+                    )
+                )
+            await TaskRepository.advance_runtime_log_cursor(
+                session,
+                task_id=execution.task_id,
+                worker_id=self.worker_id,
+                execution_id=execution.execution_id,
+                cursor_bytes=cursor_bytes,
+                resource_name=handle.object_id,
+                resource_uid=handle.resource_uid,
+                spec_hash=handle.spec_hash,
+                worker_session_id=self.worker_session_id,
+            )
+        handle.observation.log_cursor_bytes = cursor_bytes
+        for log in persisted_logs:
+            try:
+                await self.queue.publish_log(
+                    task_id=execution.task_id,
+                    sequence=log.sequence,
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "Redis log wakeup failed; PostgreSQL log remains durable",
+                    task_id=str(execution.task_id),
+                    error=str(exc),
+                )
 
     async def _best_effort_log(self, execution: ActiveExecution, content: str) -> None:
         try:

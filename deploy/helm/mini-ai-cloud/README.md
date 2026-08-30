@@ -10,7 +10,8 @@ artifact transport remain outside this release.
 - one single-replica control-plane Deployment and ClusterIP Service;
 - one configurable Worker StatefulSet with stable ordinal identities and a headless Service;
 - a pre-install/pre-upgrade migration Job;
-- two ServiceAccounts plus namespaced Roles and RoleBindings;
+- two ServiceAccounts, namespaced workload/lifecycle Roles and RoleBindings, and one read-only
+  Worker inventory ClusterRole/ClusterRoleBinding;
 - a headless Service for managed serving Pods;
 - one ConfigMap with non-secret settings;
 - one read-only ConfigMap containing the repository's complete immutable Runtime Profile set.
@@ -23,6 +24,7 @@ uninstall therefore cannot delete those administrator-owned resources.
 
 - Kubernetes 1.27 or newer;
 - Helm 3;
+- permission to create the bounded Worker inventory ClusterRole and ClusterRoleBinding;
 - two pre-existing namespaces: the Helm release namespace and one statically configured
   workload namespace;
 - reachable external PostgreSQL and Redis services;
@@ -85,13 +87,19 @@ API template.
 
 ## Namespace and RBAC boundary
 
-The workload namespace is one static allowlist entry. Both the control plane and Worker use
-Roles in that namespace; there are no ClusterRoles, wildcard resources, wildcard verbs, or
-permissions to discover arbitrary namespaces.
+The workload namespace is one static write allowlist entry. Both the control plane and Worker
+use Roles in that namespace. The Worker also uses the repository's `kubernetes-node` inventory
+provider, which requires one read-only ClusterRole: Node `get` plus Pod `list`. Pod listing is
+cluster-wide because Device Plugin allocatable capacity must subtract non-terminal accelerator
+requests from every namespace on the Worker's node. The ClusterRole has no `watch`, write,
+Secret, wildcard-resource, or wildcard-verb permission and is bound only to the Worker
+ServiceAccount.
 
 The Worker can manage Jobs, Pods, Pod logs/status, and the per-execution NetworkPolicies used
-by the v0.6 Kubernetes runtime. The control plane can manage serving Pods. Managed task
-and serving Pods created by the application set `automountServiceAccountToken=false`.
+by the v0.6 Kubernetes runtime. Its Node/Pod inventory reads turn Device Plugin allocatable
+capacity into persisted accelerator slots while deducting external Pod requests. The control
+plane can manage serving Pods. Managed task and serving Pods created by the application set
+`automountServiceAccountToken=false`.
 
 Because P1 deliberately does not split the Web API from the controller, the externally
 reachable control-plane Pod also holds namespaced workload write permissions. Operators must

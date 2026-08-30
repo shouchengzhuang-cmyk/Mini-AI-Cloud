@@ -375,9 +375,20 @@ class KubernetesRuntime:
 
             if ready is not None:
                 ready.set()
+            cursor = 0
+            persisted_cursor = handle.observation.log_cursor_bytes
             async for chunk in _iter_log_chunks(source):
-                if chunk:
-                    yield RuntimeLog(stream="stdout", content=chunk)
+                chunk_start = cursor
+                cursor += len(chunk)
+                if cursor <= persisted_cursor:
+                    continue
+                content = chunk[max(0, persisted_cursor - chunk_start) :]
+                if content:
+                    yield RuntimeLog(
+                        stream="stdout",
+                        content=content,
+                        cursor_bytes=cursor,
+                    )
         except asyncio.CancelledError:
             raise
         except ApiException as exc:

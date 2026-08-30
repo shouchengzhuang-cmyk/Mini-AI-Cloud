@@ -477,9 +477,30 @@ async def test_logs_read_only_controlled_task_container_and_capture_pod_identity
 
     assert ready.is_set()
     assert [item.content for item in logs] == [b"one\n", b"two\n"]
+    assert [item.cursor_bytes for item in logs] == [4, 8]
     assert handle.observation.pod_name == "controlled-pod"
     assert handle.observation.pod_uid == "pod-uid"
     assert core.read_namespaced_pod_log.call_args.kwargs["container"] == "task"
+
+
+async def test_adopted_logs_skip_the_durable_raw_byte_prefix() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
+    spec = _spec()
+    job = _job(runtime, spec)
+    core.list_namespaced_pod.return_value = SimpleNamespace(items=[_pod(job)])
+
+    async def chunks() -> AsyncIterator[bytes]:
+        yield b"old-"
+        yield b"prefix-new\n"
+
+    core.read_namespaced_pod_log.return_value = chunks()
+    handle = await runtime.prepare(spec)
+    handle.observation.log_cursor_bytes = len(b"old-prefix-")
+
+    logs = [item async for item in runtime.logs(handle, ready=asyncio.Event())]
+
+    assert [(item.content, item.cursor_bytes) for item in logs] == [(b"new\n", 15)]
 
 
 async def test_logs_retry_terminal_streaming_400_with_non_follow_read() -> None:

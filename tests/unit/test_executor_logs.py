@@ -2,6 +2,7 @@ import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from typing import cast
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -290,6 +291,46 @@ async def test_collect_logs_enforces_exact_total_byte_cap(
         LogStream.SYSTEM,
         "task log limit reached; stopping container to protect the control plane",
     )
+    assert execution.log_limit_exceeded.is_set()
+
+
+async def test_adopted_kubernetes_log_cursor_counts_prefix_without_repersisting_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _RuntimeStub([RuntimeLog("stdout", b"tail", cursor_bytes=1024)])
+    executor = _executor(runtime, max_task_log_bytes=1024, max_log_chunk_bytes=1024)
+    execution = _execution()
+    handle = RuntimeHandle(
+        runtime_type="kubernetes",
+        resource_kind="job",
+        object_id="task-job",
+        display_id="task-job",
+        resource_uid="job-uid",
+        spec_hash="a" * 64,
+    )
+    handle.observation.log_cursor_bytes = 1020
+    persisted: list[tuple[bytes, int]] = []
+
+    async def persist_cursor(
+        observed_handle: RuntimeHandle,
+        observed_execution: ActiveExecution,
+        stream: LogStream,
+        content: bytes,
+        *,
+        cursor_bytes: int,
+    ) -> None:
+        assert observed_handle is handle
+        assert observed_execution is execution
+        assert stream == LogStream.STDOUT
+        persisted.append((content, cursor_bytes))
+        handle.observation.log_cursor_bytes = cursor_bytes
+
+    monkeypatch.setattr(executor, "_persist_cursor_log", persist_cursor)
+    monkeypatch.setattr(executor, "_system_log", AsyncMock())
+
+    await executor._collect_logs(handle, execution, ready=asyncio.Event())
+
+    assert persisted == [(b"tail", 1024)]
     assert execution.log_limit_exceeded.is_set()
 
 
