@@ -23,6 +23,7 @@
   const state = {
     apiBase: window.location.origin,
     apiKey: "",
+    connectionAttempt: 0,
     principal: null,
     project: null,
     page: "overview",
@@ -616,24 +617,36 @@
   }
 
   async function connect(apiBase, apiKey) {
-    state.apiBase = normalizeApiBase(apiBase);
-    state.apiKey = apiKey;
-    const [principal, project] = await Promise.all([
-      api("/api/v1/auth/whoami", { channel: "connect:whoami" }),
-      api("/api/v1/projects/current", { channel: "connect:project" }),
-    ]);
-    state.principal = principal;
-    state.project = project;
-    sessionSet(SESSION_API_KEY, state.apiKey);
-    query("#api-key").value = "";
-    query("#current-project").textContent = `${project.name} (${project.slug})`;
-    query("#connection-view").classList.add("hidden");
-    query("#app-view").classList.remove("hidden");
-    setApiState("ok");
-    await refreshCurrentPage();
+    const attempt = ++state.connectionAttempt;
+    try {
+      state.apiBase = normalizeApiBase(apiBase);
+      state.apiKey = apiKey;
+      const [principal, project] = await Promise.all([
+        api("/api/v1/auth/whoami", { channel: "connect:whoami" }),
+        api("/api/v1/projects/current", { channel: "connect:project" }),
+      ]);
+      if (attempt !== state.connectionAttempt) {
+        const error = new Error("Connection attempt was replaced by a newer request.");
+        error.name = "AbortError";
+        throw error;
+      }
+      state.principal = principal;
+      state.project = project;
+      sessionSet(SESSION_API_KEY, apiKey);
+      query("#api-key").value = "";
+      query("#current-project").textContent = `${project.name} (${project.slug})`;
+      query("#connection-view").classList.add("hidden");
+      query("#app-view").classList.remove("hidden");
+      setApiState("ok");
+      await refreshCurrentPage();
+    } catch (error) {
+      if (attempt === state.connectionAttempt) state.apiKey = "";
+      throw error;
+    }
   }
 
   function disconnect() {
+    state.connectionAttempt += 1;
     abortAllRequests();
     if (state.refreshTimer) window.clearTimeout(state.refreshTimer);
     sessionRemove(SESSION_API_KEY);
@@ -1926,15 +1939,19 @@
       event.preventDefault();
       const errorTarget = query("#connection-error");
       const apiKeyInput = query("#api-key");
+      const submit = query('#connection-form button[type="submit"]');
       const apiKey = apiKeyInput.value;
       apiKeyInput.value = "";
       errorTarget.classList.add("hidden");
+      submit.disabled = true;
       try {
         await connect(query("#api-base").value, apiKey);
       } catch (error) {
-        state.apiKey = "";
+        if (error.name === "AbortError") return;
         errorTarget.textContent = formatApiError(error instanceof ApiError ? error : new ApiError(0, "INVALID_CONNECTION", error.message));
         errorTarget.classList.remove("hidden");
+      } finally {
+        submit.disabled = false;
       }
     });
     query("#disconnect-button").addEventListener("click", disconnect);
@@ -1994,7 +2011,7 @@
     try {
       await connect(window.location.origin, savedKey);
     } catch (error) {
-      state.apiKey = "";
+      if (error.name === "AbortError") return;
       sessionRemove(SESSION_API_KEY);
       const target = query("#connection-error");
       target.textContent = `Saved session could not reconnect.\n${formatApiError(error)}`;

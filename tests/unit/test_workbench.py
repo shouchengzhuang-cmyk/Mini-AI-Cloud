@@ -79,6 +79,19 @@ async def test_workbench_connection_is_locked_to_same_origin() -> None:
     assert all(middleware.cls is not CORSMiddleware for middleware in app.user_middleware)
 
 
+async def test_workbench_connection_attempts_do_not_clear_newer_credentials() -> None:
+    async with _client() as client:
+        js_response = await client.get("/workbench/assets/workbench.js")
+
+    assert "connectionAttempt: 0," in js_response.text
+    assert "const attempt = ++state.connectionAttempt;" in js_response.text
+    assert "if (attempt !== state.connectionAttempt)" in js_response.text
+    assert 'error.name = "AbortError";' in js_response.text
+    assert 'if (attempt === state.connectionAttempt) state.apiKey = "";' in js_response.text
+    assert "submit.disabled = true;" in js_response.text
+    assert "submit.disabled = false;" in js_response.text
+
+
 async def test_workbench_api_key_is_not_a_native_form_control() -> None:
     async with _client() as client:
         index_response = await client.get("/workbench")
