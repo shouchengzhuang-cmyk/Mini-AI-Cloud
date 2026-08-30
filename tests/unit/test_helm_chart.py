@@ -21,10 +21,21 @@ def test_default_values_are_single_replica_and_not_latest() -> None:
     values = yaml.safe_load((CHART / "values.yaml").read_text(encoding="utf-8"))
 
     assert values["controlPlane"]["replicas"] == 1
+    assert values["worker"]["replicas"] == 1
     assert values["service"]["type"] == "ClusterIP"
     assert values["global"]["testMode"] is False
     assert values["image"]["tag"] != "latest"
     assert values["existingSecret"]["name"]
+
+
+def test_worker_uses_stable_stateful_identity_for_restart_adoption() -> None:
+    template = (CHART / "templates" / "worker-deployment.yaml").read_text(encoding="utf-8")
+
+    assert "kind: StatefulSet" in template
+    assert "serviceName:" in template
+    assert "- name: WORKER_ID" in template
+    assert "fieldPath: metadata.name" in template
+    assert (CHART / "templates" / "worker-headless-service.yaml").is_file()
 
 
 def test_schema_fails_closed_for_ha_and_unknown_security_options() -> None:

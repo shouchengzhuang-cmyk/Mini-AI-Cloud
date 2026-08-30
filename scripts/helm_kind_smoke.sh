@@ -173,7 +173,7 @@ rm -f -- "$APP_SECRET_FILE" "$DATA_SECRET_FILE"
 "${KUBECTL[@]}" --namespace "$SYSTEM_NAMESPACE" \
   rollout status "deployment/$RELEASE-mini-ai-cloud-control-plane" --timeout=120s
 "${KUBECTL[@]}" --namespace "$SYSTEM_NAMESPACE" \
-  rollout status "deployment/$RELEASE-mini-ai-cloud-worker" --timeout=120s
+  rollout status "statefulset/$RELEASE-mini-ai-cloud-worker" --timeout=120s
 
 "${KUBECTL[@]}" auth can-i create services \
   --namespace "$WORKLOAD_NAMESPACE" \

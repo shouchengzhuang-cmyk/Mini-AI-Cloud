@@ -559,7 +559,7 @@ class KindAdaptationHarness:
                 "The control-plane Deployment and NodePort API became ready.",
                 self._control_ready,
             ),
-            ("worker-readiness", "The Worker Deployment became ready.", self._worker_ready),
+            ("worker-readiness", "The Worker StatefulSet became ready.", self._worker_ready),
             ("batch-lifecycle", "The real batch/v1 Job lifecycle helper passed.", self._batch),
             ("serving-lifecycle", "The real Fake serving lifecycle helper passed.", self._serving),
             (
@@ -1132,7 +1132,12 @@ class KindAdaptationHarness:
 
     def _worker_ready(self) -> list[CommandOutcome]:
         outcomes: list[CommandOutcome] = []
-        self._rollout(outcomes, "worker-readiness", self.worker_deployment)
+        self._rollout(
+            outcomes,
+            "worker-readiness",
+            self.worker_deployment,
+            kind="statefulset",
+        )
         return outcomes
 
     def _batch(self) -> list[CommandOutcome]:
@@ -1387,7 +1392,7 @@ class KindAdaptationHarness:
             timeout_seconds=900,
         )
         self._rollout(outcomes, claim, self.control_deployment)
-        self._rollout(outcomes, claim, self.worker_deployment)
+        self._rollout(outcomes, claim, self.worker_deployment, kind="statefulset")
         config = self._record(
             outcomes,
             claim,
@@ -1791,12 +1796,14 @@ class KindAdaptationHarness:
         self,
         outcomes: list[CommandOutcome],
         claim: str,
-        deployment: str,
+        workload: str,
+        *,
+        kind: str = "deployment",
     ) -> None:
         self._record(
             outcomes,
             claim,
-            f"rollout-{deployment}",
+            f"rollout-{workload}",
             (
                 self.config.tools.kubectl,
                 "--kubeconfig",
@@ -1805,7 +1812,7 @@ class KindAdaptationHarness:
                 self.identity.system_namespace,
                 "rollout",
                 "status",
-                f"deployment/{deployment}",
+                f"{kind}/{workload}",
                 "--timeout=300s",
             ),
         )

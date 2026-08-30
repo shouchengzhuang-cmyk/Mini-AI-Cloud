@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "mini-ai-cloud.fullname" . }}-worker
+  namespace: {{ include "mini-ai-cloud.systemNamespace" . }}
+  labels:
+    {{- include "mini-ai-cloud.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "mini-ai-cloud.selectorLabels" (dict "root" . "component" "worker") | nindent 4 }}
+  ports:
+    - name: identity
+      port: 8000
+      targetPort: 8000
+      protocol: TCP

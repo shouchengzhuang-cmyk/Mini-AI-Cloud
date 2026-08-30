@@ -1,5 +1,5 @@
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: {{ include "mini-ai-cloud.fullname" . }}-worker
   namespace: {{ include "mini-ai-cloud.systemNamespace" . }}
@@ -7,7 +7,11 @@ metadata:
     {{- include "mini-ai-cloud.labels" . | nindent 4 }}
     app.kubernetes.io/component: worker
 spec:
+  serviceName: {{ include "mini-ai-cloud.fullname" . }}-worker
   replicas: {{ .Values.worker.replicas }}
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
   selector:
     matchLabels:
       {{- include "mini-ai-cloud.selectorLabels" (dict "root" . "component" "worker") | nindent 6 }}
@@ -42,6 +46,12 @@ spec:
           env:
             - name: CONTROL_PLANE_ENABLED
               value: "false"
+            # StatefulSet ordinals keep this identity stable across Pod replacement,
+            # while remaining unique when worker.replicas is greater than one.
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: WORKER_NODE_NAME
               valueFrom:
                 fieldRef:

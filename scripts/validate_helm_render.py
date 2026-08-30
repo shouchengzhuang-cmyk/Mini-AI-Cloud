@@ -70,7 +70,7 @@ def _pod_specs(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for document in documents:
         kind = document.get("kind")
         spec = document.get("spec", {})
-        if kind == "Deployment":
+        if kind in {"Deployment", "StatefulSet"}:
             specs.append(spec["template"]["spec"])
         elif kind == "Job":
             specs.append(spec["template"]["spec"])
@@ -277,6 +277,17 @@ def validate(helm: str) -> None:
         raise RuntimeError("control-plane Deployment must render exactly one replica")
     if control_plane["spec"].get("strategy", {}).get("type") != "Recreate":
         raise RuntimeError("control-plane Deployment must avoid overlapping replicas on upgrade")
+    worker = next(document for document in documents if document.get("kind") == "StatefulSet")
+    if worker["spec"]["replicas"] != 1:
+        raise RuntimeError("default worker StatefulSet must render exactly one replica")
+    if worker["spec"].get("serviceName") != f"{release}-mini-ai-cloud-worker":
+        raise RuntimeError("worker StatefulSet must use its release-scoped governing Service")
+    worker_env = {
+        item["name"]: item for item in worker["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+    worker_id_ref = worker_env.get("WORKER_ID", {}).get("valueFrom", {}).get("fieldRef", {})
+    if worker_id_ref.get("fieldPath") != "metadata.name":
+        raise RuntimeError("worker identity must use the stable StatefulSet Pod name")
 
     kind_documents = _render(
         helm,

@@ -20,7 +20,7 @@ OpenAI-compatible API / REST / SSE
                  |
       PostgreSQL source of truth -------- Redis notifications and limits
                  |
-          Worker Deployment
+          Worker StatefulSet
            /             \
   batch/v1 Jobs       serving Pods
        |                  |
@@ -30,8 +30,9 @@ OpenAI-compatible API / REST / SSE
               administrator-owned stack
 ```
 
-The Helm release owns two Deployments, a migration Job, two Services, two ServiceAccounts,
-namespaced Roles and RoleBindings, and ConfigMaps for settings and Runtime Profiles. It never
+The Helm release owns one Deployment, one Worker StatefulSet, a migration Job, three Services,
+two ServiceAccounts, namespaced Roles and RoleBindings, and ConfigMaps for settings and Runtime
+Profiles. It never
 owns namespaces, Secrets, PostgreSQL, Redis, object storage, Device Plugins, RuntimeClasses,
 Volcano, Ingress, Gateway API objects, persistent volumes, or cluster-scoped RBAC.
 

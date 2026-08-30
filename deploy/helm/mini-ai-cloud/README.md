@@ -8,7 +8,7 @@ artifact transport remain outside this release.
 ## What the Chart owns
 
 - one single-replica control-plane Deployment and ClusterIP Service;
-- one configurable Worker Deployment;
+- one configurable Worker StatefulSet with stable ordinal identities and a headless Service;
 - a pre-install/pre-upgrade migration Job;
 - two ServiceAccounts plus namespaced Roles and RoleBindings;
 - a headless Service for managed serving Pods;
@@ -115,8 +115,10 @@ are exposed as `KUBERNETES_SERVING_SERVICE_ACCOUNT_NAME` and
 Deployment uses the `Recreate` strategy so upgrades do not overlap two control-plane Pods.
 There is no leader election, HPA, or PDB.
 
-Worker replicas are configurable. Existing PostgreSQL claim/session fencing remains the
-authority preventing duplicate claims; P1 does not replace it.
+Worker replicas are configurable. Stable StatefulSet Pod names are injected as `WORKER_ID`,
+so a rollout can transfer the existing execution/session fence without changing the Job or
+execution identity. Existing PostgreSQL claim/session fencing remains the authority preventing
+duplicate claims; P1 does not replace it.
 
 Writable paths use bounded `emptyDir` volumes. No production `hostPath`, Docker socket,
 privileged container, or host namespace is rendered. The default local artifact backend is

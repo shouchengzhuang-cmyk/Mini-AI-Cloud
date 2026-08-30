@@ -175,7 +175,7 @@ class Kubectl:
         return decoded
 
     def restart_worker(self) -> None:
-        target = f"deployment/{self.worker_deployment}"
+        target = f"statefulset/{self.worker_deployment}"
         self.run(
             "-n",
             self.system_namespace,
