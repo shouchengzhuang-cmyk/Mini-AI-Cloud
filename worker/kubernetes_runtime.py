@@ -128,10 +128,13 @@ class KubernetesRuntime:
         in_cluster: bool = False,
         service_account_name: str | None = None,
         image_pull_secrets: Sequence[str] = (),
+        worker_pod_namespace: str | None = None,
+        worker_statefulset_name: str | None = None,
         poll_interval: float = 0.25,
         api: Any | None = None,
         core_api: Any | None = None,
         networking_api: Any | None = None,
+        apps_api: Any | None = None,
         runtime_profile_catalog: RuntimeProfileCatalog | None = None,
     ) -> None:
         if not namespace.strip():
@@ -164,6 +167,28 @@ class KubernetesRuntime:
                 field_name="image_pull_secrets",
             )
             normalized_image_pull_secrets.append(normalized)
+        normalized_worker_pod_namespace = (
+            worker_pod_namespace.strip()
+            if worker_pod_namespace is not None and worker_pod_namespace.strip()
+            else None
+        )
+        normalized_worker_statefulset_name = (
+            worker_statefulset_name.strip()
+            if worker_statefulset_name is not None and worker_statefulset_name.strip()
+            else None
+        )
+        if (normalized_worker_pod_namespace is None) != (
+            normalized_worker_statefulset_name is None
+        ):
+            raise ValueError(
+                "worker_pod_namespace and worker_statefulset_name must be configured together"
+            )
+        for field_name, value in (
+            ("worker_pod_namespace", normalized_worker_pod_namespace),
+            ("worker_statefulset_name", normalized_worker_statefulset_name),
+        ):
+            if value is not None:
+                validate_kubernetes_dns_subdomain(value, field_name=field_name)
         self.namespace = namespace.strip()
         self.cluster_id = cluster_id.strip()
         self.app_env = app_env
@@ -173,10 +198,13 @@ class KubernetesRuntime:
         self.in_cluster = in_cluster
         self.service_account_name = normalized_service_account
         self.image_pull_secrets = tuple(normalized_image_pull_secrets)
+        self.worker_pod_namespace = normalized_worker_pod_namespace
+        self.worker_statefulset_name = normalized_worker_statefulset_name
         self.poll_interval = poll_interval
         self._api = api
         self._core_api = core_api
         self._networking_api = networking_api
+        self._apps_api = apps_api
         self._owns_api = api is None
         self.runtime_profile_catalog = runtime_profile_catalog
         self._client_lock = asyncio.Lock()
@@ -406,7 +434,49 @@ class KubernetesRuntime:
         self._api = None
         self._core_api = None
         self._networking_api = None
+        self._apps_api = None
         self._network_policy_labels.clear()
+
+    async def replacement_worker_expected(self, *, worker_id: str) -> bool:
+        """Return whether this StatefulSet ordinal remains in desired state.
+
+        Missing lifecycle configuration is intentionally fail-closed: custom
+        deployments that cannot prove a replacement exists must stop Jobs on
+        shutdown instead of risking an overlapping retry.
+        """
+
+        namespace = self.worker_pod_namespace
+        statefulset_name = self.worker_statefulset_name
+        if namespace is None or statefulset_name is None:
+            return False
+        prefix = f"{statefulset_name}-"
+        ordinal_text = worker_id.removeprefix(prefix)
+        if (
+            not worker_id.startswith(prefix)
+            or not ordinal_text.isdigit()
+            or (len(ordinal_text) > 1 and ordinal_text.startswith("0"))
+        ):
+            return False
+        api = await self._ensure_apps_api()
+        try:
+            statefulset = await api.read_namespaced_stateful_set(
+                name=statefulset_name,
+                namespace=namespace,
+            )
+        except ApiException as exc:
+            raise self._operation_error(
+                "inspect worker StatefulSet before shutdown for",
+                worker_id,
+                exc,
+            ) from exc
+        if getattr(getattr(statefulset, "metadata", None), "deletion_timestamp", None) is not None:
+            return False
+        replicas = getattr(getattr(statefulset, "spec", None), "replicas", None)
+        if not isinstance(replicas, int) or isinstance(replicas, bool) or replicas < 0:
+            raise KubernetesRuntimeError(
+                f"worker StatefulSet {statefulset_name} has no valid desired replicas"
+            )
+        return int(ordinal_text) < replicas
 
     async def _delete(self, handle: RuntimeHandle, *, grace_seconds: int) -> None:
         self._validate_handle(handle)
@@ -488,6 +558,20 @@ class KubernetesRuntime:
                 else:
                     self._networking_api = client.NetworkingV1Api(api_client=api_client)
         return self._networking_api
+
+    async def _ensure_apps_api(self) -> Any:
+        if self._apps_api is not None:
+            return self._apps_api
+        batch_api = await self._ensure_api()
+        async with self._client_lock:
+            if self._apps_api is None:
+                api_client = getattr(batch_api, "api_client", None)
+                self._apps_api = (
+                    client.AppsV1Api(api_client=api_client)
+                    if api_client is not None
+                    else client.AppsV1Api()
+                )
+        return self._apps_api
 
     async def list_managed(self, *, worker_id: str) -> Sequence[RuntimeHandle]:
         """List restart-adoptable Jobs, quarantining malformed resources."""

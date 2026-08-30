@@ -115,6 +115,9 @@ def _assert_security(documents: list[dict[str, Any]]) -> None:
     }
     control_role = next(role for name, role in roles.items() if name.endswith("-control-plane"))
     worker_role = next(role for name, role in roles.items() if name.endswith("-worker"))
+    lifecycle_role = next(
+        role for name, role in roles.items() if name.endswith("-worker-lifecycle")
+    )
 
     def canonical_rules(role: dict[str, Any]) -> set[tuple[tuple[str, ...], ...]]:
         return {
@@ -145,6 +148,16 @@ def _assert_security(documents: list[dict[str, Any]]) -> None:
         raise RuntimeError("control-plane Role differs from the bounded P3 contract")
     if canonical_rules(worker_role) != expected_worker:
         raise RuntimeError("worker Role differs from the bounded P2 contract")
+    lifecycle_name = str(lifecycle_role["metadata"]["name"])
+    if lifecycle_role.get("rules") != [
+        {
+            "apiGroups": ["apps"],
+            "resources": ["statefulsets"],
+            "resourceNames": [lifecycle_name.removesuffix("-lifecycle")],
+            "verbs": ["get"],
+        }
+    ]:
+        raise RuntimeError("worker lifecycle Role must only read its exact StatefulSet")
 
     for pod_spec in _pod_specs(documents):
         for forbidden_field in ("hostNetwork", "hostPID", "hostIPC"):

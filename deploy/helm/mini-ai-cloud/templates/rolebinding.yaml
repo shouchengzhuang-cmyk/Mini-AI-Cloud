@@ -31,3 +31,20 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "mini-ai-cloud.fullname" . }}-worker
     namespace: {{ include "mini-ai-cloud.systemNamespace" . }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "mini-ai-cloud.fullname" . }}-worker-lifecycle
+  namespace: {{ include "mini-ai-cloud.systemNamespace" . }}
+  labels:
+    {{- include "mini-ai-cloud.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "mini-ai-cloud.fullname" . }}-worker-lifecycle
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "mini-ai-cloud.fullname" . }}-worker
+    namespace: {{ include "mini-ai-cloud.systemNamespace" . }}

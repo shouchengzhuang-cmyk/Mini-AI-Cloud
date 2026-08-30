@@ -38,3 +38,17 @@ rules:
   - apiGroups: ["batch"]
     resources: ["jobs"]
     verbs: ["create", "delete", "get", "list", "patch", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "mini-ai-cloud.fullname" . }}-worker-lifecycle
+  namespace: {{ include "mini-ai-cloud.systemNamespace" . }}
+  labels:
+    {{- include "mini-ai-cloud.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+rules:
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    resourceNames: [{{ printf "%s-worker" (include "mini-ai-cloud.fullname" .) | quote }}]
+    verbs: ["get"]

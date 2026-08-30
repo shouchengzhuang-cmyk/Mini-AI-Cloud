@@ -254,6 +254,11 @@ Controller rollout 时不要手工删除 serving Pod。正常 API Deployment res
 
 每个 Worker 必须有唯一 `WORKER_ID`/hostname/node name，声明 `WORKER_RUNTIME_TYPES`、总/可分配 CPU/RAM、GPU device inventory、labels 与 taints。固定 ID 重注册不能清零旧 lease reservation。
 
+Helm StatefulSet Worker 在滚动替换时只保留已经持久化完整 Job handle 的 Kubernetes batch
+execution；新 Pod 继续用相同 ordinal 接管。永久缩容时，被移除的 ordinal 必须停止 Job。
+Worker 通过只读 `get` 自身 StatefulSet 的 desired replicas 区分两者；StatefulSet 正在删除、
+ordinal 不再期望、配置缺失或读取失败时一律 fail closed，不执行 relinquish。
+
 当前 shared token 只是一条过渡边界。跨主机部署前至少：
 
 - 控制平面和 Worker 使用私网或受限 overlay network；

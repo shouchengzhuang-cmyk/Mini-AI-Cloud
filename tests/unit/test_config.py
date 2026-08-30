@@ -167,6 +167,8 @@ def test_kubernetes_serving_is_safe_by_default_and_accepts_explicit_test_configu
     defaults = Settings(_env_file=None)
     assert defaults.kubernetes_serving_enabled is False
     assert defaults.kubernetes_serving_fake_enabled is False
+    assert defaults.kubernetes_worker_pod_namespace is None
+    assert defaults.kubernetes_worker_statefulset_name is None
 
     configured = Settings(
         _env_file=None,
@@ -178,6 +180,8 @@ def test_kubernetes_serving_is_safe_by_default_and_accepts_explicit_test_configu
         kubernetes_serving_image="mini-ai-cloud:kind-serving-v4a",
         kubernetes_serving_service_account_name="serving-runtime",
         kubernetes_serving_image_pull_secrets=("registry-pull, secondary-registry, registry-pull"),
+        kubernetes_worker_pod_namespace="mini-ai-system",
+        kubernetes_worker_statefulset_name="mini-ai-worker",
         runtime_profile_manifest_path=("/etc/mini-ai-cloud/runtime_profiles/manifest.json"),
     )
     assert configured.kubernetes_serving_namespace == "model-serving"
@@ -187,6 +191,8 @@ def test_kubernetes_serving_is_safe_by_default_and_accepts_explicit_test_configu
         "registry-pull",
         "secondary-registry",
     )
+    assert configured.kubernetes_worker_pod_namespace == "mini-ai-system"
+    assert configured.kubernetes_worker_statefulset_name == "mini-ai-worker"
     assert configured.runtime_profile_manifest_path == (
         "/etc/mini-ai-cloud/runtime_profiles/manifest.json"
     )
@@ -228,6 +234,12 @@ def test_default_runtime_profile_manifest_is_release_relative_not_cwd_relative(
         {"kubernetes_serving_cluster_id": "trailing-"},
         {"kubernetes_serving_service_account_name": "Bad_Name"},
         {"kubernetes_serving_image_pull_secrets": "registry-pull,trailing-"},
+        {"kubernetes_worker_pod_namespace": "mini-ai-system"},
+        {"kubernetes_worker_statefulset_name": "mini-ai-worker"},
+        {
+            "kubernetes_worker_pod_namespace": "Bad_Name",
+            "kubernetes_worker_statefulset_name": "mini-ai-worker",
+        },
         {"kubernetes_serving_lease_seconds": 6, "kubernetes_serving_probe_timeout": 3},
     ],
 )

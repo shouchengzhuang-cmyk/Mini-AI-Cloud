@@ -126,6 +126,8 @@ class WorkerService:
                 in_cluster=settings.kubernetes_in_cluster,
                 service_account_name=settings.kubernetes_serving_service_account_name,
                 image_pull_secrets=settings.kubernetes_serving_image_pull_secrets,
+                worker_pod_namespace=settings.kubernetes_worker_pod_namespace,
+                worker_statefulset_name=settings.kubernetes_worker_statefulset_name,
                 runtime_profile_catalog=runtime_profile_catalog,
             )
             runtimes["kubernetes"] = self.kubernetes_runtime
@@ -601,6 +603,7 @@ class WorkerService:
                 self.inflight, timeout=self.settings.worker_shutdown_timeout
             )
             if pending:
+                relinquish_kubernetes = await self._replacement_worker_expected()
                 self.logger.warning(
                     "shutdown deadline reached; stopping local runtimes and relinquishing "
                     "durable Kubernetes Jobs",
@@ -609,7 +612,8 @@ class WorkerService:
                 )
                 for execution in self.active.values():
                     if (
-                        execution.runtime_type == "kubernetes"
+                        relinquish_kubernetes
+                        and execution.runtime_type == "kubernetes"
                         and execution.runtime_handle_durable.is_set()
                     ):
                         execution.relinquish_requested.set()
@@ -641,6 +645,25 @@ class WorkerService:
                     error=str(exc),
                 )
         self.logger.info("worker offline", worker_id=self.worker_id)
+
+    async def _replacement_worker_expected(self) -> bool:
+        if self.kubernetes_runtime is None or not any(
+            execution.runtime_type == "kubernetes" and execution.runtime_handle_durable.is_set()
+            for execution in self.active.values()
+        ):
+            return False
+        try:
+            return await asyncio.wait_for(
+                self.kubernetes_runtime.replacement_worker_expected(worker_id=self.worker_id),
+                timeout=5.0,
+            )
+        except Exception as exc:
+            self.logger.error(
+                "worker replacement could not be proven; Kubernetes Jobs will be stopped",
+                worker_id=self.worker_id,
+                error=str(exc),
+            )
+            return False
 
     async def _best_effort_worker_status(self, status: WorkerStatus) -> None:
         try:

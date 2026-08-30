@@ -118,7 +118,11 @@ There is no leader election, HPA, or PDB.
 Worker replicas are configurable. Stable StatefulSet Pod names are injected as `WORKER_ID`,
 so a rollout can transfer the existing execution/session fence without changing the Job or
 execution identity. Existing PostgreSQL claim/session fencing remains the authority preventing
-duplicate claims; P1 does not replace it.
+duplicate claims; P1 does not replace it. Before preserving a durable batch Job at shutdown,
+the Worker reads only its exact StatefulSet and confirms that its ordinal remains below the
+desired replica count. An ordinal removed by scale-down, a deleting StatefulSet, missing
+lifecycle configuration, or a failed read all stop the Job instead of allowing an overlapping
+retry. The dedicated lifecycle Role grants only `get` on that named StatefulSet.
 
 Writable paths use bounded `emptyDir` volumes. No production `hostPath`, Docker socket,
 privileged container, or host namespace is rendered. The default local artifact backend is

@@ -171,6 +171,8 @@ class Settings(BaseSettings):
     kubernetes_kubeconfig: str | None = None
     kubernetes_in_cluster: bool = False
     kubernetes_cleanup_grace_seconds: int = Field(default=30, ge=0, le=3600)
+    kubernetes_worker_pod_namespace: OptionalNonEmptyString = None
+    kubernetes_worker_statefulset_name: OptionalNonEmptyString = None
     runtime_profile_manifest_path: str = _DEFAULT_RUNTIME_PROFILE_MANIFEST
 
     kubernetes_serving_enabled: bool = False
@@ -276,7 +278,22 @@ class Settings(BaseSettings):
             raise ValueError("KUBERNETES_SERVING_FAKE_ENABLED requires KUBERNETES_SERVING_ENABLED")
         if self.kubernetes_serving_fake_enabled and self.app_env == "production":
             raise ValueError("Kubernetes fake serving must remain disabled in production")
+        if (self.kubernetes_worker_pod_namespace is None) != (
+            self.kubernetes_worker_statefulset_name is None
+        ):
+            raise ValueError(
+                "KUBERNETES_WORKER_POD_NAMESPACE and "
+                "KUBERNETES_WORKER_STATEFULSET_NAME must be configured together"
+            )
         for field_name, value in (
+            (
+                "KUBERNETES_WORKER_POD_NAMESPACE",
+                self.kubernetes_worker_pod_namespace,
+            ),
+            (
+                "KUBERNETES_WORKER_STATEFULSET_NAME",
+                self.kubernetes_worker_statefulset_name,
+            ),
             (
                 "KUBERNETES_SERVING_SERVICE_ACCOUNT_NAME",
                 self.kubernetes_serving_service_account_name,

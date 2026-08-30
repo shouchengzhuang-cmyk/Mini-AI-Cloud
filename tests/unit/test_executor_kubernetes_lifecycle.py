@@ -251,11 +251,12 @@ async def test_relinquish_preserves_durable_running_job_for_recovery(
 
 
 @pytest.mark.parametrize(
-    ("durable", "expected_relinquish"),
-    [(True, True), (False, False)],
+    ("durable", "replacement_expected", "expected_relinquish"),
+    [(True, True, True), (True, False, False), (False, True, False)],
 )
 async def test_shutdown_relinquishes_only_durable_kubernetes_jobs(
     durable: bool,
+    replacement_expected: bool,
     expected_relinquish: bool,
 ) -> None:
     service = cast(Any, object.__new__(WorkerService))
@@ -287,6 +288,9 @@ async def test_shutdown_relinquishes_only_durable_kubernetes_jobs(
     assignment = asyncio.create_task(finish_when_signalled())
     service.inflight = {assignment}
     service.runtime = SimpleNamespace(close=AsyncMock())
+    service.kubernetes_runtime = SimpleNamespace(
+        replacement_worker_expected=AsyncMock(return_value=replacement_expected)
+    )
     service.queue = SimpleNamespace(close=AsyncMock())
     service.database = SimpleNamespace(dispose=AsyncMock())
     service._best_effort_worker_status = AsyncMock()
@@ -299,5 +303,30 @@ async def test_shutdown_relinquishes_only_durable_kubernetes_jobs(
     assert execution.relinquish_requested.is_set() is expected_relinquish
     assert execution.ownership_lost.is_set() is (not expected_relinquish)
     assert assignment.done()
+    if durable:
+        service.kubernetes_runtime.replacement_worker_expected.assert_awaited_once_with(
+            worker_id="worker-k8s"
+        )
+    else:
+        service.kubernetes_runtime.replacement_worker_expected.assert_not_awaited()
     service._best_effort_worker_status.assert_any_await(WorkerStatus.DRAINING)
     service._best_effort_worker_status.assert_any_await(WorkerStatus.OFFLINE)
+
+
+async def test_shutdown_replacement_probe_failure_is_fail_closed() -> None:
+    service = cast(Any, object.__new__(WorkerService))
+    service.worker_id = "mini-ai-worker-0"
+    service.logger = Mock()
+    execution = ActiveExecution(
+        task_id=uuid.uuid4(),
+        execution_id=uuid.uuid4(),
+        runtime_type="kubernetes",
+    )
+    execution.runtime_handle_durable.set()
+    service.active = {execution.task_id: execution}
+    service.kubernetes_runtime = SimpleNamespace(
+        replacement_worker_expected=AsyncMock(side_effect=RuntimeError("API unavailable"))
+    )
+
+    assert await service._replacement_worker_expected() is False
+    service.logger.error.assert_called_once()

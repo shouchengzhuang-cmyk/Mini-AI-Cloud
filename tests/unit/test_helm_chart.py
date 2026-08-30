@@ -35,6 +35,9 @@ def test_worker_uses_stable_stateful_identity_for_restart_adoption() -> None:
     assert "serviceName:" in template
     assert "- name: WORKER_ID" in template
     assert "fieldPath: metadata.name" in template
+    assert "- name: KUBERNETES_WORKER_POD_NAMESPACE" in template
+    assert "fieldPath: metadata.namespace" in template
+    assert "- name: KUBERNETES_WORKER_STATEFULSET_NAME" in template
     assert (CHART / "templates" / "worker-headless-service.yaml").is_file()
 
 
@@ -62,6 +65,9 @@ def test_chart_never_owns_secrets_namespaces_or_cluster_rbac() -> None:
     assert 'apiGroups: ["batch"]' in templates
     assert 'resources: ["jobs"]' in templates
     assert 'verbs: ["create", "delete", "get", "list", "patch", "watch"]' in templates
+    assert 'resources: ["statefulsets"]' in templates
+    assert 'verbs: ["get"]' in templates
+    assert "resourceNames:" in templates
     assert 'drop: ["ALL"]' in templates
     assert "readOnlyRootFilesystem: true" in templates
 

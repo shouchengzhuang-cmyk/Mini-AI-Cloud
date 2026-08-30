@@ -2,6 +2,7 @@ import asyncio
 import uuid
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import FrozenInstanceError, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -266,6 +267,63 @@ async def test_suspended_job_releases_log_attach_barrier_before_start() -> None:
 
     consumer.cancel()
     await asyncio.gather(consumer, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    ("worker_id", "replicas", "deleting", "expected"),
+    [
+        ("mini-ai-worker-0", 1, False, True),
+        ("mini-ai-worker-1", 1, False, False),
+        ("mini-ai-worker-0", 1, True, False),
+        ("custom-worker", 1, False, False),
+    ],
+)
+async def test_replacement_worker_expected_uses_statefulset_desired_ordinals(
+    worker_id: str,
+    replicas: int,
+    deleting: bool,
+    expected: bool,
+) -> None:
+    batch, core = _apis()
+    statefulset = client.V1StatefulSet(
+        metadata=client.V1ObjectMeta(
+            name="mini-ai-worker",
+            deletion_timestamp=(datetime(2026, 8, 30, tzinfo=UTC) if deleting else None),
+        ),
+        spec=client.V1StatefulSetSpec(
+            replicas=replicas,
+            selector=client.V1LabelSelector(match_labels={"app": "worker"}),
+            service_name="mini-ai-worker",
+            template=client.V1PodTemplateSpec(
+                metadata=client.V1ObjectMeta(labels={"app": "worker"}),
+                spec=client.V1PodSpec(
+                    containers=[client.V1Container(name="worker", image="example/worker")]
+                ),
+            ),
+        ),
+    )
+    apps = SimpleNamespace(
+        read_namespaced_stateful_set=AsyncMock(return_value=statefulset),
+    )
+    runtime = KubernetesRuntime(
+        namespace="runtime-tests",
+        cluster_id="cluster-a",
+        app_env="test",
+        api=batch,
+        core_api=core,
+        apps_api=apps,
+        worker_pod_namespace="system-tests",
+        worker_statefulset_name="mini-ai-worker",
+    )
+
+    assert await runtime.replacement_worker_expected(worker_id=worker_id) is expected
+    if worker_id.startswith("mini-ai-worker-"):
+        apps.read_namespaced_stateful_set.assert_awaited_once_with(
+            name="mini-ai-worker",
+            namespace="system-tests",
+        )
+    else:
+        apps.read_namespaced_stateful_set.assert_not_awaited()
 
 
 async def test_prepare_applies_workload_credentials_to_batch_job() -> None:
