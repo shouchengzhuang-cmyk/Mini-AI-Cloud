@@ -50,6 +50,7 @@ def test_chart_never_owns_secrets_namespaces_or_cluster_rbac() -> None:
     assert 'resources: ["services"]' in templates
     assert 'apiGroups: ["batch"]' in templates
     assert 'resources: ["jobs"]' in templates
+    assert 'verbs: ["create", "delete", "get", "list", "patch", "watch"]' in templates
     assert 'drop: ["ALL"]' in templates
     assert "readOnlyRootFilesystem: true" in templates
 

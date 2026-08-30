@@ -139,7 +139,7 @@ def _assert_security(documents: list[dict[str, Any]]) -> None:
             ("networkpolicies",),
             ("create", "delete", "get", "list", "watch"),
         ),
-        (("batch",), ("jobs",), ("create", "delete", "get", "list", "watch")),
+        (("batch",), ("jobs",), ("create", "delete", "get", "list", "patch", "watch")),
     }
     if canonical_rules(control_role) != expected_control:
         raise RuntimeError("control-plane Role differs from the bounded P3 contract")
