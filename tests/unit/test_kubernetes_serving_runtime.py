@@ -196,6 +196,7 @@ def test_workload_identity_references_render_without_entering_contract_hash() ->
     runtime = KubernetesServingRuntimeAdapter(
         namespace="serving-tests",
         cluster_id="kind-serving-test",
+        termination_grace_seconds=17,
         service_account_name="serving-runtime",
         image_pull_secrets=("registry-pull", "secondary-registry", "registry-pull"),
         api=SimpleNamespace(),

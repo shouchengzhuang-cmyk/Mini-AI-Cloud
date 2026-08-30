@@ -624,7 +624,9 @@ async def test_kubernetes_handoff_lease_blocks_retry_until_job_deadline(
         )
         assert held.lease_expires_at is not None
         assert held.started_at is not None
-        assert held.lease_expires_at - held.started_at >= timedelta(seconds=55)
+        assert held.lease_expires_at.replace(tzinfo=None) - held.started_at.replace(
+            tzinfo=None
+        ) >= timedelta(seconds=55)
 
     async with database.session() as session, session.begin():
         assert (
