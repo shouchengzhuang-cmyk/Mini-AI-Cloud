@@ -314,6 +314,11 @@ class KubernetesRuntime:
         self._validate_handle(handle)
         while True:
             job = await self._read_validated_job(handle, operation="wait for")
+            terminal = _job_terminal_state(getattr(job, "status", None))
+            if terminal == "deadline":
+                raise KubernetesDeadlineExceeded(
+                    f"Kubernetes Job {handle.object_id} exceeded its active deadline"
+                )
             pod = await self._controlled_pod(handle, required=False)
             status: object | None = None
             if pod is not None:
@@ -322,11 +327,6 @@ class KubernetesRuntime:
                 failure = _pod_runtime_failure(status, handle.observation.pod_name or "<unknown>")
                 if failure is not None:
                     raise failure
-            terminal = _job_terminal_state(getattr(job, "status", None))
-            if terminal == "deadline":
-                raise KubernetesDeadlineExceeded(
-                    f"Kubernetes Job {handle.object_id} exceeded its active deadline"
-                )
             if terminal == "complete":
                 return _pod_exit_code(status, default=0)
             if terminal == "failed":
@@ -1407,12 +1407,14 @@ def _job_terminal_state(status: object) -> str | None:
         reason = str(getattr(condition, "reason", "") or "")
         if condition_type == "Complete":
             return "complete"
-        if condition_type == "Failed":
+        if condition_type in {"Failed", "FailureTarget"}:
             return "deadline" if reason == "DeadlineExceeded" else "failed"
     if int(getattr(status, "succeeded", 0) or 0) > 0:
         return "complete"
-    if int(getattr(status, "failed", 0) or 0) > 0:
-        return "failed"
+    # ``failed`` counts failed Pods; it is updated before the Job controller
+    # publishes the authoritative Failed condition (and its terminal reason).
+    # Returning here can therefore misclassify an active-deadline failure as a
+    # generic non-zero exit while the DeadlineExceeded condition is in flight.
     return None
 
 

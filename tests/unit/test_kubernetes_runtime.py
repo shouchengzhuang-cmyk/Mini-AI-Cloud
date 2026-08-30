@@ -538,6 +538,67 @@ async def test_wait_classifies_oom_image_pull_and_deadline() -> None:
         await runtime.wait(handle)
 
 
+async def test_wait_ignores_failed_pod_count_until_deadline_condition_arrives() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
+    spec = _spec()
+    handle = await runtime.prepare(spec)
+
+    failed_pod_observation = _job(runtime, spec)
+    failed_pod_observation.status = SimpleNamespace(failed=1, conditions=[])
+    deadline_observation = _job(runtime, spec)
+    deadline_observation.status = SimpleNamespace(
+        failed=1,
+        conditions=[
+            SimpleNamespace(type="FailureTarget", status="True", reason="DeadlineExceeded")
+        ],
+    )
+    batch.read_namespaced_job.reset_mock()
+    batch.read_namespaced_job.side_effect = [
+        failed_pod_observation,
+        failed_pod_observation,
+        deadline_observation,
+    ]
+
+    with pytest.raises(KubernetesDeadlineExceeded):
+        await runtime.wait(handle)
+
+    assert batch.read_namespaced_job.await_count == 3
+
+
+async def test_wait_prioritizes_deadline_failure_target_over_oom_shaped_pod() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
+    spec = _spec()
+    handle = await runtime.prepare(spec)
+    job = cast(Any, handle.native)
+    job.status = SimpleNamespace(
+        failed=1,
+        conditions=[
+            SimpleNamespace(type="FailureTarget", status="True", reason="DeadlineExceeded")
+        ],
+    )
+    pod_status = SimpleNamespace(
+        phase="Failed",
+        container_statuses=[
+            SimpleNamespace(
+                state=SimpleNamespace(
+                    waiting=None,
+                    terminated=SimpleNamespace(exit_code=137, reason="OOMKilled"),
+                )
+            )
+        ],
+    )
+    core.list_namespaced_pod.return_value = SimpleNamespace(items=[_pod(job, status=pod_status)])
+    core.list_namespaced_pod.reset_mock()
+    batch.read_namespaced_job.return_value = job
+
+    with pytest.raises(KubernetesDeadlineExceeded):
+        await runtime.wait(handle)
+
+    core.list_namespaced_pod.assert_not_awaited()
+
+
 async def test_wait_reports_bounded_unschedulable_reason_without_long_tail() -> None:
     batch, core = _apis()
     runtime = _runtime(batch, core)
