@@ -431,6 +431,7 @@ class KubernetesRuntime:
 
     async def cleanup(self, handle: RuntimeHandle) -> None:
         await self._delete(handle, grace_seconds=0)
+        await self._wait_for_controlled_pod_deletion(handle)
         await self._delete_network_policy(handle)
 
     async def close(self) -> None:
@@ -726,6 +727,23 @@ class KubernetesRuntime:
     ) -> object | None:
         self._validate_handle(handle)
         await self._read_validated_job(handle, operation="inspect controlled Pods for")
+        pods = await self._list_controlled_pods(handle)
+        if not pods:
+            if required:
+                raise KubernetesRuntimeError(
+                    f"Kubernetes Job {handle.object_id} has no controlled Pod"
+                )
+            return None
+        return pods[0]
+
+    async def _wait_for_controlled_pod_deletion(self, handle: RuntimeHandle) -> None:
+        # The bounded ownership selector has no watch stream; polling preserves
+        # deny-all isolation until Kubernetes confirms the Pod is gone.
+        while await self._list_controlled_pods(handle):  # noqa: ASYNC110
+            await asyncio.sleep(self.poll_interval)
+
+    async def _list_controlled_pods(self, handle: RuntimeHandle) -> list[object]:
+        self._validate_handle(handle)
         core_api = await self._ensure_core_api()
         selector = ",".join(
             f"{key}={value}"
@@ -755,15 +773,9 @@ class KubernetesRuntime:
             raise KubernetesRuntimeError(
                 f"Kubernetes Job {handle.object_id} has multiple controlled Pods"
             )
-        if not pods:
-            if required:
-                raise KubernetesRuntimeError(
-                    f"Kubernetes Job {handle.object_id} has no controlled Pod"
-                )
-            return None
-        pod = pods[0]
-        self._validate_controlled_pod(pod, handle)
-        return pod
+        for pod in pods:
+            self._validate_controlled_pod(pod, handle)
+        return pods
 
     def _validate_controlled_pod(self, pod: object, handle: RuntimeHandle) -> None:
         labels = dict(getattr(getattr(pod, "metadata", None), "labels", None) or {})

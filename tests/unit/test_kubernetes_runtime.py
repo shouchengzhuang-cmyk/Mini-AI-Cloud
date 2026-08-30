@@ -805,6 +805,46 @@ async def test_cancel_uses_job_uid_precondition_and_refuses_recreated_job() -> N
         await runtime.stop(handle)
 
 
+async def test_cleanup_keeps_deny_all_policy_until_controlled_pod_is_gone() -> None:
+    batch, core = _apis()
+    networking = SimpleNamespace(
+        create_namespaced_network_policy=AsyncMock(),
+        read_namespaced_network_policy=AsyncMock(),
+        delete_namespaced_network_policy=AsyncMock(),
+    )
+
+    async def create_policy(*, namespace: str, body: Any) -> Any:
+        assert namespace == "runtime-tests"
+        body.metadata.uid = "network-policy-uid"
+        return body
+
+    networking.create_namespaced_network_policy.side_effect = create_policy
+    runtime = _runtime(batch, core, networking_api=networking)
+    handle = await runtime.prepare(_spec(network_enabled=False))
+    policy = networking.create_namespaced_network_policy.call_args.kwargs["body"]
+    networking.read_namespaced_network_policy.return_value = policy
+    pod = _pod(cast(Any, handle.native))
+    observations = [SimpleNamespace(items=[pod]), SimpleNamespace(items=[])]
+    order: list[str] = []
+
+    async def list_pods(**_kwargs: Any) -> object:
+        observed = observations.pop(0)
+        order.append("pod" if observed.items else "gone")
+        return observed
+
+    async def delete_policy(**_kwargs: Any) -> None:
+        assert order == ["pod", "gone"]
+        order.append("policy")
+
+    core.list_namespaced_pod.side_effect = list_pods
+    networking.delete_namespaced_network_policy.side_effect = delete_policy
+
+    await runtime.cleanup(handle)
+
+    assert order == ["pod", "gone", "policy"]
+    assert batch.delete_namespaced_job.call_args.kwargs["body"].grace_period_seconds == 0
+
+
 async def test_controller_transfer_cas_blocks_stale_delete_after_db_gate() -> None:
     batch, core = _apis()
     runtime = _runtime(batch, core)
