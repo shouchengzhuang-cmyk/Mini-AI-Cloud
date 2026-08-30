@@ -314,9 +314,7 @@ async def test_shutdown_relinquishes_only_durable_kubernetes_jobs(
     service.database = SimpleNamespace(dispose=AsyncMock())
     service._best_effort_worker_status = AsyncMock()
     service._preserve_kubernetes_handoff_leases = AsyncMock(
-        side_effect=RuntimeError("database unavailable")
-        if preserve_fails
-        else None,
+        side_effect=RuntimeError("database unavailable") if preserve_fails else None,
         return_value={execution.task_id} if expected_relinquish else set(),
     )
 

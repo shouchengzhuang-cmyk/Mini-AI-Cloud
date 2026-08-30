@@ -228,6 +228,7 @@ class TaskRepository:
         new_worker_session_id: uuid.UUID,
         lease_seconds: float,
         observations: list[dict[str, str | None]],
+        kubernetes_cleanup_grace_seconds: float = 0.0,
     ) -> list[RecoverableRuntimeExecution]:
         """CAS-transfer persisted Job executions to a newly registered Worker session."""
 
@@ -319,7 +320,12 @@ class TaskRepository:
             now = await database_utcnow(session)
             execution.worker_session_id = new_worker_session_id
             reservation.worker_session_id = new_worker_session_id
-            task.lease_expires_at = now + timedelta(seconds=lease_seconds)
+            task.lease_expires_at = _runtime_lease_expiry(
+                task,
+                now,
+                lease_seconds=lease_seconds,
+                kubernetes_cleanup_grace_seconds=kubernetes_cleanup_grace_seconds,
+            )
             task.version += 1
             recovered.append(
                 RecoverableRuntimeExecution(
@@ -1103,6 +1109,7 @@ class TaskRepository:
         observed_pod_name: str | None,
         observed_pod_uid: str | None,
         worker_session_id: uuid.UUID | None = None,
+        kubernetes_cleanup_grace_seconds: float = 0.0,
     ) -> Task:
         """Persist a runtime observation behind the full execution/session fence."""
 
@@ -1138,6 +1145,8 @@ class TaskRepository:
         ):
             raise StaleExecutionError("persisted Kubernetes Pod identity is immutable")
         if runtime_type == "kubernetes":
+            if kubernetes_cleanup_grace_seconds < 0:
+                raise ValueError("Kubernetes runtime cleanup grace must not be negative")
             if (
                 resource_kind != "job"
                 or not namespace
@@ -1173,6 +1182,17 @@ class TaskRepository:
         }
         task.runtime_handle = persisted
         task.version += 1
+        if runtime_type == "kubernetes":
+            # A durable Job may outlive an abrupt worker loss.  Install its
+            # complete execution lease now, rather than waiting for graceful
+            # shutdown, so retry recovery cannot overlap that Job.
+            now = await database_utcnow(session)
+            task.lease_expires_at = _runtime_lease_expiry(
+                task,
+                now,
+                lease_seconds=0,
+                kubernetes_cleanup_grace_seconds=kubernetes_cleanup_grace_seconds,
+            )
         execution.runtime_object_id = resource_name
         if runtime_type == "kubernetes":
             execution.runtime_namespace = namespace
@@ -1292,6 +1312,7 @@ class TaskRepository:
         execution_id: uuid.UUID,
         lease_seconds: float,
         worker_session_id: uuid.UUID | None = None,
+        kubernetes_cleanup_grace_seconds: float = 0.0,
     ) -> Task:
         task = await TaskRepository._owned_task(
             session,
@@ -1302,14 +1323,24 @@ class TaskRepository:
         )
         if task.status == TaskStatus.RUNNING:
             now = await database_utcnow(session)
-            task.lease_expires_at = now + timedelta(seconds=lease_seconds)
+            task.lease_expires_at = _runtime_lease_expiry(
+                task,
+                now,
+                lease_seconds=lease_seconds,
+                kubernetes_cleanup_grace_seconds=kubernetes_cleanup_grace_seconds,
+            )
             task.version += 1
             return task
         if task.status not in {TaskStatus.PULLING, TaskStatus.STARTING}:
             raise StaleExecutionError("task is no longer starting for this execution")
         now = await database_utcnow(session)
         _transition(session, task, TaskStatus.RUNNING, now)
-        task.lease_expires_at = now + timedelta(seconds=lease_seconds)
+        task.lease_expires_at = _runtime_lease_expiry(
+            task,
+            now,
+            lease_seconds=lease_seconds,
+            kubernetes_cleanup_grace_seconds=kubernetes_cleanup_grace_seconds,
+        )
         return task
 
     @staticmethod
@@ -1387,6 +1418,7 @@ class TaskRepository:
         execution_id: uuid.UUID,
         lease_seconds: float,
         worker_session_id: uuid.UUID | None = None,
+        kubernetes_cleanup_grace_seconds: float = 0.0,
     ) -> bool:
         task = await TaskRepository.get(session, task_id, for_update=True)
         if (
@@ -1405,7 +1437,12 @@ class TaskRepository:
             ):
                 return False
         now = await database_utcnow(session)
-        task.lease_expires_at = now + timedelta(seconds=lease_seconds)
+        task.lease_expires_at = _runtime_lease_expiry(
+            task,
+            now,
+            lease_seconds=lease_seconds,
+            kubernetes_cleanup_grace_seconds=kubernetes_cleanup_grace_seconds,
+        )
         task.version += 1
         return True
 
@@ -2002,6 +2039,25 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
+def _runtime_lease_expiry(
+    task: Task,
+    now: datetime,
+    *,
+    lease_seconds: float,
+    kubernetes_cleanup_grace_seconds: float,
+) -> datetime:
+    if kubernetes_cleanup_grace_seconds < 0:
+        raise ValueError("Kubernetes runtime cleanup grace must not be negative")
+    ordinary_expiry = now + timedelta(seconds=lease_seconds)
+    if task.runtime_type.value != "kubernetes" or task.runtime_handle is None:
+        return ordinary_expiry
+    started_at = _as_utc(task.started_at) if task.started_at is not None else now
+    job_expiry = started_at + timedelta(
+        seconds=task.timeout_seconds + kubernetes_cleanup_grace_seconds
+    )
+    return max(ordinary_expiry, job_expiry)
+
+
 def _enum_value(value: ErrorCategory | ErrorCode | str | None) -> str | None:
     if isinstance(value, ErrorCategory | ErrorCode):
         return value.value
@@ -2040,3 +2096,4 @@ async def _complete_preemption_plans(
     for plan in plans:
         plan.state = "completed"
         plan.completed_at = now
+

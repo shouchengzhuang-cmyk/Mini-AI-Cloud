@@ -187,7 +187,7 @@ def test_nonaccelerator_contract_hash_remains_compatible_with_a4() -> None:
     assert selector[SPEC_HASH_LABEL] == "9ae65e930dfffd128522b1a3d56861f6"
 
 
-def test_workload_identity_references_render_without_entering_contract_hash() -> None:
+async def test_configured_service_account_enters_serving_contract_hash() -> None:
     base = _runtime(SimpleNamespace())._selector_labels(
         _spec(),
         worker_id="k8s-serving-worker",
@@ -213,7 +213,25 @@ def test_workload_identity_references_render_without_entering_contract_hash() ->
         "registry-pull",
         "secondary-registry",
     ]
-    assert configured[SPEC_HASH_LABEL] == base[SPEC_HASH_LABEL]
+    assert configured[SPEC_HASH_LABEL] != base[SPEC_HASH_LABEL]
+
+    api = _prepare_api()
+    api.create_namespaced_pod.side_effect = ApiException(status=409)
+    api.read_namespaced_pod = AsyncMock(return_value=pod)
+    changed = KubernetesServingRuntimeAdapter(
+        namespace="serving-tests",
+        cluster_id="kind-serving-test",
+        termination_grace_seconds=17,
+        service_account_name="new-serving-runtime",
+        api=api,
+    )
+
+    with pytest.raises(KubernetesServingOwnershipError, match="fencing labels"):
+        await changed.prepare(
+            _spec(),
+            worker_id="k8s-serving-worker",
+            worker_session_id=WORKER_SESSION_ID,
+        )
 
 
 async def test_prepare_accepts_default_service_account_with_configured_pull_secret() -> None:
@@ -1083,3 +1101,4 @@ async def test_version_and_close_only_close_owned_client() -> None:
     await owned.close()
     owned_close.assert_awaited_once()
     assert owned._api is None
+

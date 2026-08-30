@@ -503,6 +503,7 @@ class TaskExecutor:
                 observed_pod_name=handle.observation.pod_name,
                 observed_pod_uid=handle.observation.pod_uid,
                 worker_session_id=self.worker_session_id,
+                kubernetes_cleanup_grace_seconds=self.settings.kubernetes_cleanup_grace_seconds,
             )
 
     async def _resolve_secrets(self, task: Task, execution: ActiveExecution) -> ResolvedTaskSecrets:
@@ -531,6 +532,7 @@ class TaskExecutor:
                 execution_id=execution.execution_id,
                 lease_seconds=self.settings.task_lease_seconds,
                 worker_session_id=self.worker_session_id,
+                kubernetes_cleanup_grace_seconds=self.settings.kubernetes_cleanup_grace_seconds,
             )
 
     async def _preserve_kubernetes_handoff_lease(
@@ -999,3 +1001,4 @@ class TaskExecutor:
             return await asyncio.wait_for(awaitable, timeout=remaining)
         except TimeoutError as exc:
             raise ExecutionTimedOut from exc
+

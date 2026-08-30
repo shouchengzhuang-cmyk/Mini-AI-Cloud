@@ -276,6 +276,7 @@ class WorkerService:
                 new_worker_session_id=self.worker_session_id,
                 lease_seconds=self.settings.task_lease_seconds,
                 observations=observations,
+                kubernetes_cleanup_grace_seconds=self.settings.kubernetes_cleanup_grace_seconds,
             )
         by_execution_id = {
             uuid.UUID(handle.labels[EXECUTION_ID_LABEL]): handle for handle in controller_handles
@@ -605,11 +606,17 @@ class WorkerService:
             )
             if pending:
                 relinquish_kubernetes = await self._replacement_worker_expected()
-                relinquished_task_ids = (
-                    await self._preserve_kubernetes_handoff_leases()
-                    if relinquish_kubernetes
-                    else set()
-                )
+                relinquished_task_ids: set[uuid.UUID] = set()
+                if relinquish_kubernetes:
+                    try:
+                        relinquished_task_ids = await self._preserve_kubernetes_handoff_leases()
+                    except Exception as exc:
+                        self.logger.warning(
+                            "Kubernetes Job handoff leases could not be fenced; "
+                            "Jobs will be stopped",
+                            worker_id=self.worker_id,
+                            error=str(exc),
+                        )
                 self.logger.warning(
                     "shutdown deadline reached; stopping local runtimes and relinquishing "
                     "durable Kubernetes Jobs",

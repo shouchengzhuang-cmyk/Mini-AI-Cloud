@@ -612,16 +612,29 @@ async def test_kubernetes_handoff_lease_blocks_retry_until_job_deadline(
             worker_id=worker_id,
             execution_id=execution_id,
             worker_session_id=worker_session_id,
+            kubernetes_cleanup_grace_seconds=30,
             **runtime_identity,
         )
-        held = await TaskRepository.preserve_kubernetes_handoff_lease(
+        await TaskRepository.mark_running(
             session,
             task_id=task_id,
             worker_id=worker_id,
             execution_id=execution_id,
             worker_session_id=worker_session_id,
-            cleanup_grace_seconds=30,
+            lease_seconds=30,
+            kubernetes_cleanup_grace_seconds=30,
         )
+        assert await TaskRepository.renew_lease(
+            session,
+            task_id=task_id,
+            worker_id=worker_id,
+            execution_id=execution_id,
+            worker_session_id=worker_session_id,
+            lease_seconds=30,
+            kubernetes_cleanup_grace_seconds=30,
+        )
+        held = await TaskRepository.get(session, task_id)
+        assert held is not None
         assert held.lease_expires_at is not None
         assert held.started_at is not None
         assert held.lease_expires_at.replace(tzinfo=None) - held.started_at.replace(
@@ -754,3 +767,4 @@ async def test_reregistration_fences_artifact_materialize_and_publish(
     assert artifacts[0].state == "failed"
     assert [path for path in (tmp_path / "objects").rglob("*") if path.is_file()] == []
     await manager.cleanup(workspace)
+

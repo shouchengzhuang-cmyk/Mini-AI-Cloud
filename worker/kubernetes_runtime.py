@@ -222,6 +222,7 @@ class KubernetesRuntime:
         labels = dict(job.metadata.labels or {})
         if not spec.network_enabled:
             await self._ensure_network_policy(spec, labels)
+        created_by_request = False
         # The policy intentionally survives a failed Pod create. A concurrent,
         # idempotent prepare may already have adopted it, so rollback here could
         # remove isolation from that execution. An empty fenced selector is safe.
@@ -230,6 +231,7 @@ class KubernetesRuntime:
                 namespace=self.namespace,
                 body=job,
             )
+            created_by_request = True
         except ApiException as exc:
             if exc.status != 409:
                 detail = self._operation_error("create", job_name, exc)
@@ -243,12 +245,23 @@ class KubernetesRuntime:
                 raise self._operation_error("adopt", job_name, read_exc) from read_exc
 
         controller_session_id = spec.worker_session_id or _LEGACY_WORKER_SESSION_ID
-        self._validate_adopted_job(
-            created,
-            expected_labels=labels,
-            expected_spec=spec,
-            expected_controller_session_id=controller_session_id,
-        )
+        try:
+            self._validate_adopted_job(
+                created,
+                expected_labels=labels,
+                expected_spec=spec,
+                expected_controller_session_id=controller_session_id,
+            )
+        except KubernetesRuntimeError:
+            if created_by_request:
+                await self._compensate_rejected_created_job(
+                    created,
+                    job_name=job_name,
+                    expected_labels=labels,
+                    expected_controller_session_id=controller_session_id,
+                    cleanup_network_policy=not spec.network_enabled,
+                )
+            raise
         handle = RuntimeHandle(
             runtime_type=self.runtime_type,
             resource_kind="job",
@@ -349,7 +362,6 @@ class KubernetesRuntime:
                         await _close_log_source(source)
                         source = None
                         raise response_error
-                    break
                 except ApiException as exc:
                     if exc.status != 400:
                         raise
@@ -372,23 +384,44 @@ class KubernetesRuntime:
                             return
                         final_read = True
                     await asyncio.sleep(self.poll_interval)
-
-            if ready is not None:
-                ready.set()
-            cursor = 0
-            persisted_cursor = handle.observation.log_cursor_bytes
-            async for chunk in _iter_log_chunks(source):
-                chunk_start = cursor
-                cursor += len(chunk)
-                if cursor <= persisted_cursor:
                     continue
-                content = chunk[max(0, persisted_cursor - chunk_start) :]
-                if content:
-                    yield RuntimeLog(
-                        stream="stdout",
-                        content=content,
-                        cursor_bytes=cursor,
-                    )
+
+                if ready is not None:
+                    ready.set()
+                cursor = 0
+                persisted_cursor = handle.observation.log_cursor_bytes
+                try:
+                    async for chunk in _iter_log_chunks(source):
+                        chunk_start = cursor
+                        cursor += len(chunk)
+                        if cursor <= persisted_cursor:
+                            continue
+                        content = chunk[max(0, persisted_cursor - chunk_start) :]
+                        if content:
+                            yield RuntimeLog(
+                                stream="stdout",
+                                content=content,
+                                cursor_bytes=cursor,
+                            )
+                finally:
+                    await _close_log_source(source)
+                    source = None
+
+                # A streaming response can end while the Job is still alive.
+                # Reopen from the durable byte cursor until the Job reaches a
+                # terminal state; otherwise later output silently disappears.
+                job = await self._read_validated_job(handle, operation="reconcile log EOF for")
+                terminal = _job_terminal_state(getattr(job, "status", None))
+                if terminal is not None:
+                    if final_read:
+                        if terminal == "deadline":
+                            raise KubernetesDeadlineExceeded(
+                                f"Kubernetes Job {handle.object_id} exceeded its active deadline"
+                            )
+                        return
+                    final_read = True
+                    continue
+                await asyncio.sleep(self.poll_interval)
         except asyncio.CancelledError:
             raise
         except ApiException as exc:
@@ -528,6 +561,68 @@ class KubernetesRuntime:
             if exc.status == 404:
                 return
             raise self._operation_error("delete", handle.object_id, exc) from exc
+
+    async def _compensate_rejected_created_job(
+        self,
+        job: object,
+        *,
+        job_name: str,
+        expected_labels: Mapping[str, str],
+        expected_controller_session_id: uuid.UUID,
+        cleanup_network_policy: bool,
+    ) -> None:
+        """Delete a newly created Job that failed post-create validation.
+
+        This path is deliberately narrower than normal cleanup: the Job has
+        not produced a durable handle, but creation succeeded in this process.
+        Exact labels, name, UID, and resourceVersion fence a compensation
+        delete without accepting the mutated launch contract.
+        """
+
+        metadata = getattr(job, "metadata", None)
+        labels = dict(getattr(metadata, "labels", None) or {})
+        if getattr(metadata, "name", None) != job_name or any(
+            labels.get(key) != value for key, value in expected_labels.items()
+        ):
+            raise KubernetesRuntimeError(
+                f"refusing to compensate Kubernetes Job {job_name}: execution fence mismatch"
+            )
+        uid = _required_uid(job, resource="Job")
+        resource_version = _required_resource_version(job, resource="Job")
+        handle = RuntimeHandle(
+            runtime_type=self.runtime_type,
+            resource_kind="job",
+            object_id=job_name,
+            display_id=job_name,
+            native=job,
+            namespace=self.namespace,
+            resource_uid=uid,
+            resource_version=resource_version,
+            controller_session_id=expected_controller_session_id,
+            spec_hash=expected_labels[SPEC_HASH_LABEL],
+            labels=MappingProxyType(dict(expected_labels)),
+        )
+        api = await self._ensure_api()
+        body = client.V1DeleteOptions(
+            grace_period_seconds=0,
+            preconditions=client.V1Preconditions(
+                uid=uid,
+                resource_version=resource_version,
+            ),
+            propagation_policy="Foreground",
+        )
+        try:
+            await api.delete_namespaced_job(
+                name=job_name,
+                namespace=self.namespace,
+                body=body,
+            )
+        except ApiException as exc:
+            if exc.status != 404:
+                raise self._operation_error("compensate rejected", job_name, exc) from exc
+        if cleanup_network_policy:
+            await self._wait_for_controlled_pod_deletion(handle)
+            await self._delete_network_policy(handle)
 
     async def _ensure_api(self) -> Any:
         if self._api is not None:
@@ -1241,6 +1336,10 @@ class KubernetesRuntime:
         container_security = getattr(container, "security_context", None)
         if (
             getattr(pod_spec, "automount_service_account_token", None) is not False
+            or getattr(pod_spec, "host_ipc", None) is True
+            or getattr(pod_spec, "host_network", None) is True
+            or getattr(pod_spec, "host_pid", None) is True
+            or getattr(pod_spec, "share_process_namespace", None) is True
             or getattr(pod_security, "run_as_non_root", None) is not True
             or getattr(getattr(pod_security, "seccomp_profile", None), "type", None)
             != "RuntimeDefault"
@@ -1707,3 +1806,4 @@ def _as_bytes(value: object) -> bytes:
     if isinstance(value, bytearray | memoryview):
         return bytes(value)
     raise TypeError(f"unsupported Kubernetes log chunk type: {type(value).__name__}")
+

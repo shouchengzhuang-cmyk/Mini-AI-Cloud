@@ -1120,6 +1120,7 @@ def _pod_contract(pod: object) -> dict[str, object]:
     volume = volumes[0] if len(volumes) == 1 else None
     empty_dir = getattr(volume, "empty_dir", None)
     volume_mounts = getattr(container, "volume_mounts", None) or []
+    service_account_name = getattr(pod_spec, "service_account_name", None)
     accelerator_contract = annotations.get(ACCELERATOR_RESOURCE_ANNOTATION) is not None
     contract_label_keys = _BASE_CONTRACT_LABEL_KEYS + (
         _ACCELERATOR_CONTRACT_LABEL_KEYS if accelerator_contract else ()
@@ -1151,6 +1152,14 @@ def _pod_contract(pod: object) -> dict[str, object]:
             "host_pid": getattr(pod_spec, "host_pid", None) is True,
             "share_process_namespace": getattr(pod_spec, "share_process_namespace", None) is True,
             "restart_policy": getattr(pod_spec, "restart_policy", None),
+            # Kubernetes may default the implicit account to ``default``.  A
+            # controller-configured non-default account is workload identity,
+            # though, and must fence deterministic Pod adoption.
+            **(
+                {"service_account_name": service_account_name}
+                if service_account_name not in {None, "default"}
+                else {}
+            ),
             **(
                 {
                     "runtime_class_name": getattr(pod_spec, "runtime_class_name", None),
@@ -1759,3 +1768,4 @@ def _bounded(value: str | None) -> str | None:
     if value is None:
         return None
     return value[:_MAX_ERROR_LENGTH]
+

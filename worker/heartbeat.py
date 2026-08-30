@@ -69,6 +69,7 @@ class Heartbeat:
                     execution_id=execution.execution_id,
                     lease_seconds=self.settings.task_lease_seconds,
                     worker_session_id=self.worker_session_id,
+                    kubernetes_cleanup_grace_seconds=self.settings.kubernetes_cleanup_grace_seconds,
                 )
             if not renewed:
                 execution.ownership_lost.set()
@@ -103,3 +104,4 @@ class Heartbeat:
                     worker_id=self.worker_id,
                     error=str(exc),
                 )
+

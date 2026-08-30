@@ -457,6 +457,46 @@ async def test_create_conflict_quarantines_spec_hash_or_session_drift(drift: str
         await runtime.prepare(spec)
 
 
+async def test_prepare_compensates_created_job_rejected_by_post_create_validation() -> None:
+    batch, core = _apis()
+    networking = SimpleNamespace(
+        create_namespaced_network_policy=AsyncMock(),
+        read_namespaced_network_policy=AsyncMock(),
+        delete_namespaced_network_policy=AsyncMock(),
+    )
+
+    created_policy: Any | None = None
+
+    async def create_policy(*, namespace: str, body: Any) -> Any:
+        nonlocal created_policy
+        assert namespace == "runtime-tests"
+        body.metadata.uid = "network-policy-uid"
+        created_policy = body
+        return body
+
+    async def read_policy(**_kwargs: Any) -> Any:
+        assert created_policy is not None
+        return created_policy
+
+    networking.create_namespaced_network_policy.side_effect = create_policy
+    networking.read_namespaced_network_policy.side_effect = read_policy
+    runtime = _runtime(batch, core, networking_api=networking)
+    spec = _spec(network_enabled=False)
+    created = _job(runtime, spec)
+    created.spec.template.spec.host_network = True
+    batch.create_namespaced_job.side_effect = None
+    batch.create_namespaced_job.return_value = created
+
+    with pytest.raises(KubernetesRuntimeError, match="security baseline"):
+        await runtime.prepare(spec)
+
+    delete = batch.delete_namespaced_job.call_args.kwargs
+    assert delete["name"] == runtime.job_name(spec.task_id, spec.execution_id)
+    assert delete["body"].preconditions.uid == "job-uid"
+    assert delete["body"].grace_period_seconds == 0
+    networking.delete_namespaced_network_policy.assert_awaited_once()
+
+
 async def test_logs_read_only_controlled_task_container_and_capture_pod_identity() -> None:
     batch, core = _apis()
     runtime = _runtime(batch, core)
@@ -471,6 +511,9 @@ async def test_logs_read_only_controlled_task_container_and_capture_pod_identity
 
     core.read_namespaced_pod_log.return_value = chunks()
     handle = await runtime.prepare(spec)
+    cast(Any, handle.native).status = SimpleNamespace(
+        conditions=[SimpleNamespace(type="Complete", status="True", reason="")]
+    )
     ready = asyncio.Event()
 
     logs = [item async for item in runtime.logs(handle, ready=ready)]
@@ -496,11 +539,57 @@ async def test_adopted_logs_skip_the_durable_raw_byte_prefix() -> None:
 
     core.read_namespaced_pod_log.return_value = chunks()
     handle = await runtime.prepare(spec)
+    cast(Any, handle.native).status = SimpleNamespace(
+        conditions=[SimpleNamespace(type="Complete", status="True", reason="")]
+    )
     handle.observation.log_cursor_bytes = len(b"old-prefix-")
 
     logs = [item async for item in runtime.logs(handle, ready=asyncio.Event())]
 
     assert [(item.content, item.cursor_bytes) for item in logs] == [(b"new\n", 15)]
+
+
+async def test_logs_reconnect_after_early_eof_from_durable_cursor() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
+    spec = _spec()
+    handle = await runtime.prepare(spec)
+    running = _pod(cast(Any, handle.native))
+    core.list_namespaced_pod.return_value = SimpleNamespace(items=[running])
+
+    async def first_stream() -> AsyncIterator[bytes]:
+        yield b"first\n"
+
+    async def second_stream() -> AsyncIterator[bytes]:
+        yield b"first\n"
+        yield b"second\n"
+        cast(Any, handle.native).status = SimpleNamespace(
+            conditions=[SimpleNamespace(type="Complete", status="True", reason="")]
+        )
+
+    async def final_stream() -> AsyncIterator[bytes]:
+        if False:  # pragma: no cover - preserve the async-generator protocol
+            yield b""
+
+    core.read_namespaced_pod_log.side_effect = [
+        first_stream(),
+        second_stream(),
+        final_stream(),
+    ]
+    logs = runtime.logs(handle, ready=asyncio.Event()).__aiter__()
+
+    first = await anext(logs)
+    handle.observation.log_cursor_bytes = first.cursor_bytes or 0
+    second = await anext(logs)
+    with pytest.raises(StopAsyncIteration):
+        await anext(logs)
+
+    assert [(first.content, first.cursor_bytes), (second.content, second.cursor_bytes)] == [
+        (b"first\n", 6),
+        (b"second\n", 13),
+    ]
+    calls = core.read_namespaced_pod_log.call_args_list
+    assert [call.kwargs["follow"] for call in calls] == [True, True, False]
 
 
 async def test_logs_retry_terminal_streaming_400_with_non_follow_read() -> None:
@@ -517,6 +606,9 @@ async def test_logs_retry_terminal_streaming_400_with_non_follow_read() -> None:
     completed = _StreamingLogResponse(200, "OK", b"KIND_BATCH_SUCCESS\n")
     core.read_namespaced_pod_log.side_effect = [waiting, completed]
     handle = await runtime.prepare(spec)
+    cast(Any, handle.native).status = SimpleNamespace(
+        conditions=[SimpleNamespace(type="Complete", status="True", reason="")]
+    )
     ready = asyncio.Event()
 
     logs = [item async for item in runtime.logs(handle, ready=ready)]
@@ -541,8 +633,12 @@ async def test_logs_retry_pending_streaming_400_without_persisting_error_body() 
     )
     waiting = _StreamingLogResponse(400, "Bad Request", b"container is waiting\n")
     running = _StreamingLogResponse(200, "OK", b"KIND_BATCH_SUCCESS\n")
-    core.read_namespaced_pod_log.side_effect = [waiting, running]
+    final = _StreamingLogResponse(200, "OK")
+    core.read_namespaced_pod_log.side_effect = [waiting, running, final]
     handle = await runtime.prepare(spec)
+    cast(Any, handle.native).status = SimpleNamespace(
+        conditions=[SimpleNamespace(type="Complete", status="True", reason="")]
+    )
     ready = asyncio.Event()
 
     logs = [item async for item in runtime.logs(handle, ready=ready)]
@@ -551,8 +647,9 @@ async def test_logs_retry_pending_streaming_400_without_persisting_error_body() 
     assert [item.content for item in logs] == [b"KIND_BATCH_SUCCESS\n"]
     assert waiting.closed
     assert running.closed
+    assert final.closed
     calls = core.read_namespaced_pod_log.call_args_list
-    assert [call.kwargs["follow"] for call in calls] == [True, True]
+    assert [call.kwargs["follow"] for call in calls] == [True, True, False]
 
 
 async def test_logs_reject_unchecked_streaming_http_error() -> None:
@@ -946,3 +1043,4 @@ async def test_retry_execution_gets_distinct_job_name_and_handle_identity_is_fro
     assert first.labels[EXECUTION_ID_LABEL] != second.labels[EXECUTION_ID_LABEL]
     with pytest.raises(FrozenInstanceError):
         first.object_id = "mutated"  # type: ignore[misc]
+
