@@ -4,9 +4,10 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
+    <meta name="mini-ai-cloud-root-path" content="__MINI_AI_CLOUD_ROOT_PATH__">
     <title>Mini AI Cloud Workbench</title>
-    <link rel="stylesheet" href="/workbench/assets/workbench.css">
-    <script src="/workbench/assets/workbench.js" defer></script>
+    <link rel="stylesheet" href="__MINI_AI_CLOUD_ROOT_PATH__/workbench/assets/workbench.css">
+    <script src="__MINI_AI_CLOUD_ROOT_PATH__/workbench/assets/workbench.js" defer></script>
   </head>
   <body>
     <noscript>
@@ -24,7 +25,7 @@
         </p>
         <form id="connection-form" class="form-stack">
           <label>
-            <span>API origin (same origin)</span>
+            <span>API base (same origin)</span>
             <input id="api-base" name="api-base" type="url" required readonly aria-readonly="true">
             <small>Workbench connects only to the control plane serving this page.</small>
           </label>
@@ -42,8 +43,8 @@
         </form>
         <div id="connection-error" class="inline-error hidden" role="alert"></div>
         <div class="connection-links">
-          <a href="/docs">OpenAPI docs</a>
-          <a href="/livez">API liveness</a>
+          <a href="__MINI_AI_CLOUD_ROOT_PATH__/docs">OpenAPI docs</a>
+          <a href="__MINI_AI_CLOUD_ROOT_PATH__/livez">API liveness</a>
         </div>
       </section>
     </main>

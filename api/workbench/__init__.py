@@ -1,21 +1,24 @@
+from html import escape
 from pathlib import Path
 
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 WORKBENCH_DIR = Path(__file__).resolve().parent
 WORKBENCH_INDEX = WORKBENCH_DIR / "index.html"
 WORKBENCH_ASSETS = WORKBENCH_DIR / "assets"
+WORKBENCH_ROOT_TOKEN = "__MINI_AI_CLOUD_ROOT_PATH__"
+WORKBENCH_INDEX_HTML = WORKBENCH_INDEX.read_text(encoding="utf-8")
 
 
 def install_workbench(app: FastAPI) -> None:
     """Expose the dependency-free operator workbench without changing API routing."""
 
-    async def workbench_index() -> FileResponse:
-        return FileResponse(
-            WORKBENCH_INDEX,
-            media_type="text/html",
+    async def workbench_index(request: Request) -> HTMLResponse:
+        root_path = str(request.scope.get("root_path", "")).rstrip("/")
+        return HTMLResponse(
+            WORKBENCH_INDEX_HTML.replace(WORKBENCH_ROOT_TOKEN, escape(root_path, quote=True)),
             headers={
                 "Cache-Control": "no-store",
                 "Content-Security-Policy": (

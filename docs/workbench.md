@@ -18,7 +18,7 @@ Workbench 由 FastAPI 同源托管，不需要 Node、npm、CDN 或单独的前�
 
 ## 认证
 
-Workbench 只连接托管当前页面的同源 Mini AI Cloud API。连接页会显示并锁定当前 API origin，不支持填写远程 API Base URL。输入 Project API Key 后，Workbench 会调用：
+Workbench 只连接托管当前页面的同源 Mini AI Cloud API。连接页会显示并锁定当前部署 base（包含反向代理或 ASGI `root_path` 前缀），不支持填写远程 API Base URL。输入 Project API Key 后，Workbench 会调用：
 
 - `GET /api/v1/auth/whoami`
 - `GET /api/v1/projects/current`
@@ -34,7 +34,7 @@ Workbench 只连接托管当前页面的同源 Mini AI Cloud API。连接页会�
 - Usage 按 1h、24h、7d、30d 窗口展示 usage、serving usage、cost 和 Project quota。
 - System 显示控制面健康、应用版本，并提供 OpenAPI 和 Prometheus 入口。
 
-页面可见时，Overview、Services 和 Workers 默认约每 5 秒刷新；活跃 Task detail 约每 2.5 秒刷新。页面隐藏时会暂停轮询，新的刷新会取消尚未完成的旧请求。
+页面可见时，Overview、Services 和 Workers 默认约每 5 秒刷新；活跃 Task detail 约每 2.5 秒刷新。页面隐藏时会暂停轮询并取消尚未完成的读取请求，但不会中止已经发出的创建、取消、伸缩或停止操作。
 
 ## 安全边界
 

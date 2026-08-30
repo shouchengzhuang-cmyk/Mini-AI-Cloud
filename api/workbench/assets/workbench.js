@@ -23,7 +23,7 @@
   };
 
   const state = {
-    apiBase: window.location.origin,
+    apiBase: currentApiBase(),
     apiKey: "",
     connectionAttempt: 0,
     principal: null,
@@ -214,6 +214,7 @@
   }
 
   function normalizeApiBase(rawValue) {
+    const expectedBase = currentApiBase();
     const url = new URL(rawValue, window.location.origin);
     if (!["http:", "https:"].includes(url.protocol)) {
       throw new Error("API Base URL must use http or https.");
@@ -224,7 +225,24 @@
     if (url.origin !== window.location.origin) {
       throw new Error("Workbench API origin must match the page origin.");
     }
-    return window.location.origin;
+    const normalizedBase = `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
+    if (normalizedBase !== expectedBase || url.search || url.hash) {
+      throw new Error("Workbench API base must match the page deployment base.");
+    }
+    return expectedBase;
+  }
+
+  function deploymentRootPath() {
+    const meta = document.querySelector('meta[name="mini-ai-cloud-root-path"]');
+    const rootPath = meta ? meta.content.trim().replace(/\/+$/, "") : "";
+    if (rootPath && !rootPath.startsWith("/")) {
+      throw new Error("Workbench deployment root must be an absolute path.");
+    }
+    return rootPath;
+  }
+
+  function currentApiBase() {
+    return `${window.location.origin}${deploymentRootPath()}`;
   }
 
   function createIdempotencyKey() {
@@ -667,7 +685,7 @@
     closeDrawer();
     query("#connection-view").classList.remove("hidden");
     query("#app-view").classList.add("hidden");
-    query("#api-base").value = window.location.origin;
+    query("#api-base").value = currentApiBase();
     query("#api-key").value = "";
     query("#connection-error").classList.add("hidden");
   }
@@ -1938,7 +1956,7 @@
   }
 
   function systemLink(label, path, description) {
-    const href = new URL(path, `${state.apiBase}/`).href;
+    const href = `${state.apiBase}${path}`;
     return node("a", { className: "resource-row", href, target: "_blank", rel: "noreferrer" }, [
       node("div", {}, [node("strong", { text: label }), node("small", { text: description })]),
       node("span", { text: "Open" }),
@@ -2024,10 +2042,10 @@
   async function initialize() {
     bindEvents();
     const savedKey = sessionGet(SESSION_API_KEY);
-    query("#api-base").value = window.location.origin;
+    query("#api-base").value = currentApiBase();
     if (!savedKey) return;
     try {
-      await connect(window.location.origin, savedKey);
+      await connect(currentApiBase(), savedKey);
     } catch (error) {
       if (error.name === "AbortError") return;
       sessionRemove(SESSION_API_KEY);

@@ -70,13 +70,32 @@ async def test_workbench_connection_is_locked_to_same_origin() -> None:
         index_response = await client.get("/workbench")
         js_response = await client.get("/workbench/assets/workbench.js")
 
-    assert "API origin (same origin)" in index_response.text
+    assert "API base (same origin)" in index_response.text
     assert re.search(r'<input[^>]+id="api-base"[^>]+readonly', index_response.text)
     assert "another API Base URL" not in index_response.text
     assert "url.origin !== window.location.origin" in js_response.text
-    assert "return window.location.origin;" in js_response.text
+    assert "function deploymentRootPath()" in js_response.text
+    assert 'meta[name="mini-ai-cloud-root-path"]' in js_response.text
+    assert "return `${window.location.origin}${deploymentRootPath()}`;" in js_response.text
     assert "mini_ai_cloud_workbench_base" not in js_response.text
     assert all(middleware.cls is not CORSMiddleware for middleware in app.user_middleware)
+
+
+async def test_workbench_preserves_the_asgi_root_path() -> None:
+    transport = ASGITransport(app=app, root_path="/mini-cloud")
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://testserver/mini-cloud/",
+    ) as client:
+        index_response = await client.get("workbench")
+        js_response = await client.get("workbench/assets/workbench.js")
+
+    assert index_response.status_code == 200
+    assert 'content="/mini-cloud"' in index_response.text
+    assert 'href="/mini-cloud/workbench/assets/workbench.css"' in index_response.text
+    assert 'src="/mini-cloud/workbench/assets/workbench.js"' in index_response.text
+    assert 'href="/mini-cloud/docs"' in index_response.text
+    assert js_response.status_code == 200
 
 
 async def test_workbench_connection_attempts_do_not_clear_newer_credentials() -> None:
