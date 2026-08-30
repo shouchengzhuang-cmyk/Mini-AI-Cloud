@@ -404,9 +404,7 @@ async def test_kubernetes_restart_handoff_preserves_creation_fence_and_blocks_zo
             lease_seconds=30,
             observations=[observation],
         )
-    assert [(item.task_id, item.execution_id) for item in recovered] == [
-        (task_id, execution_id)
-    ]
+    assert [(item.task_id, item.execution_id) for item in recovered] == [(task_id, execution_id)]
 
     async with database.session() as session, session.begin():
         assert not await TaskRepository.runtime_cleanup_owned(
@@ -433,9 +431,7 @@ async def test_kubernetes_restart_handoff_preserves_creation_fence_and_blocks_zo
         )
         execution = await session.get(TaskExecution, execution_id)
         reservation = await session.scalar(
-            select(ResourceReservation).where(
-                ResourceReservation.execution_id == execution_id
-            )
+            select(ResourceReservation).where(ResourceReservation.execution_id == execution_id)
         )
         task = await TaskRepository.get(session, task_id)
         assert execution is not None and reservation is not None and task is not None

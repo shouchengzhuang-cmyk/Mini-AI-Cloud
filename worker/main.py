@@ -274,8 +274,7 @@ class WorkerService:
                 observations=observations,
             )
         by_execution_id = {
-            uuid.UUID(handle.labels[EXECUTION_ID_LABEL]): handle
-            for handle in controller_handles
+            uuid.UUID(handle.labels[EXECUTION_ID_LABEL]): handle for handle in controller_handles
         }
         self.recovered_kubernetes_executions = [
             (item, by_execution_id[item.execution_id]) for item in matched
@@ -392,9 +391,7 @@ class WorkerService:
             execution_id=recovered.execution_id,
         )
         self.active[recovered.task_id] = execution
-        task = asyncio.create_task(
-            self._run_assignment(execution, recovered_handle=handle)
-        )
+        task = asyncio.create_task(self._run_assignment(execution, recovered_handle=handle))
         self.inflight.add(task)
         task.add_done_callback(self._assignment_done)
         self.logger.info(

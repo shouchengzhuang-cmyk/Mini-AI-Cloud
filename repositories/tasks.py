@@ -238,12 +238,8 @@ class TaskRepository:
             try:
                 task_id = uuid.UUID(observed["task_id"] or "")
                 execution_id = uuid.UUID(observed["execution_id"] or "")
-                runtime_worker_session_id = uuid.UUID(
-                    observed["worker_session_id"] or ""
-                )
-                controller_session_id = uuid.UUID(
-                    observed["controller_session_id"] or ""
-                )
+                runtime_worker_session_id = uuid.UUID(observed["worker_session_id"] or "")
+                controller_session_id = uuid.UUID(observed["controller_session_id"] or "")
             except (TypeError, ValueError):
                 continue
             if controller_session_id != new_worker_session_id:
@@ -1155,9 +1151,7 @@ class TaskRepository:
             "runtime_resource_name": resource_name,
             "runtime_resource_uid": resource_uid,
             "runtime_worker_session_id": (
-                str(runtime_worker_session_id)
-                if runtime_worker_session_id is not None
-                else None
+                str(runtime_worker_session_id) if runtime_worker_session_id is not None else None
             ),
             "observed_pod_name": observed_pod_name,
             "observed_pod_uid": observed_pod_uid,
@@ -1195,9 +1189,7 @@ class TaskRepository:
         worker = await session.get(Worker, worker_id)
         execution = await session.get(TaskExecution, execution_id)
         reservation = await session.scalar(
-            select(ResourceReservation).where(
-                ResourceReservation.execution_id == execution_id
-            )
+            select(ResourceReservation).where(ResourceReservation.execution_id == execution_id)
         )
         if (
             worker is None

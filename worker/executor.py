@@ -438,17 +438,10 @@ class TaskExecutor:
     ) -> None:
         if handle.runtime_type != "kubernetes":
             return
-        if (
-            self.worker_session_id is None
-            or handle.controller_session_id != self.worker_session_id
-        ):
-            raise StaleExecutionError(
-                "Kubernetes Job handle controller session is stale"
-            )
+        if self.worker_session_id is None or handle.controller_session_id != self.worker_session_id:
+            raise StaleExecutionError("Kubernetes Job handle controller session is stale")
         try:
-            runtime_worker_session_id = uuid.UUID(
-                handle.labels["mini-ai-cloud/worker-session-id"]
-            )
+            runtime_worker_session_id = uuid.UUID(handle.labels["mini-ai-cloud/worker-session-id"])
         except (KeyError, ValueError) as exc:
             raise RuntimeError(
                 "Kubernetes Job handle has an invalid creation worker session"
