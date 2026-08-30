@@ -26,6 +26,7 @@ from scripts.kind_batch_e2e import (
     _assert_job_contract,
     _assert_pod_contract,
     _authenticate,
+    _cleanup_tasks,
     _configure_image_policy,
     _observe_runtime_contract,
     _raise_outcome,
@@ -438,6 +439,42 @@ def test_redaction_removes_every_secret_and_cleanup_failure_wins() -> None:
     assert redacted == "[REDACTED] [REDACTED] [REDACTED]"
     with pytest.raises(KindBatchE2EError, match="cleanup failed"):
         _raise_outcome(RuntimeError("scenario failed"), ["delete failed"])
+
+
+@pytest.mark.asyncio
+async def test_cleanup_waits_for_worker_owned_uid_fenced_deletion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = SequenceAPI([{"status": "cancelled"}])
+    waited: list[tuple[str, float]] = []
+
+    class WorkerOwnedKubectl:
+        sensitive_values: tuple[str, ...] = ()
+
+        def delete_exact(self, kind: str, resource: dict[str, Any]) -> None:
+            del kind, resource
+            raise AssertionError("the harness must not race the Worker's UID-fenced delete")
+
+    async def runtime_absent(
+        kube: object,
+        task_id: str,
+        *,
+        timeout_seconds: float,
+    ) -> None:
+        assert isinstance(kube, WorkerOwnedKubectl)
+        waited.append((task_id, timeout_seconds))
+
+    monkeypatch.setattr("scripts.kind_batch_e2e._wait_runtime_absent", runtime_absent)
+
+    errors = await _cleanup_tasks(
+        cast(API, api),
+        cast(Any, WorkerOwnedKubectl()),
+        [TASK_ID],
+    )
+
+    assert errors == []
+    assert waited == [(TASK_ID, 30)]
+    assert api.calls == [("GET", f"/api/v1/tasks/{TASK_ID}")]
 
 
 def test_cli_reports_not_run_without_required_environment(

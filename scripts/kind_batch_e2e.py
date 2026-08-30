@@ -751,10 +751,9 @@ async def _cleanup_tasks(
             errors.append(f"task {task_id} terminal cleanup: {type(exc).__name__}: {exc}")
 
         try:
-            for job in kube.jobs_for_task(task_id):
-                kube.delete_exact("job", job)
-            for policy in kube.network_policies_for_task(task_id):
-                kube.delete_exact("networkpolicy", policy)
+            # The Worker owns runtime deletion and applies the execution/UID fences.
+            # A terminal task can become visible just before that deletion completes,
+            # so wait for the owned cleanup instead of racing it with a second delete.
             await _wait_runtime_absent(kube, task_id, timeout_seconds=30)
         except Exception as exc:
             errors.append(f"task {task_id} Kubernetes cleanup: {type(exc).__name__}: {exc}")
