@@ -909,7 +909,7 @@ class KindAdaptationHarness:
                 "--namespace",
                 "k8s.io",
                 "images",
-                "check",
+                "inspect",
                 self.app_image,
             ),
         )
@@ -944,7 +944,7 @@ class KindAdaptationHarness:
                     "--namespace",
                     "k8s.io",
                     "images",
-                    "check",
+                    "inspect",
                     alias.digest_reference,
                 ),
             )
