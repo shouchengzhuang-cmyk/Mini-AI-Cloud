@@ -159,7 +159,7 @@ def test_controller_restart_targets_chart_control_plane(
 
 
 @pytest.mark.asyncio
-async def test_image_policy_and_bad_image_share_explicit_tag() -> None:
+async def test_image_policy_pins_app_digest_and_bad_image_tag() -> None:
     calls: list[dict[str, object]] = []
 
     class PolicyAPI:
@@ -170,6 +170,7 @@ async def test_image_policy_and_bad_image_share_explicit_tag() -> None:
     await _configure_kind_image_policy(
         cast(API, PolicyAPI()),
         "project-1234",
+        image=f"docker.io/library/mini-ai-cloud:m7-p4-1234@sha256:{'a' * 64}",
         repository="library/mini-ai-cloud",
         tag="m7-p4-1234",
     )
@@ -179,7 +180,8 @@ async def test_image_policy_and_bad_image_share_explicit_tag() -> None:
     rules = payload["rules"]
     assert isinstance(rules, list)
     assert rules[0]["repository_glob"] == "library/mini-ai-cloud"
-    assert rules[0]["tag_glob"] == "m7-p4-1234"
+    assert rules[0]["digest"] == f"sha256:{'a' * 64}"
+    assert "tag_glob" not in rules[0]
     assert rules[1]["tag_glob"] == "m7-p4-1234"
     assert _bad_image_reference("m7-p4-1234") == ("invalid.local/mini-ai-cloud/missing:m7-p4-1234")
 

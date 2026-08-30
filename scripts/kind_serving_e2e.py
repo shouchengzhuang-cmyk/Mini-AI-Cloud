@@ -17,6 +17,8 @@ from typing import Any
 
 import httpx
 
+from core.image_policy import ImageReferenceError, canonicalize_image_reference
+
 MANAGED_LABEL = "mini-ai-cloud/managed"
 RESOURCE_KIND_LABEL = "mini-ai-cloud/resource-kind"
 SERVICE_ID_LABEL = "mini-ai-cloud/service-id"
@@ -284,6 +286,7 @@ async def run_e2e_from_environment() -> None:
         await _configure_kind_image_policy(
             api,
             project_id,
+            image=environment.image,
             repository=environment.image_policy_repository,
             tag=environment.image_policy_tag,
         )
@@ -350,9 +353,26 @@ async def _configure_kind_image_policy(
     api: API,
     project_id: str,
     *,
+    image: str,
     repository: str,
     tag: str,
 ) -> None:
+    try:
+        reference = canonicalize_image_reference(image)
+    except ImageReferenceError as exc:
+        raise KindServingE2EError("Kind serving image reference is invalid") from exc
+    if reference.repository != repository:
+        raise KindServingE2EError("Kind serving image repository does not match its policy")
+    application_rule: dict[str, object] = {
+        "action": "allow",
+        "registry": reference.registry,
+        "repository_glob": reference.repository,
+        "priority": 10,
+    }
+    if reference.digest is not None:
+        application_rule["digest"] = reference.digest
+    else:
+        application_rule["tag_glob"] = tag
     await api.json(
         "PUT",
         f"/api/v1/projects/{project_id}/image-policy",
@@ -360,13 +380,7 @@ async def _configure_kind_image_policy(
             "default_action": "deny",
             "require_digest": False,
             "rules": [
-                {
-                    "action": "allow",
-                    "registry": "docker.io",
-                    "repository_glob": repository,
-                    "tag_glob": tag,
-                    "priority": 10,
-                },
+                application_rule,
                 {
                     "action": "allow",
                     "registry": "invalid.local",
