@@ -77,6 +77,16 @@ async def test_workbench_connection_is_locked_to_same_origin() -> None:
     assert all(middleware.cls is not CORSMiddleware for middleware in app.user_middleware)
 
 
+async def test_workbench_api_key_is_not_a_native_form_control() -> None:
+    async with _client() as client:
+        index_response = await client.get("/workbench")
+        js_response = await client.get("/workbench/assets/workbench.js")
+
+    assert 'id="api-key"' in index_response.text
+    assert 'name="api-key"' not in index_response.text
+    assert 'const apiKeyInput = query("#api-key");' in js_response.text
+
+
 async def test_workbench_service_runtime_controls_restore_a_valid_pair() -> None:
     async with _client() as client:
         index_response = await client.get("/workbench")
