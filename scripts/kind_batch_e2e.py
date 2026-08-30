@@ -661,9 +661,21 @@ async def _wait_task_status(
         if last_status in expected_statuses:
             return task
         if last_status in FINAL_STATUSES:
+            failure = {
+                key: task.get(key)
+                for key in (
+                    "exit_code",
+                    "error_category",
+                    "error_code",
+                    "error_message",
+                    "failure_category",
+                )
+                if task.get(key) is not None
+            }
             raise KindBatchE2EError(
                 f"task {task_id} reached terminal status {last_status!r}, "
-                f"expected {sorted(expected_statuses)}"
+                f"expected {sorted(expected_statuses)}; "
+                f"failure={json.dumps(failure, sort_keys=True, separators=(',', ':'))}"
             )
         await asyncio.sleep(poll_interval)
     raise KindBatchE2EError(

@@ -314,9 +314,20 @@ async def test_wait_task_status_polls_until_expected_terminal_state() -> None:
 
 @pytest.mark.asyncio
 async def test_wait_task_status_fails_closed_on_wrong_terminal_state() -> None:
-    api = SequenceAPI([{"status": "failed"}])
+    api = SequenceAPI(
+        [
+            {
+                "status": "failed",
+                "exit_code": 137,
+                "error_category": "RESOURCE_ERROR",
+                "error_code": "OOM_KILLED",
+                "error_message": "container exhausted its memory limit",
+                "failure_category": "runtime",
+            }
+        ]
+    )
 
-    with pytest.raises(KindBatchE2EError, match="terminal status 'failed'"):
+    with pytest.raises(KindBatchE2EError) as error:
         await _wait_task_status(
             api,
             TASK_ID,
@@ -324,6 +335,14 @@ async def test_wait_task_status_fails_closed_on_wrong_terminal_state() -> None:
             timeout_seconds=1,
             poll_interval=0,
         )
+
+    message = str(error.value)
+    assert "terminal status 'failed'" in message
+    assert '"exit_code":137' in message
+    assert '"error_category":"RESOURCE_ERROR"' in message
+    assert '"error_code":"OOM_KILLED"' in message
+    assert '"error_message":"container exhausted its memory limit"' in message
+    assert '"failure_category":"runtime"' in message
 
 
 @pytest.mark.asyncio
