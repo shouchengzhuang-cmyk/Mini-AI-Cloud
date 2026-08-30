@@ -31,6 +31,8 @@ docker compose ps
 curl -fsS http://localhost:8000/readyz
 ```
 
+浏览器打开 `http://localhost:8000/workbench`，输入 Project API Key，即可查看任务、模型服务、Worker、配额与最近用量。Workbench 是供开发和运维体验使用的同源轻量控制台，不是 production-grade 多租户管理后台。详细说明见 [Web Workbench](docs/workbench.md)。
+
 成功时 `/readyz` 返回 PostgreSQL、Redis 与控制面依赖状态。完成体验后保留数据卷地停止：
 
 ```bash

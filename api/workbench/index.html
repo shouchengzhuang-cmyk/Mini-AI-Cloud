@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="mini-ai-cloud-root-path" content="__MINI_AI_CLOUD_ROOT_PATH__">
+    <title>Mini AI Cloud Workbench</title>
+    <link rel="stylesheet" href="__MINI_AI_CLOUD_ROOT_PATH__/workbench/assets/workbench.css">
+    <script src="__MINI_AI_CLOUD_ROOT_PATH__/workbench/assets/workbench.js" defer></script>
+  </head>
+  <body>
+    <noscript>
+      <div class="fatal-message">Mini AI Cloud Workbench requires JavaScript.</div>
+    </noscript>
+
+    <main id="connection-view" class="connection-shell">
+      <section class="connection-panel" aria-labelledby="connection-title">
+        <div class="brand-mark" aria-hidden="true">MC</div>
+        <p class="eyebrow">Mini AI Cloud</p>
+        <h1 id="connection-title">Connect to the control plane</h1>
+        <p class="muted">
+          Your API key is kept in session storage for this browser tab. It is never placed in a
+          URL or local storage.
+        </p>
+        <form id="connection-form" class="form-stack">
+          <label>
+            <span>API base (same origin)</span>
+            <input id="api-base" name="api-base" type="url" required readonly aria-readonly="true">
+            <small>Workbench connects only to the control plane serving this page.</small>
+          </label>
+          <label>
+            <span>Project API Key</span>
+            <input
+              id="api-key"
+              type="password"
+              required
+              autocomplete="off"
+              spellcheck="false"
+            >
+          </label>
+          <button class="button primary" type="submit">Connect</button>
+        </form>
+        <div id="connection-error" class="inline-error hidden" role="alert"></div>
+        <div class="connection-links">
+          <a href="__MINI_AI_CLOUD_ROOT_PATH__/docs">OpenAPI docs</a>
+          <a href="__MINI_AI_CLOUD_ROOT_PATH__/livez">API liveness</a>
+        </div>
+      </section>
+    </main>
+
+    <div id="app-view" class="app-shell hidden">
+      <aside class="sidebar">
+        <div class="sidebar-brand">
+          <div class="brand-mark small" aria-hidden="true">MC</div>
+          <div>
+            <strong>Mini AI Cloud</strong>
+            <span>Workbench</span>
+          </div>
+        </div>
+        <nav id="primary-nav" aria-label="Workbench sections">
+          <button class="nav-item active" data-page="overview" type="button">Overview</button>
+          <button class="nav-item" data-page="tasks" type="button">Tasks</button>
+          <button class="nav-item" data-page="services" type="button">Services</button>
+          <button class="nav-item" data-page="workers" type="button">Workers</button>
+          <button class="nav-item" data-page="usage" type="button">Usage</button>
+          <button class="nav-item" data-page="system" type="button">System</button>
+        </nav>
+        <div class="sidebar-footer">
+          <div class="caption">Inventory & reservation state</div>
+          <button id="disconnect-button" class="button ghost full" type="button">
+            Disconnect / Forget
+          </button>
+        </div>
+      </aside>
+
+      <div class="workspace">
+        <header class="topbar">
+          <div>
+            <p id="page-eyebrow" class="eyebrow">Control plane</p>
+            <h1 id="page-title">Overview</h1>
+          </div>
+          <div class="topbar-context">
+            <div class="context-item">
+              <span>Project</span>
+              <strong id="current-project">—</strong>
+            </div>
+            <div class="context-item">
+              <span>API</span>
+              <strong id="api-state" class="status-badge neutral">Checking</strong>
+            </div>
+          </div>
+        </header>
+
+        <div id="global-error" class="global-message hidden" role="alert"></div>
+
+        <div class="refresh-strip">
+          <span id="last-updated">Last updated: —</span>
+          <label class="toggle-label">
+            <input id="auto-refresh" type="checkbox" checked>
+            <span>Auto refresh</span>
+          </label>
+          <button id="refresh-button" class="button compact" type="button">Refresh now</button>
+        </div>
+
+        <main class="page-stack">
+          <section id="page-overview" class="page active" aria-labelledby="page-title">
+            <div id="overview-health" class="card-grid health-grid loading-block"></div>
+            <section class="section-block">
+              <div class="section-heading">
+                <div>
+                  <p class="eyebrow">At a glance</p>
+                  <h2>Platform activity</h2>
+                </div>
+              </div>
+              <div id="overview-summary" class="card-grid summary-grid loading-block"></div>
+            </section>
+            <section class="section-block two-column">
+              <article class="panel">
+                <div class="panel-heading">
+                  <div>
+                    <p class="eyebrow">Recent work</p>
+                    <h2>Tasks</h2>
+                  </div>
+                  <button class="button compact" data-action="open-run-task" type="button">
+                    Run task
+                  </button>
+                </div>
+                <div id="overview-tasks"></div>
+              </article>
+              <article class="panel">
+                <div class="panel-heading">
+                  <div>
+                    <p class="eyebrow">Serving</p>
+                    <h2>Model services</h2>
+                  </div>
+                  <button class="button compact" data-action="open-deploy-service" type="button">
+                    Deploy
+                  </button>
+                </div>
+                <div id="overview-services"></div>
+              </article>
+            </section>
+          </section>
+
+          <section id="page-tasks" class="page" aria-labelledby="page-title">
+            <div class="toolbar panel">
+              <label class="inline-field">
+                <span>Status</span>
+                <select id="task-status-filter">
+                  <option value="">All statuses</option>
+                  <option value="pending">Pending</option>
+                  <option value="queued">Queued</option>
+                  <option value="scheduling">Scheduling</option>
+                  <option value="assigned">Assigned</option>
+                  <option value="preparing">Preparing</option>
+                  <option value="pulling">Pulling</option>
+                  <option value="starting">Starting</option>
+                  <option value="running">Running</option>
+                  <option value="retrying">Retrying</option>
+                  <option value="succeeded">Succeeded</option>
+                  <option value="failed">Failed</option>
+                  <option value="cancelled">Cancelled</option>
+                  <option value="timed_out">Timed out</option>
+                </select>
+              </label>
+              <button class="button primary" data-action="open-run-task" type="button">
+                Run task
+              </button>
+            </div>
+            <div id="tasks-content" class="panel loading-block"></div>
+          </section>
+
+          <section id="page-services" class="page" aria-labelledby="page-title">
+            <div class="toolbar panel">
+              <p class="muted">Desired state, reconciled replicas, and admission results.</p>
+              <button class="button primary" data-action="open-deploy-service" type="button">
+                Deploy service
+              </button>
+            </div>
+            <div id="services-content" class="panel loading-block"></div>
+          </section>
+
+          <section id="page-workers" class="page" aria-labelledby="page-title">
+            <article class="notice">
+              Capacity bars show Mini AI Cloud inventory and reservations. They are not live
+              hardware telemetry.
+            </article>
+            <div id="workers-content" class="panel loading-block"></div>
+          </section>
+
+          <section id="page-usage" class="page" aria-labelledby="page-title">
+            <div class="toolbar panel">
+              <label class="inline-field">
+                <span>Window</span>
+                <select id="usage-window">
+                  <option value="1">Last 1 hour</option>
+                  <option value="24" selected>Last 24 hours</option>
+                  <option value="168">Last 7 days</option>
+                  <option value="720">Last 30 days</option>
+                </select>
+              </label>
+            </div>
+            <div id="usage-content" class="content-stack loading-block"></div>
+          </section>
+
+          <section id="page-system" class="page" aria-labelledby="page-title">
+            <div id="system-content" class="content-stack loading-block"></div>
+          </section>
+        </main>
+      </div>
+    </div>
+
+    <aside id="detail-drawer" class="detail-drawer" aria-label="Resource detail" aria-hidden="true">
+      <header class="drawer-header">
+        <div>
+          <p id="drawer-eyebrow" class="eyebrow">Detail</p>
+          <h2 id="drawer-title">Resource</h2>
+        </div>
+        <button id="drawer-close" class="icon-button" type="button" aria-label="Close detail">×</button>
+      </header>
+      <div id="drawer-content" class="drawer-content"></div>
+    </aside>
+    <div id="drawer-backdrop" class="drawer-backdrop hidden"></div>
+
+    <dialog id="run-task-dialog" class="modal">
+      <form id="run-task-form" method="dialog">
+        <div class="modal-heading">
+          <div>
+            <p class="eyebrow">Quick run</p>
+            <h2>Run a task</h2>
+          </div>
+          <button class="icon-button" type="button" data-dialog-close aria-label="Close">×</button>
+        </div>
+        <div class="form-grid">
+          <label class="span-2"><span>Image</span><input name="image" required value="python:3.12-slim"></label>
+          <label class="span-2">
+            <span>Command</span>
+            <textarea name="command" required rows="3">python -c "print('hello from Mini AI Cloud')"</textarea>
+            <small>Shell-style arguments; the command is sent as an argument array.</small>
+          </label>
+          <label><span>Runtime type</span><select name="runtime_type"><option>docker</option><option>kubernetes</option><option>fake</option></select></label>
+          <label><span>CPU cores</span><input name="cpu_limit" type="number" min="0.01" max="1024" step="0.01" value="0.25" required></label>
+          <label><span>Memory MB</span><input name="memory_limit_mb" type="number" min="16" value="128" required></label>
+          <label><span>Accelerators</span><input name="accelerator_count" type="number" min="0" max="64" value="0" required></label>
+          <label><span>Timeout seconds</span><input name="timeout_seconds" type="number" min="1" max="86400" value="300"></label>
+          <label class="check-field"><input name="network_enabled" type="checkbox"><span>Network enabled</span></label>
+        </div>
+        <details class="advanced-fields">
+          <summary>Advanced scheduling</summary>
+          <div class="form-grid">
+            <label><span>Priority</span><input name="priority" type="number" min="0" max="100" value="50"></label>
+            <label><span>Max retries</span><input name="max_retries" type="number" min="0" max="100" value="0"></label>
+            <label class="check-field"><input name="preemptible" type="checkbox"><span>Preemptible</span></label>
+            <label>
+              <span>Vendor</span>
+              <select name="accelerator_vendor">
+                <option value="nvidia">NVIDIA</option>
+                <option value="huawei-ascend">Huawei Ascend</option>
+              </select>
+            </label>
+            <label><span>Model constraint</span><input name="accelerator_model" placeholder="e.g. A100"></label>
+            <label><span>Memory / device MB</span><input name="accelerator_memory" type="number" min="0" value="0"></label>
+            <label><span>Runtime profile</span><input name="runtime_profile" placeholder="Optional profile ID"></label>
+            <label><span>Capabilities</span><input name="capabilities" placeholder="bf16, hbm"></label>
+          </div>
+        </details>
+        <div id="run-task-error" class="inline-error hidden" role="alert"></div>
+        <div class="modal-actions">
+          <button class="button ghost" type="button" data-dialog-close>Cancel</button>
+          <button class="button primary" id="run-task-submit" type="submit">Run task</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="deploy-service-dialog" class="modal">
+      <form id="deploy-service-form" method="dialog">
+        <div class="modal-heading">
+          <div>
+            <p class="eyebrow">Quick deploy</p>
+            <h2>Deploy a model service</h2>
+          </div>
+          <button class="icon-button" type="button" data-dialog-close aria-label="Close">×</button>
+        </div>
+        <div class="form-grid">
+          <label><span>Name</span><input name="name" required placeholder="demo-model"></label>
+          <label><span>Model</span><input name="model" placeholder="org/model or use Logical model ID"></label>
+          <label><span>Serving runtime</span><select name="runtime"><option value="vllm">vLLM</option><option value="fake">Fake</option></select></label>
+          <label><span>Runtime type</span><select name="runtime_type"><option value="docker">docker</option><option value="kubernetes">kubernetes</option><option value="fake" disabled>fake</option></select></label>
+          <label><span>Replicas</span><input name="replicas" type="number" min="0" max="1000" value="1" required></label>
+          <label><span>CPU millicores</span><input name="cpu_millicores" type="number" min="1" value="1000" required></label>
+          <label><span>Memory MB</span><input name="memory_mb" type="number" min="16" value="1024" required></label>
+          <label><span>Accelerators</span><input name="accelerator_count" type="number" min="0" max="64" value="0" required></label>
+          <label>
+            <span>Tensor parallel size</span>
+            <input name="tensor_parallel_size" type="number" min="1" max="64" value="1" required readonly aria-readonly="true">
+            <small>Automatically matches the accelerator count, with a minimum of 1.</small>
+          </label>
+          <label><span>dtype</span><select name="dtype"><option>auto</option><option>half</option><option>float16</option><option>bfloat16</option><option>float32</option></select></label>
+          <label><span>GPU memory utilization</span><input name="gpu_memory_utilization" type="number" min="0.01" max="1" step="0.01" value="0.9" required></label>
+          <label><span>Max model length</span><input name="max_model_len" type="number" min="1" placeholder="Runtime default"></label>
+        </div>
+        <details class="advanced-fields">
+          <summary>Advanced admission</summary>
+          <div class="form-grid">
+            <label><span>Image override</span><input name="image" placeholder="Optional immutable image"></label>
+            <label><span>Model revision</span><input name="model_revision" placeholder="Optional revision"></label>
+            <label>
+              <span>Vendor</span>
+              <select name="accelerator_vendor"><option value="nvidia">NVIDIA</option><option value="huawei-ascend">Huawei Ascend</option></select>
+            </label>
+            <label><span>Accelerator model</span><input name="accelerator_model" placeholder="Optional"></label>
+            <label><span>Memory / device MB</span><input name="accelerator_memory" type="number" min="0" value="0"></label>
+            <label><span>Runtime profile</span><input name="runtime_profile" placeholder="Optional profile ID"></label>
+            <label><span>Logical model ID</span><input name="logical_model_id" placeholder="Required for Kubernetes vLLM"></label>
+            <label><span>Model variant ID</span><input name="model_variant_id" placeholder="Optional UUID"></label>
+          </div>
+        </details>
+        <div id="deploy-service-error" class="inline-error hidden" role="alert"></div>
+        <div class="modal-actions">
+          <button class="button ghost" type="button" data-dialog-close>Cancel</button>
+          <button class="button primary" id="deploy-service-submit" type="submit">Deploy service</button>
+        </div>
+      </form>
+    </dialog>
+  </body>
+</html>
