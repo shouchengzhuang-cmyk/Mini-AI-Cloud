@@ -20,6 +20,7 @@ from scripts.kind_kubernetes_adaptation import (
     KindEvidenceError,
     PhaseFailure,
     ToolPaths,
+    _is_kubectl_denial,
     application_containerd_aliases,
     application_reference,
     build_upgrade_sentinels,
@@ -223,6 +224,74 @@ def test_pod_security_rejects_token_mount_hostpath_and_privilege() -> None:
     bad_privilege["spec"]["containers"][0]["securityContext"]["privileged"] = True
     with pytest.raises(KindEvidenceError, match="security contract"):
         validate_pod_security({"items": [bad_privilege]}, workload_namespace="workload")
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "expected"),
+    [(1, "no\n", True), (0, "yes\n", False), (2, "", False)],
+)
+def test_kubectl_denial_requires_exit_one_and_no(
+    returncode: int,
+    stdout: str,
+    expected: bool,
+) -> None:
+    outcome = CommandOutcome(
+        command_id="cmd-0001",
+        claim_id="security-contract",
+        label="deny-outside-allowlist",
+        returncode=returncode,
+        started_at="2026-08-30T00:00:00Z",
+        ended_at="2026-08-30T00:00:01Z",
+        stdout=stdout,
+        stderr="",
+    )
+
+    assert _is_kubectl_denial(outcome) is expected
+
+
+@pytest.mark.parametrize(("returncode", "accepted"), [(1, True), (0, False), (2, False)])
+def test_record_accepts_only_the_explicit_denial_returncode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    returncode: int,
+    accepted: bool,
+) -> None:
+    harness = KindAdaptationHarness(_config(tmp_path), identity=_identity())
+    outcome = CommandOutcome(
+        command_id="cmd-0001",
+        claim_id="security-contract",
+        label="deny-outside-allowlist",
+        returncode=returncode,
+        started_at="2026-08-30T00:00:00Z",
+        ended_at="2026-08-30T00:00:01Z",
+        stdout="no\n" if returncode == 1 else "",
+        stderr="",
+    )
+    monkeypatch.setattr(harness.recorder, "record", lambda *args, **kwargs: outcome)
+    outcomes: list[CommandOutcome] = []
+    try:
+        if accepted:
+            assert (
+                harness._record(
+                    outcomes,
+                    "security-contract",
+                    "deny-outside-allowlist",
+                    ("kubectl", "auth", "can-i"),
+                    expected_returncodes=(1,),
+                )
+                is outcome
+            )
+        else:
+            with pytest.raises(PhaseFailure, match=f"exit code {returncode}"):
+                harness._record(
+                    outcomes,
+                    "security-contract",
+                    "deny-outside-allowlist",
+                    ("kubectl", "auth", "can-i"),
+                    expected_returncodes=(1,),
+                )
+    finally:
+        assert harness._remove_temporary_state() is None
 
 
 def test_helm_values_bind_unique_scopes_digest_and_typed_test_flags(tmp_path: Path) -> None:

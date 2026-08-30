@@ -439,6 +439,10 @@ def _items(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     return [item for item in raw if isinstance(item, dict)]
 
 
+def _is_kubectl_denial(outcome: CommandOutcome) -> bool:
+    return outcome.returncode == 1 and outcome.stdout.strip() == "no"
+
+
 class KindAdaptationHarness:
     def __init__(
         self,
@@ -658,7 +662,10 @@ class KindAdaptationHarness:
         input_text: str | None = None,
         environment: Mapping[str, str] | None = None,
         timeout_seconds: float = 900,
+        expected_returncodes: Sequence[int] = (0,),
     ) -> CommandOutcome:
+        if not expected_returncodes:
+            raise ValueError("expected_returncodes must not be empty")
         outcome = self.recorder.record(
             label,
             argv,
@@ -668,10 +675,11 @@ class KindAdaptationHarness:
             timeout_seconds=timeout_seconds,
         )
         outcomes.append(outcome)
-        if outcome.returncode != 0:
+        if outcome.returncode not in expected_returncodes:
+            expected = ", ".join(str(code) for code in expected_returncodes)
             raise PhaseFailure(
                 f"{label} failed with exit code {outcome.returncode}; "
-                "inspect redacted evidence logs",
+                f"expected one of [{expected}]; inspect redacted evidence logs",
                 outcomes.copy(),
             )
         return outcome
@@ -1345,8 +1353,9 @@ class KindAdaptationHarness:
                     "--as",
                     f"system:serviceaccount:{self.identity.system_namespace}:{service_account}",
                 ),
+                expected_returncodes=(1,),
             )
-            if denial.stdout.strip() != "no":
+            if not _is_kubectl_denial(denial):
                 raise PhaseFailure("namespaced RBAC crossed the allowlist boundary", outcomes)
         return outcomes
 
@@ -1751,7 +1760,7 @@ class KindAdaptationHarness:
                     "--namespace",
                     namespace,
                     "get",
-                    "pod,service,deployment,job,configmap,serviceaccount,role,rolebinding",
+                    "pod,service,deployment,statefulset,job,configmap,serviceaccount,role,rolebinding",
                     "-o",
                     "json",
                 ),

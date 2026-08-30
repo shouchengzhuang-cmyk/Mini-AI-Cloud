@@ -224,7 +224,7 @@ def _assert_runtime_profiles(documents: list[dict[str, Any]]) -> None:
 
     expected_paths = {f"runtime_profiles/{name}" for name in source_files}
     for document in documents:
-        if document.get("kind") != "Deployment":
+        if document.get("kind") not in {"Deployment", "StatefulSet"}:
             continue
         pod_spec = document["spec"]["template"]["spec"]
         volume = next(item for item in pod_spec["volumes"] if item["name"] == "runtime-profiles")
