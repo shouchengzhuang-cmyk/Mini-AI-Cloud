@@ -143,7 +143,10 @@ class TaskExecutor:
         secret_values: tuple[str, ...] = ()
         runtime_environment: dict[str, str] = {}
         prepared_artifacts: PreparedArtifactWorkspace | None = None
+        runtime_handle_durable = recovered_handle is not None
         deadline = 0.0
+        if runtime_handle_durable:
+            execution.runtime_handle_durable.set()
         try:
             task = await self._mark_pulling(execution)
             resolved_secrets = await self._resolve_secrets(task, execution)
@@ -199,7 +202,12 @@ class TaskExecutor:
                 )
             assert handle is not None
             await self._record_runtime_handle(execution, handle)
+            if handle.runtime_type == "kubernetes":
+                runtime_handle_durable = True
+                execution.runtime_handle_durable.set()
             pre_start_stop = await self._pre_start_stop_reason(execution)
+            if pre_start_stop == "relinquish":
+                return ExecutionResult(accepted=False, status=None)
             if pre_start_stop == "ownership_lost":
                 return ExecutionResult(accepted=False, status=None)
             if pre_start_stop == "cancelled":
@@ -240,9 +248,13 @@ class TaskExecutor:
                 "log_limit_exceeded",
             }:
                 await self._stop_owned(handle, execution)
-            if outcome.reason == "ownership_lost":
+            if outcome.reason in {"ownership_lost", "relinquish"}:
                 self.logger.warning(
-                    "container stopped after fencing token was revoked",
+                    (
+                        "runtime relinquished for worker restart"
+                        if outcome.reason == "relinquish"
+                        else "container stopped after fencing token was revoked"
+                    ),
                     task_id=str(execution.task_id),
                     worker_id=self.worker_id,
                 )
@@ -389,7 +401,25 @@ class TaskExecutor:
                 await asyncio.gather(log_task, return_exceptions=True)
             if handle is not None:
                 try:
-                    if await self._runtime_cleanup_owned(handle, execution):
+                    relinquishing = (
+                        handle.runtime_type == "kubernetes"
+                        and runtime_handle_durable
+                        and execution.relinquish_requested.is_set()
+                    )
+                    if relinquishing:
+                        self.logger.info(
+                            "durable Kubernetes Job preserved for replacement worker adoption",
+                            task_id=str(execution.task_id),
+                            execution_id=str(execution.execution_id),
+                            runtime_object_id=handle.object_id,
+                        )
+                    elif handle.runtime_type == "kubernetes" and not runtime_handle_durable:
+                        # A newly prepared Job is suspended until its handle is
+                        # durable. Exact Kubernetes UID/session/spec fences make
+                        # this a safe compensation path even when the DB write
+                        # failed before cleanup ownership could be established.
+                        await self.runtime.cleanup(handle)
+                    elif await self._runtime_cleanup_owned(handle, execution):
                         await self.runtime.cleanup(handle)
                     else:
                         self.logger.warning(
@@ -406,7 +436,16 @@ class TaskExecutor:
                         runtime_object_id=handle.object_id,
                         error=redact_text(str(exc), secret_values),
                     )
-            if self.artifact_workspace is not None and prepared_artifacts is not None:
+            if (
+                self.artifact_workspace is not None
+                and prepared_artifacts is not None
+                and not (
+                    handle is not None
+                    and handle.runtime_type == "kubernetes"
+                    and runtime_handle_durable
+                    and execution.relinquish_requested.is_set()
+                )
+            ):
                 try:
                     await self.artifact_workspace.cleanup(prepared_artifacts)
                 except Exception as exc:
@@ -528,6 +567,8 @@ class TaskExecutor:
 
     async def _watch_for_stop(self, execution: ActiveExecution) -> str:
         while True:
+            if execution.relinquish_requested.is_set():
+                return "relinquish"
             if execution.ownership_lost.is_set():
                 return "ownership_lost"
             if execution.log_limit_exceeded.is_set():
@@ -544,6 +585,8 @@ class TaskExecutor:
             await asyncio.sleep(0.25)
 
     async def _pre_start_stop_reason(self, execution: ActiveExecution) -> str | None:
+        if execution.relinquish_requested.is_set():
+            return "relinquish"
         if execution.ownership_lost.is_set():
             return "ownership_lost"
         async with self.database.session() as session:

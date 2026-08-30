@@ -214,6 +214,7 @@ async def test_prepare_builds_fenced_cpu_job_without_node_name_or_extended_resou
     assert job.spec.backoff_limit == 0
     assert job.spec.active_deadline_seconds == 45
     assert job.spec.completions == job.spec.parallelism == 1
+    assert job.spec.suspend is True
     assert pod_spec.restart_policy == "Never"
     assert pod_spec.node_name is None
     assert pod_spec.scheduler_name is None
@@ -227,6 +228,44 @@ async def test_prepare_builds_fenced_cpu_job_without_node_name_or_extended_resou
     assert handle.controller_session_id == WORKER_SESSION_ID
     assert handle.namespace == "runtime-tests"
     assert handle.observation.pod_name is None
+
+
+async def test_start_unsuspends_exact_durable_job_with_resource_version_cas() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
+    spec = _spec()
+    handle = await runtime.prepare(spec)
+    started = _job(runtime, spec)
+    started.spec.suspend = False
+    started.metadata.resource_version = "2"
+    batch.patch_namespaced_job.return_value = started
+
+    await runtime.start(handle)
+
+    batch.patch_namespaced_job.assert_awaited_once_with(
+        name=handle.object_id,
+        namespace="runtime-tests",
+        body={"metadata": {"resourceVersion": "1"}, "spec": {"suspend": False}},
+    )
+
+
+async def test_suspended_job_releases_log_attach_barrier_before_start() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
+    handle = await runtime.prepare(_spec())
+    ready = asyncio.Event()
+    stream = runtime.logs(handle, ready=ready)
+
+    async def consume() -> None:
+        async for _item in stream:
+            return
+
+    consumer = asyncio.create_task(consume())
+
+    await asyncio.wait_for(ready.wait(), timeout=0.2)
+
+    consumer.cancel()
+    await asyncio.gather(consumer, return_exceptions=True)
 
 
 async def test_prepare_applies_workload_credentials_to_batch_job() -> None:

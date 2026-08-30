@@ -369,7 +369,9 @@ class WorkerService:
 
     def _start_assignment(self, assignment: TaskAssignment) -> None:
         execution = ActiveExecution(
-            task_id=assignment.task_id, execution_id=assignment.execution_id
+            task_id=assignment.task_id,
+            execution_id=assignment.execution_id,
+            runtime_type=assignment.runtime_type,
         )
         self.active[assignment.task_id] = execution
         task = asyncio.create_task(self._run_assignment(execution))
@@ -391,7 +393,9 @@ class WorkerService:
         execution = ActiveExecution(
             task_id=recovered.task_id,
             execution_id=recovered.execution_id,
+            runtime_type=handle.runtime_type,
         )
+        execution.runtime_handle_durable.set()
         self.active[recovered.task_id] = execution
         task = asyncio.create_task(self._run_assignment(execution, recovered_handle=handle))
         self.inflight.add(task)
@@ -598,12 +602,19 @@ class WorkerService:
             )
             if pending:
                 self.logger.warning(
-                    "shutdown deadline reached; stopping active task containers",
+                    "shutdown deadline reached; stopping local runtimes and relinquishing "
+                    "durable Kubernetes Jobs",
                     worker_id=self.worker_id,
                     active_tasks=[str(task_id) for task_id in self.active],
                 )
                 for execution in self.active.values():
-                    execution.ownership_lost.set()
+                    if (
+                        execution.runtime_type == "kubernetes"
+                        and execution.runtime_handle_durable.is_set()
+                    ):
+                        execution.relinquish_requested.set()
+                    else:
+                        execution.ownership_lost.set()
                 _done, pending = await asyncio.wait(
                     pending, timeout=self.settings.docker_stop_timeout + 5
                 )

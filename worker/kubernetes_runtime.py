@@ -240,10 +240,34 @@ class KubernetesRuntime:
         return handle
 
     async def start(self, handle: RuntimeHandle) -> None:
-        """Job creation starts execution; this verifies the fenced Job still exists."""
+        """Unsuspend a durably recorded Job behind its Kubernetes CAS fences."""
 
         self._validate_handle(handle)
-        await self._read_validated_job(handle, operation="start")
+        api = await self._ensure_api()
+        job = await self._read_validated_job(handle, operation="start")
+        if getattr(getattr(job, "spec", None), "suspend", None) is True:
+            resource_version = _required_resource_version(job, resource="Job")
+            body = {
+                "metadata": {"resourceVersion": resource_version},
+                "spec": {"suspend": False},
+            }
+            try:
+                job = await api.patch_namespaced_job(
+                    name=handle.object_id,
+                    namespace=self.namespace,
+                    body=body,
+                )
+            except ApiException as exc:
+                raise self._operation_error("unsuspend", handle.object_id, exc) from exc
+            self._validate_adopted_job(
+                job,
+                expected_labels=handle.labels,
+                expected_controller_session_id=handle.controller_session_id,
+            )
+            if _required_uid(job, resource="Job") != handle.resource_uid:
+                raise KubernetesRuntimeError(
+                    f"refusing to unsuspend Kubernetes Job {handle.object_id}: UID fence mismatch"
+                )
         pod = await self._controlled_pod(handle, required=False)
         if pod is not None:
             self._bind_observed_pod(handle, pod)
@@ -263,6 +287,11 @@ class KubernetesRuntime:
                 pod = await self._controlled_pod(handle, required=False)
                 if pod is None:
                     job = await self._read_validated_job(handle, operation="stream logs for")
+                    if (
+                        getattr(getattr(job, "spec", None), "suspend", None) is True
+                        and ready is not None
+                    ):
+                        ready.set()
                     terminal = _job_terminal_state(getattr(job, "status", None))
                     if terminal is not None:
                         if ready is not None:
@@ -836,6 +865,7 @@ class KubernetesRuntime:
                 backoff_limit=0,
                 completions=1,
                 parallelism=1,
+                suspend=True,
                 template=template,
             ),
         )

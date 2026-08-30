@@ -14,8 +14,11 @@ from repositories.workers import WorkerRepository
 class ActiveExecution:
     task_id: uuid.UUID
     execution_id: uuid.UUID
+    runtime_type: str | None = None
     ownership_lost: asyncio.Event = field(default_factory=asyncio.Event)
     log_limit_exceeded: asyncio.Event = field(default_factory=asyncio.Event)
+    runtime_handle_durable: asyncio.Event = field(default_factory=asyncio.Event)
+    relinquish_requested: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class Heartbeat:
