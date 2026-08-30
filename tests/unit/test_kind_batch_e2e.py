@@ -27,6 +27,7 @@ from scripts.kind_batch_e2e import (
     _assert_pod_contract,
     _authenticate,
     _configure_image_policy,
+    _observe_runtime_contract,
     _raise_outcome,
     _redact,
     _task_payload,
@@ -323,6 +324,36 @@ async def test_wait_task_status_fails_closed_on_wrong_terminal_state() -> None:
             timeout_seconds=1,
             poll_interval=0,
         )
+
+
+@pytest.mark.asyncio
+async def test_runtime_contract_accepts_fast_terminal_task_with_retained_objects() -> None:
+    job = _job()
+    pod = _pod(job)
+    api = SequenceAPI([{"status": "succeeded", "execution_id": EXECUTION_ID}])
+
+    class RetainedRuntimeKubectl:
+        def jobs_for_task(self, task_id: str) -> list[dict[str, Any]]:
+            assert task_id == TASK_ID
+            return [job]
+
+        def pods_for_task(self, task_id: str) -> list[dict[str, Any]]:
+            assert task_id == TASK_ID
+            return [pod]
+
+    observed_job, execution_id, observed_pod = await _observe_runtime_contract(
+        api,
+        cast(Any, RetainedRuntimeKubectl()),
+        task_id=TASK_ID,
+        project_id=PROJECT_ID,
+        image=IMAGE,
+        timeout_seconds=30,
+    )
+
+    assert observed_job is job
+    assert observed_pod is pod
+    assert execution_id == EXECUTION_ID
+    assert api.calls == [("GET", f"/api/v1/tasks/{TASK_ID}")]
 
 
 @pytest.mark.asyncio

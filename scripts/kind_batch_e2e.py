@@ -559,14 +559,6 @@ async def _observe_runtime_contract(
 ) -> tuple[dict[str, Any], str, dict[str, Any]]:
     job = await _wait_single_job(kube, task_id, timeout_seconds=60)
     execution_id = _required_label(_labels(job), EXECUTION_ID_LABEL)
-    task = await _wait_task_execution(
-        api,
-        task_id,
-        execution_id,
-        timeout_seconds=30,
-    )
-    if task.get("status") in FINAL_STATUSES:
-        raise KindBatchE2EError("task became terminal before its live Job contract was inspected")
     _assert_job_contract(
         job,
         project_id=project_id,
@@ -577,6 +569,15 @@ async def _observe_runtime_contract(
     )
     pod = await _wait_controlled_pod(kube, task_id, job, timeout_seconds=30)
     _assert_pod_contract(pod, job)
+    # A short Job can finish before the control-plane read observes its execution.
+    # The retained Job and Pod remain authoritative for the runtime contract, while
+    # each scenario's subsequent status assertion still rejects an unexpected terminal state.
+    await _wait_task_execution(
+        api,
+        task_id,
+        execution_id,
+        timeout_seconds=30,
+    )
     return job, execution_id, pod
 
 
