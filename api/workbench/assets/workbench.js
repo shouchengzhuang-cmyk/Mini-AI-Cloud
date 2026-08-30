@@ -1397,17 +1397,34 @@
     const runtime = form.elements.runtime.value;
     const runtimeType = form.elements.runtime_type;
     const acceleratorCount = form.elements.accelerator_count;
+    const model = form.elements.model;
+    const logicalModelId = form.elements.logical_model_id;
+    const modelVariantId = form.elements.model_variant_id;
     if (runtime === "fake") {
       runtimeType.value = "fake";
       runtimeType.disabled = true;
       acceleratorCount.value = "0";
       acceleratorCount.disabled = true;
+      acceleratorCount.min = "0";
+      model.disabled = false;
+      model.required = true;
+      logicalModelId.disabled = true;
+      logicalModelId.required = false;
+      modelVariantId.disabled = true;
       syncTensorParallelSize(form);
       return;
     }
     runtimeType.disabled = false;
     acceleratorCount.disabled = false;
     if (runtimeType.value === "fake") runtimeType.value = "docker";
+    const kubernetesVllm = runtime === "vllm" && runtimeType.value === "kubernetes";
+    model.disabled = kubernetesVllm;
+    model.required = !kubernetesVllm;
+    logicalModelId.disabled = !kubernetesVllm;
+    logicalModelId.required = kubernetesVllm;
+    modelVariantId.disabled = !kubernetesVllm;
+    acceleratorCount.min = kubernetesVllm ? "1" : "0";
+    if (kubernetesVllm && Number(acceleratorCount.value) < 1) acceleratorCount.value = "1";
     syncTensorParallelSize(form);
   }
 
@@ -1430,11 +1447,16 @@
     try {
       const model = String(formData.get("model") || "").trim();
       const logicalModelId = String(formData.get("logical_model_id") || "").trim();
+      const runtime = String(formData.get("runtime") || "vllm");
+      const runtimeType = String(form.elements.runtime_type.value || "docker");
+      if (runtime === "vllm" && runtimeType === "kubernetes" && !logicalModelId) {
+        throw new Error("Logical model ID is required for Kubernetes vLLM.");
+      }
       if (!model && !logicalModelId) throw new Error("Model or Logical model ID is required.");
       const payload = {
         name: String(formData.get("name") || "").trim(),
-        runtime: String(formData.get("runtime") || "vllm"),
-        runtime_type: String(form.elements.runtime_type.value || "docker"),
+        runtime,
+        runtime_type: runtimeType,
         replicas: Number(formData.get("replicas")),
         cpu_millicores: Number(formData.get("cpu_millicores")),
         memory_mb: Number(formData.get("memory_mb")),
@@ -1823,6 +1845,9 @@
     }
     const deployServiceForm = query("#deploy-service-form");
     deployServiceForm.elements.runtime.addEventListener("change", () => {
+      syncServingRuntime(deployServiceForm);
+    });
+    deployServiceForm.elements.runtime_type.addEventListener("change", () => {
       syncServingRuntime(deployServiceForm);
     });
     deployServiceForm.elements.accelerator_count.addEventListener("input", () => {

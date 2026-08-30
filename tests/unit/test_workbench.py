@@ -99,7 +99,24 @@ async def test_workbench_service_runtime_controls_restore_a_valid_pair() -> None
     assert 'runtimeType.value = "fake";' in js_response.text
     assert "runtimeType.disabled = true;" in js_response.text
     assert 'if (runtimeType.value === "fake") runtimeType.value = "docker";' in js_response.text
-    assert "runtime_type: String(form.elements.runtime_type.value" in js_response.text
+    assert "runtime_type: runtimeType," in js_response.text
+
+
+async def test_workbench_kubernetes_vllm_requires_logical_model_admission() -> None:
+    async with _client() as client:
+        js_response = await client.get("/workbench/assets/workbench.js")
+
+    assert 'runtimeType.value === "kubernetes"' in js_response.text
+    assert "model.disabled = kubernetesVllm;" in js_response.text
+    assert "logicalModelId.required = kubernetesVllm;" in js_response.text
+    assert "logicalModelId.disabled = !kubernetesVllm;" in js_response.text
+    assert "modelVariantId.disabled = !kubernetesVllm;" in js_response.text
+    assert 'acceleratorCount.min = kubernetesVllm ? "1" : "0";' in js_response.text
+    assert 'acceleratorCount.value = "1";' in js_response.text
+    assert (
+        'throw new Error("Logical model ID is required for Kubernetes vLLM.");' in js_response.text
+    )
+    assert 'elements.runtime_type.addEventListener("change"' in js_response.text
 
 
 async def test_workbench_idempotency_key_supports_insecure_http_contexts() -> None:
