@@ -311,9 +311,7 @@ class KubernetesRuntime:
             if pod is not None:
                 self._bind_observed_pod(handle, pod)
                 status = getattr(pod, "status", None)
-                failure = _pod_runtime_failure(
-                    status, handle.observation.pod_name or "<unknown>"
-                )
+                failure = _pod_runtime_failure(status, handle.observation.pod_name or "<unknown>")
                 if failure is not None:
                     raise failure
             terminal = _job_terminal_state(getattr(job, "status", None))
@@ -1073,9 +1071,7 @@ class KubernetesRuntime:
             or getattr(container_security, "allow_privilege_escalation", None) is not False
             or getattr(container_security, "privileged", None) is not False
             or getattr(container_security, "read_only_root_filesystem", None) is not True
-            or list(
-                getattr(getattr(container_security, "capabilities", None), "drop", None) or []
-            )
+            or list(getattr(getattr(container_security, "capabilities", None), "drop", None) or [])
             != ["ALL"]
         ):
             raise KubernetesRuntimeError(
@@ -1096,9 +1092,7 @@ class KubernetesRuntime:
             PROJECT_ID_LABEL: str(spec.project_id or _LEGACY_PROJECT_ID),
             EXECUTION_ID_LABEL: str(spec.execution_id),
             WORKER_ID_LABEL: spec.worker_id,
-            WORKER_SESSION_ID_LABEL: str(
-                spec.worker_session_id or _LEGACY_WORKER_SESSION_ID
-            ),
+            WORKER_SESSION_ID_LABEL: str(spec.worker_session_id or _LEGACY_WORKER_SESSION_ID),
             CLUSTER_ID_LABEL: self.cluster_id,
             MANAGED_LABEL: "true",
             RESOURCE_KIND_LABEL: BATCH_JOB_RESOURCE_KIND,
@@ -1280,9 +1274,7 @@ def _job_contract(job: object) -> dict[str, object]:
     return {
         "labels": {key: labels.get(key) for key in _CONTRACT_LABEL_KEYS if labels.get(key)},
         "annotations": {
-            key: annotations.get(key)
-            for key in _CONTRACT_ANNOTATION_KEYS
-            if annotations.get(key)
+            key: annotations.get(key) for key in _CONTRACT_ANNOTATION_KEYS if annotations.get(key)
         },
         "job": {
             "active_deadline_seconds": getattr(job_spec, "active_deadline_seconds", None),
@@ -1311,7 +1303,11 @@ def _job_contract(job: object) -> dict[str, object]:
             "node_selector": _string_mapping(getattr(pod_spec, "node_selector", None)),
             "restart_policy": getattr(pod_spec, "restart_policy", None),
             "runtime_class_name": getattr(pod_spec, "runtime_class_name", None),
-            "scheduler_name": getattr(pod_spec, "scheduler_name", None),
+            # The Kubernetes API defaults an omitted schedulerName to
+            # ``default-scheduler`` before returning the created Job.  Treat the
+            # implicit and explicit forms as the same launch contract so an
+            # otherwise unchanged Job keeps its pre-create spec hash.
+            "scheduler_name": (getattr(pod_spec, "scheduler_name", None) or "default-scheduler"),
             "security_context": _model_contract(getattr(pod_spec, "security_context", None)),
             "tolerations": _model_contract(getattr(pod_spec, "tolerations", None) or []),
             "volumes": _model_contract(getattr(pod_spec, "volumes", None) or []),
@@ -1325,12 +1321,8 @@ def _job_contract(job: object) -> dict[str, object]:
             "env": _model_contract(getattr(container, "env", None) or []),
             "requests": _string_mapping(getattr(resources, "requests", None)),
             "limits": _string_mapping(getattr(resources, "limits", None)),
-            "security_context": _model_contract(
-                getattr(container, "security_context", None)
-            ),
-            "volume_mounts": _model_contract(
-                getattr(container, "volume_mounts", None) or []
-            ),
+            "security_context": _model_contract(getattr(container, "security_context", None)),
+            "volume_mounts": _model_contract(getattr(container, "volume_mounts", None) or []),
         },
     }
 

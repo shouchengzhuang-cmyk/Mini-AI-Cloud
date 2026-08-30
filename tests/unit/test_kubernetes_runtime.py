@@ -205,6 +205,26 @@ async def test_prepare_builds_fenced_cpu_job_without_node_name_or_extended_resou
     assert handle.observation.pod_name is None
 
 
+async def test_prepare_accepts_api_server_defaulted_scheduler_name() -> None:
+    batch, core = _apis()
+
+    async def create_defaulted_job(*, namespace: str, body: Any) -> Any:
+        assert namespace == "runtime-tests"
+        body.metadata.uid = "job-uid"
+        body.metadata.resource_version = "1"
+        body.spec.template.spec.scheduler_name = "default-scheduler"
+        batch.read_namespaced_job.return_value = body
+        return body
+
+    batch.create_namespaced_job.side_effect = create_defaulted_job
+
+    handle = await _runtime(batch, core).prepare(_spec())
+    created = cast(Any, handle.native)
+
+    assert handle.resource_uid == "job-uid"
+    assert created.spec.template.spec.scheduler_name == "default-scheduler"
+
+
 @pytest.mark.parametrize(
     ("identity", "resource_name", "runtime_class", "scheduler"),
     [
@@ -260,7 +280,23 @@ async def test_create_conflict_adopts_only_exact_job() -> None:
     )
 
 
-@pytest.mark.parametrize("drift", ["spec", "session"])
+async def test_create_conflict_adopts_api_server_defaulted_scheduler_name() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core)
+    spec = _spec()
+    existing = _job(runtime, spec)
+    existing.spec.template.spec.scheduler_name = "default-scheduler"
+    batch.create_namespaced_job.side_effect = ApiException(status=409, reason="AlreadyExists")
+    batch.read_namespaced_job.return_value = existing
+
+    handle = await runtime.prepare(spec)
+    adopted = cast(Any, handle.native)
+
+    assert handle.resource_uid == "job-uid"
+    assert adopted.spec.template.spec.scheduler_name == "default-scheduler"
+
+
+@pytest.mark.parametrize("drift", ["spec", "scheduler", "session"])
 async def test_create_conflict_quarantines_spec_hash_or_session_drift(drift: str) -> None:
     batch, core = _apis()
     runtime = _runtime(batch, core)
@@ -268,6 +304,8 @@ async def test_create_conflict_quarantines_spec_hash_or_session_drift(drift: str
     existing = _job(runtime, spec)
     if drift == "spec":
         existing.spec.template.spec.containers[0].image = "attacker/image:latest"
+    elif drift == "scheduler":
+        existing.spec.template.spec.scheduler_name = "attacker-scheduler"
     else:
         existing.metadata.labels[WORKER_SESSION_ID_LABEL] = str(uuid.uuid4())
     batch.create_namespaced_job.side_effect = ApiException(status=409)
