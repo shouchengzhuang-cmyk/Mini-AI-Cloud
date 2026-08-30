@@ -2,6 +2,7 @@
   "use strict";
 
   const SESSION_API_KEY = "mini_ai_cloud_workbench_key";
+  const LIST_PAGE_SIZE = 100;
   const TASK_LOG_PAGE_SIZE = 500;
   const TERMINAL_TASK_STATUSES = new Set([
     "succeeded",
@@ -36,6 +37,11 @@
       taskId: null,
       offset: 0,
       entries: [],
+    },
+    listPages: {
+      tasks: { key: "", cursor: null, history: [] },
+      services: { key: "", cursor: null, history: [] },
+      workers: { key: "", cursor: null, history: [] },
     },
     lastData: {
       tasks: [],
@@ -419,6 +425,62 @@
     return node("div", { className: "data-table-wrap" }, [table]);
   }
 
+  function currentListPage(resource, key = "") {
+    if (state.listPages[resource].key !== key) {
+      state.listPages[resource] = { key, cursor: null, history: [] };
+    }
+    return state.listPages[resource];
+  }
+
+  function resetListPages() {
+    for (const resource of Object.keys(state.listPages)) {
+      state.listPages[resource] = { key: "", cursor: null, history: [] };
+    }
+  }
+
+  function listCursorSuffix(page) {
+    return page.cursor ? `&cursor=${encodeURIComponent(page.cursor)}` : "";
+  }
+
+  function listPagination(resource, pagination, itemCount, refresh) {
+    const page = state.listPages[resource];
+    const nextCursor = pagination.next_cursor || null;
+    const total = Number.isFinite(Number(pagination.total)) ? Number(pagination.total) : itemCount;
+    const first = itemCount ? page.history.length * LIST_PAGE_SIZE + 1 : 0;
+    const last = first ? first + itemCount - 1 : 0;
+
+    const move = (event, cursor, rememberCurrent) => {
+      event.currentTarget.disabled = true;
+      if (rememberCurrent) page.history.push(page.cursor);
+      else page.history.pop();
+      page.cursor = cursor;
+      refresh().catch(showGlobalError);
+    };
+    const previousCursor = page.history.length ? page.history[page.history.length - 1] : null;
+    return node("div", { className: "list-pagination" }, [
+      node("span", {
+        className: "muted",
+        text: `${first}–${last} of ${formatNumber(total, 0)} · page ${page.history.length + 1}`,
+      }),
+      node("div", { className: "pagination-actions" }, [
+        node("button", {
+          className: "button compact ghost",
+          type: "button",
+          text: "Previous",
+          disabled: !page.history.length,
+          on: { click: (event) => move(event, previousCursor, false) },
+        }),
+        node("button", {
+          className: "button compact ghost",
+          type: "button",
+          text: "Next",
+          disabled: !nextCursor,
+          on: { click: (event) => move(event, nextCursor, true) },
+        }),
+      ]),
+    ]);
+  }
+
   function detailSection(title, content) {
     return node("section", { className: "detail-section" }, [node("h3", { text: title }), content]);
   }
@@ -576,6 +638,7 @@
     state.apiKey = "";
     state.principal = null;
     state.project = null;
+    resetListPages();
     closeDrawer();
     query("#connection-view").classList.remove("hidden");
     query("#app-view").classList.add("hidden");
@@ -760,9 +823,14 @@
 
   async function renderTasks() {
     const filter = query("#task-status-filter").value;
-    const suffix = filter ? `&status=${encodeURIComponent(filter)}` : "";
+    const page = currentListPage("tasks", filter);
+    const filterSuffix = filter ? `&status=${encodeURIComponent(filter)}` : "";
+    const cursorSuffix = listCursorSuffix(page);
     try {
-      const payload = await api(`/api/v1/tasks?limit=100${suffix}`, { channel: "page:tasks" });
+      const payload = await api(
+        `/api/v1/tasks?limit=${LIST_PAGE_SIZE}${filterSuffix}${cursorSuffix}`,
+        { channel: "page:tasks" },
+      );
       const tasks = payload.items || [];
       state.lastData.tasks = tasks;
       if (!tasks.length) {
@@ -789,7 +857,12 @@
         { label: "Started", render: (task) => formatTime(task.started_at) },
         { label: "Duration", render: taskDuration },
       ];
-      replace("#tasks-content", [dataTable(columns, tasks, showTask)]);
+      replace("#tasks-content", [
+        node("div", { className: "content-stack" }, [
+          dataTable(columns, tasks, showTask),
+          listPagination("tasks", payload.pagination || {}, tasks.length, renderTasks),
+        ]),
+      ]);
     } catch (error) {
       if (error.name === "AbortError") return;
       replace("#tasks-content", [unavailable(error)]);
@@ -1172,8 +1245,13 @@
   }
 
   async function renderServices() {
+    const page = currentListPage("services");
+    const cursorSuffix = listCursorSuffix(page);
     try {
-      const payload = await api("/api/v1/services?limit=100", { channel: "page:services" });
+      const payload = await api(
+        `/api/v1/services?limit=${LIST_PAGE_SIZE}${cursorSuffix}`,
+        { channel: "page:services" },
+      );
       const services = payload.items || [];
       state.lastData.services = services;
       if (!services.length) {
@@ -1199,7 +1277,12 @@
         { label: "Replicas", render: renderReplicaRatio },
         { label: "Updated", render: (service) => formatTime(service.updated_at) },
       ];
-      replace("#services-content", [dataTable(columns, services, showService)]);
+      replace("#services-content", [
+        node("div", { className: "content-stack" }, [
+          dataTable(columns, services, showService),
+          listPagination("services", payload.pagination || {}, services.length, renderServices),
+        ]),
+      ]);
     } catch (error) {
       if (error.name === "AbortError") return;
       replace("#services-content", [unavailable(error)]);
@@ -1493,8 +1576,13 @@
   }
 
   async function renderWorkers() {
+    const page = currentListPage("workers");
+    const cursorSuffix = listCursorSuffix(page);
     try {
-      const payload = await api("/api/v1/workers?limit=100", { channel: "page:workers" });
+      const payload = await api(
+        `/api/v1/workers?limit=${LIST_PAGE_SIZE}${cursorSuffix}`,
+        { channel: "page:workers" },
+      );
       const workers = payload.items || [];
       state.lastData.workers = workers;
       if (!workers.length) {
@@ -1529,7 +1617,12 @@
         { label: "GPU reserved", render: (worker) => capacityCell("devices", worker.reserved_gpus, worker.gpu_count) },
         { label: "Heartbeat", render: (worker) => formatTime(worker.last_heartbeat_at, true) },
       ];
-      replace("#workers-content", [dataTable(columns, workers, showWorker)]);
+      replace("#workers-content", [
+        node("div", { className: "content-stack" }, [
+          dataTable(columns, workers, showWorker),
+          listPagination("workers", payload.pagination || {}, workers.length, renderWorkers),
+        ]),
+      ]);
     } catch (error) {
       if (error.name === "AbortError") return;
       replace("#workers-content", [unavailable(error)]);

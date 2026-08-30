@@ -152,3 +152,17 @@ async def test_workbench_task_logs_follow_sequence_cursor() -> None:
     assert "&offset=${offset}`" in js_response.text
     assert "state.taskLogs.offset = nextOffset;" in js_response.text
     assert "if (logs.length < TASK_LOG_PAGE_SIZE) break;" in js_response.text
+
+
+async def test_workbench_resource_lists_follow_api_cursors() -> None:
+    async with _client() as client:
+        js_response = await client.get("/workbench/assets/workbench.js")
+
+    assert "const LIST_PAGE_SIZE = 100;" in js_response.text
+    assert "function listCursorSuffix(page)" in js_response.text
+    assert "function resetListPages()" in js_response.text
+    assert "pagination.next_cursor || null" in js_response.text
+    assert "page.history.push(page.cursor);" in js_response.text
+    assert 'listPagination("tasks"' in js_response.text
+    assert 'listPagination("services"' in js_response.text
+    assert 'listPagination("workers"' in js_response.text

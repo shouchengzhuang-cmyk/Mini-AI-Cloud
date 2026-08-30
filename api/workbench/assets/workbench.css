@@ -626,6 +626,19 @@ textarea {
   overflow-x: auto;
 }
 
+.list-pagination,
+.pagination-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.list-pagination {
+  flex-wrap: wrap;
+  justify-content: space-between;
+  padding-top: 4px;
+}
+
 .data-table {
   width: 100%;
   border-collapse: collapse;
