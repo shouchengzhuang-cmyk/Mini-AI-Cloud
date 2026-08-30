@@ -111,6 +111,9 @@ async def test_workbench_kubernetes_vllm_requires_logical_model_admission() -> N
     assert "logicalModelId.required = kubernetesVllm;" in js_response.text
     assert "logicalModelId.disabled = !kubernetesVllm;" in js_response.text
     assert "modelVariantId.disabled = !kubernetesVllm;" in js_response.text
+    assert 'if (!kubernetesVllm) acceleratorVendor.value = "nvidia";' in js_response.text
+    assert "acceleratorVendor.disabled = !kubernetesVllm;" in js_response.text
+    assert "runtimeProfile.disabled = !kubernetesVllm;" in js_response.text
     assert 'acceleratorCount.min = kubernetesVllm ? "1" : "0";' in js_response.text
     assert 'acceleratorCount.value = "1";' in js_response.text
     assert (
@@ -166,3 +169,4 @@ async def test_workbench_resource_lists_follow_api_cursors() -> None:
     assert 'listPagination("tasks"' in js_response.text
     assert 'listPagination("services"' in js_response.text
     assert 'listPagination("workers"' in js_response.text
+    assert '? listPagination("tasks", payload.pagination || {}, 0, renderTasks)' in js_response.text

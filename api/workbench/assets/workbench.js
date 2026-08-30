@@ -460,7 +460,9 @@
     return node("div", { className: "list-pagination" }, [
       node("span", {
         className: "muted",
-        text: `${first}–${last} of ${formatNumber(total, 0)} · page ${page.history.length + 1}`,
+        text: itemCount
+          ? `${first}–${last} of ${formatNumber(total, 0)} · page ${page.history.length + 1}`
+          : `No items · ${formatNumber(total, 0)} total · page ${page.history.length + 1}`,
       }),
       node("div", { className: "pagination-actions" }, [
         node("button", {
@@ -835,12 +837,17 @@
       state.lastData.tasks = tasks;
       if (!tasks.length) {
         replace("#tasks-content", [
-          emptyState(
-            filter ? "No tasks match this status" : "No tasks yet",
-            filter ? "Choose another status or submit a new workload." : "Submit a small workload and follow its real scheduler state.",
-            "Run your first task",
-            openRunTask,
-          ),
+          node("div", { className: "content-stack" }, [
+            emptyState(
+              filter ? "No tasks match this status" : "No tasks yet",
+              filter ? "Choose another status or submit a new workload." : "Submit a small workload and follow its real scheduler state.",
+              "Run your first task",
+              openRunTask,
+            ),
+            page.history.length
+              ? listPagination("tasks", payload.pagination || {}, 0, renderTasks)
+              : null,
+          ]),
         ]);
         return;
       }
@@ -1256,12 +1263,17 @@
       state.lastData.services = services;
       if (!services.length) {
         replace("#services-content", [
-          emptyState(
-            "No services yet",
-            "Deploy a model endpoint and inspect its desired, actual, and healthy replicas.",
-            "Deploy a service",
-            openDeployService,
-          ),
+          node("div", { className: "content-stack" }, [
+            emptyState(
+              "No services yet",
+              "Deploy a model endpoint and inspect its desired, actual, and healthy replicas.",
+              "Deploy a service",
+              openDeployService,
+            ),
+            page.history.length
+              ? listPagination("services", payload.pagination || {}, 0, renderServices)
+              : null,
+          ]),
         ]);
         return;
       }
@@ -1483,6 +1495,8 @@
     const model = form.elements.model;
     const logicalModelId = form.elements.logical_model_id;
     const modelVariantId = form.elements.model_variant_id;
+    const acceleratorVendor = form.elements.accelerator_vendor;
+    const runtimeProfile = form.elements.runtime_profile;
     if (runtime === "fake") {
       runtimeType.value = "fake";
       runtimeType.disabled = true;
@@ -1494,6 +1508,9 @@
       logicalModelId.disabled = true;
       logicalModelId.required = false;
       modelVariantId.disabled = true;
+      acceleratorVendor.value = "nvidia";
+      acceleratorVendor.disabled = true;
+      runtimeProfile.disabled = true;
       syncTensorParallelSize(form);
       return;
     }
@@ -1506,6 +1523,9 @@
     logicalModelId.disabled = !kubernetesVllm;
     logicalModelId.required = kubernetesVllm;
     modelVariantId.disabled = !kubernetesVllm;
+    if (!kubernetesVllm) acceleratorVendor.value = "nvidia";
+    acceleratorVendor.disabled = !kubernetesVllm;
+    runtimeProfile.disabled = !kubernetesVllm;
     acceleratorCount.min = kubernetesVllm ? "1" : "0";
     if (kubernetesVllm && Number(acceleratorCount.value) < 1) acceleratorCount.value = "1";
     syncTensorParallelSize(form);
@@ -1587,10 +1607,15 @@
       state.lastData.workers = workers;
       if (!workers.length) {
         replace("#workers-content", [
-          emptyState(
-            "No workers registered",
-            "Check worker processes, control-plane readiness, and registration credentials. Capacity appears after a worker heartbeat.",
-          ),
+          node("div", { className: "content-stack" }, [
+            emptyState(
+              "No workers registered",
+              "Check worker processes, control-plane readiness, and registration credentials. Capacity appears after a worker heartbeat.",
+            ),
+            page.history.length
+              ? listPagination("workers", payload.pagination || {}, 0, renderWorkers)
+              : null,
+          ]),
         ]);
         return;
       }
