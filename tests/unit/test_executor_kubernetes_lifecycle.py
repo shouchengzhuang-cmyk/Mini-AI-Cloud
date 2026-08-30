@@ -15,7 +15,7 @@ from core.enums import RuntimeType, TaskStatus, WorkerStatus
 from core.redis import RedisQueue
 from models.task import Task
 from repositories.secrets import ResolvedTaskSecrets
-from repositories.tasks import ExecutionResult
+from repositories.tasks import ExecutionResult, TaskRepository
 from worker.executor import TaskExecutor, WaitOutcome
 from worker.heartbeat import ActiveExecution
 from worker.main import WorkerService
@@ -338,6 +338,74 @@ async def test_shutdown_relinquishes_only_durable_kubernetes_jobs(
         service._preserve_kubernetes_handoff_leases.assert_not_awaited()
     service._best_effort_worker_status.assert_any_await(WorkerStatus.DRAINING)
     service._best_effort_worker_status.assert_any_await(WorkerStatus.OFFLINE)
+
+
+async def test_shutdown_stops_durable_job_when_real_handoff_lease_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = cast(Any, object.__new__(WorkerService))
+    service.worker_id = "worker-k8s"
+    service.worker_session_id = uuid.uuid4()
+    service.logger = Mock()
+    service.settings = SimpleNamespace(
+        worker_shutdown_timeout=0,
+        docker_stop_timeout=0,
+        kubernetes_cleanup_grace_seconds=30,
+    )
+    service.heartbeat_stop = asyncio.Event()
+    execution = ActiveExecution(
+        task_id=uuid.uuid4(),
+        execution_id=uuid.uuid4(),
+        runtime_type="kubernetes",
+    )
+    execution.runtime_handle_durable.set()
+    service.active = {execution.task_id: execution}
+
+    async def finish_when_signalled() -> None:
+        await execution.ownership_lost.wait()
+
+    assignment = asyncio.create_task(finish_when_signalled())
+    service.inflight = {assignment}
+    service.runtime = SimpleNamespace(close=AsyncMock())
+    service.kubernetes_runtime = SimpleNamespace(
+        replacement_worker_expected=AsyncMock(return_value=True)
+    )
+    service.queue = SimpleNamespace(close=AsyncMock())
+    session = Mock()
+    transaction = AsyncMock()
+    session_scope = AsyncMock()
+    session.begin.return_value = transaction
+    session_scope.__aenter__.return_value = session
+    service.database = SimpleNamespace(
+        session=Mock(return_value=session_scope),
+        dispose=AsyncMock(),
+    )
+    service._best_effort_worker_status = AsyncMock()
+    preserve = AsyncMock(side_effect=RuntimeError("database unavailable"))
+    monkeypatch.setattr(TaskRepository, "preserve_kubernetes_handoff_lease", preserve)
+
+    async def heartbeat() -> None:
+        await service.heartbeat_stop.wait()
+
+    await service._shutdown(asyncio.create_task(heartbeat()))
+
+    assert execution.ownership_lost.is_set()
+    assert not execution.relinquish_requested.is_set()
+    assert assignment.done()
+    preserve.assert_awaited_once_with(
+        session,
+        task_id=execution.task_id,
+        worker_id=service.worker_id,
+        execution_id=execution.execution_id,
+        worker_session_id=service.worker_session_id,
+        cleanup_grace_seconds=30,
+    )
+    service.logger.warning.assert_any_call(
+        "Kubernetes Job handoff lease could not be fenced; Job will be stopped",
+        task_id=str(execution.task_id),
+        execution_id=str(execution.execution_id),
+        error="database unavailable",
+    )
 
 
 async def test_shutdown_replacement_probe_failure_is_fail_closed() -> None:
