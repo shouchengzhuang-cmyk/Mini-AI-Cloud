@@ -6,6 +6,7 @@ from fastapi.staticfiles import StaticFiles
 
 WORKBENCH_DIR = Path(__file__).resolve().parent
 WORKBENCH_INDEX = WORKBENCH_DIR / "index.html"
+WORKBENCH_ASSETS = WORKBENCH_DIR / "assets"
 
 
 def install_workbench(app: FastAPI) -> None:
@@ -48,6 +49,6 @@ def install_workbench(app: FastAPI) -> None:
     )
     app.mount(
         "/workbench/assets",
-        StaticFiles(directory=WORKBENCH_DIR, check_dir=True),
+        StaticFiles(directory=WORKBENCH_ASSETS, check_dir=True),
         name="workbench-assets",
     )

@@ -35,9 +35,11 @@ async def test_workbench_core_assets_are_served() -> None:
 
 async def test_missing_workbench_asset_returns_404() -> None:
     async with _client() as client:
-        response = await client.get("/workbench/assets/does-not-exist.js")
+        missing_response = await client.get("/workbench/assets/does-not-exist.js")
+        index_response = await client.get("/workbench/assets/index.html")
 
-    assert response.status_code == 404
+    assert missing_response.status_code == 404
+    assert index_response.status_code == 404
 
 
 async def test_workbench_does_not_break_livez_or_openapi() -> None:
@@ -122,3 +124,14 @@ async def test_workbench_tensor_parallelism_tracks_accelerator_count() -> None:
     assert 'acceleratorCount.value = "0";' in js_response.text
     assert "acceleratorCount.disabled = true;" in js_response.text
     assert 'elements.accelerator_count.addEventListener("input"' in js_response.text
+
+
+async def test_workbench_task_logs_follow_sequence_cursor() -> None:
+    async with _client() as client:
+        js_response = await client.get("/workbench/assets/workbench.js")
+
+    assert "const TASK_LOG_PAGE_SIZE = 500;" in js_response.text
+    assert "async function fetchTaskLogs(taskId)" in js_response.text
+    assert "&offset=${offset}`" in js_response.text
+    assert "state.taskLogs.offset = nextOffset;" in js_response.text
+    assert "if (logs.length < TASK_LOG_PAGE_SIZE) break;" in js_response.text

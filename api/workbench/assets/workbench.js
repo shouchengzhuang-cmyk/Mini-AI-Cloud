@@ -2,6 +2,7 @@
   "use strict";
 
   const SESSION_API_KEY = "mini_ai_cloud_workbench_key";
+  const TASK_LOG_PAGE_SIZE = 500;
   const TERMINAL_TASK_STATUSES = new Set([
     "succeeded",
     "failed",
@@ -31,6 +32,11 @@
     detailTerminal: true,
     detailPollCount: 0,
     logsAutoScroll: true,
+    taskLogs: {
+      taskId: null,
+      offset: 0,
+      entries: [],
+    },
     lastData: {
       tasks: [],
       services: [],
@@ -460,6 +466,7 @@
     state.detail = { type, id };
     state.detailTerminal = false;
     state.detailPollCount = 0;
+    resetTaskLogs(type === "task" ? id : null);
     query("#drawer-eyebrow").textContent = `${type} detail`;
     query("#drawer-title").textContent = title;
     replace("#drawer-content", [node("div", { className: "loading-block" })]);
@@ -473,6 +480,7 @@
     state.detail = null;
     state.detailTerminal = true;
     state.detailPollCount = 0;
+    resetTaskLogs();
     const drawer = query("#detail-drawer");
     drawer.classList.remove("open");
     drawer.setAttribute("aria-hidden", "true");
@@ -801,16 +809,54 @@
     refreshTaskDetail().catch(showGlobalError);
   }
 
+  function resetTaskLogs(taskId = null) {
+    state.taskLogs = {
+      taskId,
+      offset: 0,
+      entries: [],
+    };
+  }
+
+  async function fetchTaskLogs(taskId) {
+    if (state.taskLogs.taskId !== taskId) resetTaskLogs(taskId);
+
+    while (true) {
+      const offset = state.taskLogs.offset;
+      const page = await api(
+        `/api/v1/tasks/${encodeURIComponent(taskId)}/logs?limit=${TASK_LOG_PAGE_SIZE}&offset=${offset}`,
+        { channel: "detail:task:logs" },
+      );
+      if (state.taskLogs.taskId !== taskId) {
+        const error = new Error("Task detail changed while logs were loading.");
+        error.name = "AbortError";
+        throw error;
+      }
+
+      const logs = page.logs || [];
+      if (!logs.length) break;
+      const nextOffset = Number(logs[logs.length - 1].sequence);
+      if (!Number.isInteger(nextOffset) || nextOffset <= offset) {
+        throw new ApiError(0, "INVALID_LOG_PAGE", "Task log sequence did not advance.", null, null);
+      }
+      state.taskLogs.entries.push(...logs);
+      state.taskLogs.offset = nextOffset;
+      if (logs.length < TASK_LOG_PAGE_SIZE) break;
+    }
+
+    return { logs: [...state.taskLogs.entries] };
+  }
+
   async function refreshTaskDetail() {
     if (!state.detail || state.detail.type !== "task") return;
-    const id = encodeURIComponent(state.detail.id);
+    const taskId = state.detail.id;
+    const id = encodeURIComponent(taskId);
     const results = await Promise.allSettled([
       api(`/api/v1/tasks/${id}`, { channel: "detail:task" }),
       api(`/api/v1/tasks/${id}/timeline`, { channel: "detail:task:timeline" }),
       api(`/api/v1/tasks/${id}/scheduling`, { channel: "detail:task:scheduling" }),
-      api(`/api/v1/tasks/${id}/logs?limit=500`, { channel: "detail:task:logs" }),
+      fetchTaskLogs(taskId),
     ]);
-    if (!state.detail || state.detail.type !== "task" || state.detail.id !== decodeURIComponent(id)) return;
+    if (!state.detail || state.detail.type !== "task" || state.detail.id !== taskId) return;
     const task = settledValue(results[0]);
     if (!task) {
       replace("#drawer-content", [unavailable(results[0].reason)]);
