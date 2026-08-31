@@ -598,14 +598,6 @@ async def test_kubernetes_handoff_lease_blocks_retry_until_job_deadline(
             worker_session_id=worker_session_id,
             lease_seconds=30,
         )
-        await TaskRepository.mark_running(
-            session,
-            task_id=task_id,
-            worker_id=worker_id,
-            execution_id=execution_id,
-            worker_session_id=worker_session_id,
-            lease_seconds=30,
-        )
         await TaskRepository.record_runtime_handle(
             session,
             task_id=task_id,
@@ -614,6 +606,15 @@ async def test_kubernetes_handoff_lease_blocks_retry_until_job_deadline(
             worker_session_id=worker_session_id,
             kubernetes_cleanup_grace_seconds=30,
             **runtime_identity,
+        )
+        await TaskRepository.mark_starting(
+            session,
+            task_id=task_id,
+            worker_id=worker_id,
+            execution_id=execution_id,
+            worker_session_id=worker_session_id,
+            lease_seconds=30,
+            kubernetes_cleanup_grace_seconds=30,
         )
         await TaskRepository.mark_running(
             session,

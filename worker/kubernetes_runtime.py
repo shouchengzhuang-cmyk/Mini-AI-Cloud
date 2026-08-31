@@ -1580,11 +1580,13 @@ def _job_contract(job: object) -> dict[str, object]:
             "node_selector": _string_mapping(getattr(pod_spec, "node_selector", None)),
             "restart_policy": getattr(pod_spec, "restart_policy", None),
             **(
-                {
-                    "service_account_name": service_account_name,
-                    "image_pull_secrets": _model_contract(image_pull_secrets),
-                }
-                if service_account_name not in (None, "default") or image_pull_secrets
+                {"service_account_name": service_account_name}
+                if service_account_name not in (None, "default")
+                else {}
+            ),
+            **(
+                {"image_pull_secrets": _model_contract(image_pull_secrets)}
+                if image_pull_secrets
                 else {}
             ),
             "runtime_class_name": getattr(pod_spec, "runtime_class_name", None),

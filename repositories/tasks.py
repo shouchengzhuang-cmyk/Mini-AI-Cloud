@@ -1389,6 +1389,7 @@ class TaskRepository:
         execution_id: uuid.UUID,
         lease_seconds: float,
         worker_session_id: uuid.UUID | None = None,
+        kubernetes_cleanup_grace_seconds: float = 0.0,
     ) -> Task:
         task = await TaskRepository._owned_task(
             session,
@@ -1399,14 +1400,24 @@ class TaskRepository:
         )
         if task.status in {TaskStatus.STARTING, TaskStatus.RUNNING}:
             now = await database_utcnow(session)
-            task.lease_expires_at = now + timedelta(seconds=lease_seconds)
+            task.lease_expires_at = _runtime_lease_expiry(
+                task,
+                now,
+                lease_seconds=lease_seconds,
+                kubernetes_cleanup_grace_seconds=kubernetes_cleanup_grace_seconds,
+            )
             task.version += 1
             return task
         if task.status != TaskStatus.PULLING:
             raise StaleExecutionError("task is no longer pulling for this execution")
         now = await database_utcnow(session)
         _transition(session, task, TaskStatus.STARTING, now)
-        task.lease_expires_at = now + timedelta(seconds=lease_seconds)
+        task.lease_expires_at = _runtime_lease_expiry(
+            task,
+            now,
+            lease_seconds=lease_seconds,
+            kubernetes_cleanup_grace_seconds=kubernetes_cleanup_grace_seconds,
+        )
         return task
 
     @staticmethod

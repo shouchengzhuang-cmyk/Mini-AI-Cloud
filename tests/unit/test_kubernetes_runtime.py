@@ -438,6 +438,24 @@ async def test_create_conflict_adopts_api_server_defaulted_pod_fields() -> None:
     assert adopted.spec.template.spec.service_account_name == "default"
 
 
+async def test_create_conflict_adopts_defaulted_service_account_with_pull_secret() -> None:
+    batch, core = _apis()
+    runtime = _runtime(batch, core, image_pull_secrets=("registry-pull",))
+    spec = _spec()
+    existing = _job(runtime, spec)
+    existing.spec.template.spec.service_account_name = "default"
+    batch.create_namespaced_job.side_effect = ApiException(status=409, reason="AlreadyExists")
+    batch.read_namespaced_job.return_value = existing
+
+    handle = await runtime.prepare(spec)
+
+    assert handle.resource_uid == "job-uid"
+    adopted = cast(Any, handle.native)
+    assert [item.name for item in adopted.spec.template.spec.image_pull_secrets] == [
+        "registry-pull"
+    ]
+
+
 @pytest.mark.parametrize("drift", ["spec", "scheduler", "session"])
 async def test_create_conflict_quarantines_spec_hash_or_session_drift(drift: str) -> None:
     batch, core = _apis()
