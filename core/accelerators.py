@@ -65,6 +65,7 @@ class AcceleratorDevice:
     fake: bool = False
     device_index: int = 0
     kubernetes_resource_name: str | None = None
+    kubernetes_node_name: str | None = None
     kubernetes_node_labels: tuple[tuple[str, str], ...] = ()
     kubernetes_node_taints: tuple[tuple[str, str | None, str], ...] = ()
 
@@ -109,6 +110,8 @@ class AcceleratorDevice:
             )
             if not _KUBERNETES_RESOURCE.fullmatch(self.kubernetes_resource_name):
                 raise ValueError("kubernetes_resource_name must be a qualified resource name")
+        if self.kubernetes_node_name is not None:
+            _validate_inventory_text("kubernetes_node_name", self.kubernetes_node_name, maximum=253)
         label_keys = [key for key, _ in self.kubernetes_node_labels]
         if len(label_keys) != len(set(label_keys)):
             raise ValueError("kubernetes_node_labels keys must be unique")

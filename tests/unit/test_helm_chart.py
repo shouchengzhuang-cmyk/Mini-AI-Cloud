@@ -59,9 +59,10 @@ def test_chart_keeps_inventory_and_workload_rbac_bounded() -> None:
     assert "kind: Namespace\n" not in templates
     assert templates.count("\nkind: ClusterRole\n") == 1
     assert templates.count("\nkind: ClusterRoleBinding\n") == 1
-    assert 'resources: ["nodes"]\n    verbs: ["get"]' in templates
+    assert 'resources: ["nodes"]\n    verbs: ["list"]' in templates
     assert 'resources: ["pods"]\n    verbs: ["list"]' in templates
     assert 'ACCELERATOR_INVENTORY_PROVIDERS: "kubernetes-node"' in templates
+    assert "- name: WORKER_NODE_NAME" not in templates
     assert 'resources: ["secrets"]' not in templates
     assert 'verbs: ["*"]' not in templates
     assert 'resources: ["*"]' not in templates

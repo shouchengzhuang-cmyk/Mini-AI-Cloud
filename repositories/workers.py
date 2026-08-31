@@ -204,6 +204,10 @@ class WorkerRepository:
             )
             if device.kubernetes_resource_name == "":
                 raise ValueError("accelerator kubernetes_resource_name must not be blank")
+            node_name = item.get("kubernetes_node_name")
+            device.kubernetes_node_name = str(node_name).strip() if node_name is not None else None
+            if device.kubernetes_node_name == "":
+                raise ValueError("accelerator kubernetes_node_name must not be blank")
             device.health = str(item.get("health", "healthy"))
             device.fake = bool(item.get("fake", False))
             device.inventory_generation = worker.inventory_generation

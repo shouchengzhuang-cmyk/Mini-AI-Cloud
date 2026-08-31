@@ -53,6 +53,7 @@ class GPUDevice(Base):
     runtime_profile_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     capabilities_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     kubernetes_resource_name: Mapped[str | None] = mapped_column(String(255))
+    kubernetes_node_name: Mapped[str | None] = mapped_column(String(253))
     health: Mapped[str] = mapped_column(String(32), default="healthy")
     fake: Mapped[bool] = mapped_column(Boolean, default=False)
     inventory_generation: Mapped[int] = mapped_column(Integer, default=1)

@@ -81,11 +81,31 @@ class KubernetesNodeReader(Protocol):
     ) -> Awaitable[Mapping[str, object]]: ...
 
 
+class KubernetesNodesReader(Protocol):
+    def __call__(
+        self,
+        *,
+        kubeconfig: str | None,
+        in_cluster: bool,
+        request_timeout: float,
+    ) -> Awaitable[tuple[Mapping[str, object], ...]]: ...
+
+
 class KubernetesPodReader(Protocol):
     def __call__(
         self,
         *,
         node_name: str,
+        kubeconfig: str | None,
+        in_cluster: bool,
+        request_timeout: float,
+    ) -> Awaitable[tuple[Mapping[str, object], ...]]: ...
+
+
+class KubernetesAllPodsReader(Protocol):
+    def __call__(
+        self,
+        *,
         kubeconfig: str | None,
         in_cluster: bool,
         request_timeout: float,
@@ -565,6 +585,7 @@ def parse_kubernetes_node(node: Mapping[str, object]) -> _ParseResult:
     ):
         return _ParseResult((), 1)
     node_uid = str(metadata.get("uid") or "").strip()
+    node_name = str(metadata.get("name") or "").strip()
     labels = metadata.get("labels")
     labels = labels if isinstance(labels, Mapping) else {}
     node_labels = tuple(
@@ -575,7 +596,7 @@ def parse_kubernetes_node(node: Mapping[str, object]) -> _ParseResult:
         )
     )
     allocatable = status.get("allocatable")
-    if not node_uid or not isinstance(allocatable, Mapping):
+    if not node_uid or not node_name or not isinstance(allocatable, Mapping):
         return _ParseResult((), 1)
 
     devices: list[AcceleratorDevice] = []
@@ -627,6 +648,7 @@ def parse_kubernetes_node(node: Mapping[str, object]) -> _ParseResult:
                     compute_arch=compute_arch,
                     capabilities=("kubernetes-capacity-slot",),
                     kubernetes_resource_name=resource_name,
+                    kubernetes_node_name=node_name,
                     kubernetes_node_labels=node_labels,
                     kubernetes_node_taints=node_taints,
                 )
@@ -816,9 +838,11 @@ def _deduct_external_pod_requests(
 
 
 class KubernetesNodeAcceleratorProvider(_InventoryProviderBase):
-    """Read Device Plugin capacity from one Kubernetes Node object.
+    """Read Device Plugin capacity from Kubernetes Node objects.
 
-    Generated IDs identify stable node capacity slots, not physical device IDs.
+    A configured node name scopes discovery for an explicitly single-node deployment;
+    otherwise the provider inventories every eligible cluster node. Generated IDs identify
+    stable node capacity slots, not physical device IDs.
     Runtime observations remain authoritative for the concrete allocation.
     """
 
@@ -831,7 +855,9 @@ class KubernetesNodeAcceleratorProvider(_InventoryProviderBase):
         kubeconfig: str | None = None,
         in_cluster: bool = False,
         node_reader: KubernetesNodeReader | None = None,
+        nodes_reader: KubernetesNodesReader | None = None,
         pod_reader: KubernetesPodReader | None = None,
+        all_pods_reader: KubernetesAllPodsReader | None = None,
         cluster_id: str | None = None,
         worker_id: str | None = None,
         timeout: float = 5.0,
@@ -842,7 +868,9 @@ class KubernetesNodeAcceleratorProvider(_InventoryProviderBase):
         self.kubeconfig = kubeconfig
         self.in_cluster = in_cluster
         self._node_reader = node_reader or _read_kubernetes_node
+        self._nodes_reader = nodes_reader or _read_kubernetes_nodes
         self._pod_reader = pod_reader or _read_kubernetes_pods
+        self._all_pods_reader = all_pods_reader or _read_kubernetes_all_pods
         self.cluster_id = cluster_id.strip() if cluster_id is not None else None
         self.worker_id = worker_id.strip() if worker_id is not None else None
         self.timeout = timeout
@@ -855,23 +883,101 @@ class KubernetesNodeAcceleratorProvider(_InventoryProviderBase):
         raise RuntimeError("Kubernetes inventory discovery must be awaited inside an event loop")
 
     async def discover_async(self) -> InventoryProviderResult:
-        if not self.node_name:
+        if self.node_name:
+            return await self._discover_node(self.node_name)
+        try:
+            async with asyncio.timeout(self.timeout):
+                nodes, pods = await asyncio.gather(
+                    self._nodes_reader(
+                        kubeconfig=self.kubeconfig,
+                        in_cluster=self.in_cluster,
+                        request_timeout=self.timeout,
+                    ),
+                    self._all_pods_reader(
+                        kubeconfig=self.kubeconfig,
+                        in_cluster=self.in_cluster,
+                        request_timeout=self.timeout,
+                    ),
+                )
+        except Exception:
             return InventoryProviderResult(
                 provider=self.name,
                 status=InventoryStatus.UNAVAILABLE,
-                message="worker_node_name_required",
+                message="kubernetes_api_request_failed",
             )
+        if not isinstance(nodes, tuple) or not all(isinstance(node, Mapping) for node in nodes):
+            return InventoryProviderResult(
+                provider=self.name,
+                status=InventoryStatus.DEGRADED,
+                message="invalid_node_list",
+                rejected_rows=1,
+            )
+        if not isinstance(pods, tuple) or not all(isinstance(pod, Mapping) for pod in pods):
+            return InventoryProviderResult(
+                provider=self.name,
+                status=InventoryStatus.DEGRADED,
+                message="invalid_pod_list",
+                rejected_rows=1,
+            )
+        devices: list[AcceleratorDevice] = []
+        rejected_rows = 0
+        excluded_slots = 0
+        try:
+            for node in sorted(nodes, key=_kubernetes_node_sort_key):
+                parsed = parse_kubernetes_node(node)
+                rejected_rows += parsed.rejected_rows
+                metadata = node.get("metadata")
+                node_name = metadata.get("name") if isinstance(metadata, Mapping) else None
+                if not isinstance(node_name, str) or not node_name.strip():
+                    rejected_rows += 1
+                    continue
+                external_requests = _external_pod_accelerator_requests(
+                    pods,
+                    node_name=node_name,
+                    cluster_id=self.cluster_id,
+                    worker_id=self.worker_id,
+                )
+                adjusted, excluded = _deduct_external_pod_requests(
+                    parsed.devices, external_requests
+                )
+                next_index = len(devices)
+                devices.extend(
+                    replace(device, device_index=next_index + index)
+                    for index, device in enumerate(adjusted)
+                )
+                excluded_slots += excluded
+        except (TypeError, ValueError):
+            return InventoryProviderResult(
+                provider=self.name,
+                status=InventoryStatus.DEGRADED,
+                message="invalid_pod_resource_requests",
+                rejected_rows=1,
+            )
+        details: list[str] = []
+        if rejected_rows:
+            details.append(f"rejected {rejected_rows} incomplete capacity slot(s)")
+        if excluded_slots:
+            details.append(f"excluded {excluded_slots} externally requested capacity slot(s)")
+        return InventoryProviderResult(
+            provider=self.name,
+            status=(InventoryStatus.DEGRADED if rejected_rows else InventoryStatus.AVAILABLE),
+            devices=tuple(devices),
+            message="; ".join(details) or None,
+            rejected_rows=rejected_rows,
+        )
+
+    async def _discover_node(self, node_name: str) -> InventoryProviderResult:
         try:
             async with asyncio.timeout(self.timeout):
                 node, pods = await asyncio.gather(
                     self._node_reader(
-                        node_name=self.node_name,
+                        node_name=node_name,
                         kubeconfig=self.kubeconfig,
                         in_cluster=self.in_cluster,
                         request_timeout=self.timeout,
                     ),
                     self._pod_reader(
-                        node_name=self.node_name,
+                        node_name=node_name,
                         kubeconfig=self.kubeconfig,
                         in_cluster=self.in_cluster,
                         request_timeout=self.timeout,
@@ -894,7 +1000,7 @@ class KubernetesNodeAcceleratorProvider(_InventoryProviderBase):
         try:
             external_requests = _external_pod_accelerator_requests(
                 pods,
-                node_name=self.node_name,
+                node_name=node_name,
                 cluster_id=self.cluster_id,
                 worker_id=self.worker_id,
             )
@@ -957,6 +1063,40 @@ async def _read_kubernetes_node(
             await api_client.close()
 
 
+async def _read_kubernetes_nodes(
+    *,
+    kubeconfig: str | None,
+    in_cluster: bool,
+    request_timeout: float,
+) -> tuple[Mapping[str, object], ...]:
+    configuration = client.Configuration()
+    api_client: client.ApiClient | None = None
+    try:
+        if in_cluster:
+            loaded = config.load_incluster_config(client_configuration=configuration)
+            if isawaitable(loaded):
+                await loaded
+        else:
+            await config.load_kube_config(
+                config_file=kubeconfig,
+                client_configuration=configuration,
+                persist_config=False,
+            )
+        api_client = client.ApiClient(configuration=configuration)
+        api = client.CoreV1Api(api_client=api_client)
+        node_list = await api.list_node(_request_timeout=request_timeout)
+        serialized = api_client.sanitize_for_serialization(node_list)
+        if not isinstance(serialized, Mapping) or not isinstance(serialized.get("items"), list):
+            raise TypeError("Kubernetes NodeList response must contain an items list")
+        nodes = serialized["items"]
+        if not all(isinstance(node, Mapping) for node in nodes):
+            raise TypeError("Kubernetes NodeList items must be objects")
+        return tuple(nodes)
+    finally:
+        if api_client is not None:
+            await api_client.close()
+
+
 async def _read_kubernetes_pods(
     *,
     node_name: str,
@@ -993,6 +1133,45 @@ async def _read_kubernetes_pods(
     finally:
         if api_client is not None:
             await api_client.close()
+
+
+async def _read_kubernetes_all_pods(
+    *,
+    kubeconfig: str | None,
+    in_cluster: bool,
+    request_timeout: float,
+) -> tuple[Mapping[str, object], ...]:
+    configuration = client.Configuration()
+    api_client: client.ApiClient | None = None
+    try:
+        if in_cluster:
+            loaded = config.load_incluster_config(client_configuration=configuration)
+            if isawaitable(loaded):
+                await loaded
+        else:
+            await config.load_kube_config(
+                config_file=kubeconfig,
+                client_configuration=configuration,
+                persist_config=False,
+            )
+        api_client = client.ApiClient(configuration=configuration)
+        api = client.CoreV1Api(api_client=api_client)
+        pod_list = await api.list_pod_for_all_namespaces(_request_timeout=request_timeout)
+        serialized = api_client.sanitize_for_serialization(pod_list)
+        if not isinstance(serialized, Mapping) or not isinstance(serialized.get("items"), list):
+            raise TypeError("Kubernetes PodList response must contain an items list")
+        pods = serialized["items"]
+        if not all(isinstance(pod, Mapping) for pod in pods):
+            raise TypeError("Kubernetes PodList items must be objects")
+        return tuple(pods)
+    finally:
+        if api_client is not None:
+            await api_client.close()
+
+
+def _kubernetes_node_sort_key(node: Mapping[str, object]) -> str:
+    metadata = node.get("metadata")
+    return str(metadata.get("name") or "") if isinstance(metadata, Mapping) else ""
 
 
 class FakeAcceleratorInventoryProvider(_InventoryProviderBase):

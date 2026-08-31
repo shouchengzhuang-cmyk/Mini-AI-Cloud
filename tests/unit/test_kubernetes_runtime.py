@@ -80,6 +80,7 @@ def _profile_spec(identity: str) -> tuple[RuntimeProfileCatalog, ExecutionSpec]:
         runtime_profile_version=entry.profile_version,
         runtime_profile_digest=entry.semantic_digest,
         allocation_authority="kubernetes_device_plugin",
+        kubernetes_node_name="gpu-node-a",
     )
 
 
@@ -372,7 +373,7 @@ async def test_prepare_accepts_api_server_defaulted_scheduler_name() -> None:
         ("ascend-vllm-k8s-a2@2.0.0", "huawei.com/Ascend910", "ascend", "volcano"),
     ],
 )
-async def test_profile_drives_accelerator_job_placement_without_node_name(
+async def test_profile_drives_accelerator_job_placement_on_admitted_node(
     identity: str,
     resource_name: str,
     runtime_class: str,
@@ -389,11 +390,21 @@ async def test_profile_drives_accelerator_job_placement_without_node_name(
     assert resources[resource_name] == "2"
     assert pod_spec.runtime_class_name == runtime_class
     assert pod_spec.scheduler_name == scheduler
-    assert pod_spec.node_name is None
+    assert pod_spec.node_name == "gpu-node-a"
     assert pod_spec.node_selector
     assert pod_spec.tolerations
     if identity.startswith("nvidia"):
         assert pod_spec.affinity is not None
+
+
+async def test_accelerator_job_rejects_missing_admitted_node() -> None:
+    catalog, spec = _profile_spec("nvidia-vllm-k8s@2.0.0")
+    batch, core = _apis()
+
+    with pytest.raises(KubernetesGpuUnavailable, match="admitted Kubernetes node"):
+        await _runtime(batch, core, runtime_profile_catalog=catalog).prepare(
+            replace(spec, kubernetes_node_name=None)
+        )
 
 
 async def test_accelerator_job_without_profile_fails_closed_without_nvidia_fallback() -> None:

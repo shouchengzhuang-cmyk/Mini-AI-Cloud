@@ -59,6 +59,7 @@ def _inventory_payload(devices: Iterable[AcceleratorDevice]) -> list[dict[str, o
             "runtime_profile_ids": list(item.runtime_profile_ids),
             "capabilities": list(item.capabilities),
             "kubernetes_resource_name": item.kubernetes_resource_name,
+            "kubernetes_node_name": item.kubernetes_node_name,
             "health": item.health,
             "fake": item.fake,
         }
@@ -281,6 +282,29 @@ class WorkerService:
         by_execution_id = {
             uuid.UUID(handle.labels[EXECUTION_ID_LABEL]): handle for handle in controller_handles
         }
+        matched_execution_ids = {item.execution_id for item in matched}
+        reconciled_orphans = 0
+        for execution_id, handle in by_execution_id.items():
+            if execution_id in matched_execution_ids:
+                continue
+            try:
+                await self.kubernetes_runtime.cleanup(handle)
+            except KubernetesRuntimeError as exc:
+                self.logger.warning(
+                    "unmatched recovered Kubernetes Job cleanup failed",
+                    worker_id=self.worker_id,
+                    execution_id=str(execution_id),
+                    resource_name=handle.object_id,
+                    error=str(exc),
+                )
+            else:
+                reconciled_orphans += 1
+                self.logger.warning(
+                    "unmatched recovered Kubernetes Job cleaned up",
+                    worker_id=self.worker_id,
+                    execution_id=str(execution_id),
+                    resource_name=handle.object_id,
+                )
         self.recovered_kubernetes_executions = [
             (item, by_execution_id[item.execution_id]) for item in matched
         ]
@@ -293,6 +317,7 @@ class WorkerService:
                 - len(matched)
                 + len(self.kubernetes_runtime.recovery_conflicts)
             ),
+            orphan_cleanup_count=reconciled_orphans,
         )
 
     def request_stop(self) -> None:

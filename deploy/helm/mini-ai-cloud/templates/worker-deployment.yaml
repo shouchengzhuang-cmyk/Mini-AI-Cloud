@@ -52,10 +52,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            - name: WORKER_NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
             - name: KUBERNETES_WORKER_POD_NAMESPACE
               valueFrom:
                 fieldRef:

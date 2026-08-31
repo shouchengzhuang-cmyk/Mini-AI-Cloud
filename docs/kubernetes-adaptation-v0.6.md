@@ -153,8 +153,8 @@ The complete schema is [values.schema.json](../deploy/helm/mini-ai-cloud/values.
 The control plane and Worker run in the system namespace. Their write-capable Roles can act only
 in the one configured workload namespace. Accelerator admission uses the `kubernetes-node`
 inventory provider, so the Worker additionally has a read-only ClusterRole with exactly Node
-`get` and Pod `list`. The Pod list is cluster-wide only to deduct external accelerator requests
-from Device Plugin allocatable capacity on the Worker's node. No `watch`, write, Secret,
+`list` and Pod `list`. Both reads are cluster-wide to deduct external accelerator requests from
+Device Plugin allocatable capacity on every eligible node. No `watch`, write, Secret,
 wildcard-resource, or wildcard-verb permission is granted at cluster scope.
 
 The Worker Role manages the fenced batch Jobs, their Pods and logs/status, and deny-all

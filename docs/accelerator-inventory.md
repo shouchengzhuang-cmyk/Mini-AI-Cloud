@@ -70,8 +70,8 @@ service/reservation commitment 统一计费，避免重复扣减。Pod 列表不
 保留节点/profile 兼容性元数据，但 health 标记为 `externally-allocated`，不会作为空闲容量
 参与正副本或 batch 准入。
 
-因此运行 `kubernetes-node` provider 的 Kubernetes 身份必须同时拥有目标 Node 的
-`get` 权限和所有 namespace Pod 的 `list` 权限；使用 kubeconfig 时也必须授予等价权限。
+因此运行 `kubernetes-node` provider 的 Kubernetes 身份必须同时拥有集群 Node 的
+`list` 权限和所有 namespace Pod 的 `list` 权限；使用 kubeconfig 时也必须授予等价权限。
 Helm Chart 默认启用该 provider，并只为 Worker ServiceAccount 创建包含这两个只读动作
 的 ClusterRole/ClusterRoleBinding；它不授予 watch、写入、Secret 或通配符权限。
 

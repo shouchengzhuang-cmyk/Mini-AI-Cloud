@@ -89,9 +89,9 @@ API template.
 
 The workload namespace is one static write allowlist entry. Both the control plane and Worker
 use Roles in that namespace. The Worker also uses the repository's `kubernetes-node` inventory
-provider, which requires one read-only ClusterRole: Node `get` plus Pod `list`. Pod listing is
+provider, which requires one read-only ClusterRole: Node `list` plus Pod `list`. Both reads are
 cluster-wide because Device Plugin allocatable capacity must subtract non-terminal accelerator
-requests from every namespace on the Worker's node. The ClusterRole has no `watch`, write,
+requests on every eligible node. The ClusterRole has no `watch`, write,
 Secret, wildcard-resource, or wildcard-verb permission and is bound only to the Worker
 ServiceAccount.
 

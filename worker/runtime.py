@@ -104,6 +104,7 @@ class ExecutionSpec:
     runtime_profile_digest: str | None = None
     model_variant_id: uuid.UUID | None = None
     allocation_authority: str | None = None
+    kubernetes_node_name: str | None = None
     mounts: tuple[RuntimeMount, ...] = ()
     worker_session_id: uuid.UUID | None = None
 

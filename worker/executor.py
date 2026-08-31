@@ -470,6 +470,7 @@ class TaskExecutor:
                 execution_id=execution.execution_id,
                 lease_seconds=self.settings.task_lease_seconds,
                 worker_session_id=self.worker_session_id,
+                kubernetes_cleanup_grace_seconds=self.settings.kubernetes_cleanup_grace_seconds,
             )
 
     async def _record_runtime_handle(
@@ -951,6 +952,7 @@ class TaskExecutor:
             runtime_profile_digest=task.runtime_profile_digest,
             model_variant_id=task.model_variant_id,
             allocation_authority=task.allocation_authority,
+            kubernetes_node_name=task.kubernetes_node_name,
             mounts=mounts,
             worker_session_id=self.worker_session_id,
         )

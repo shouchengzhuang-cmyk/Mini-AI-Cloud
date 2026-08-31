@@ -634,6 +634,15 @@ async def test_kubernetes_handoff_lease_blocks_retry_until_job_deadline(
             lease_seconds=30,
             kubernetes_cleanup_grace_seconds=30,
         )
+        await TaskRepository.mark_pulling(
+            session,
+            task_id=task_id,
+            worker_id=worker_id,
+            execution_id=execution_id,
+            worker_session_id=worker_session_id,
+            lease_seconds=30,
+            kubernetes_cleanup_grace_seconds=30,
+        )
         held = await TaskRepository.get(session, task_id)
         assert held is not None
         assert held.lease_expires_at is not None
