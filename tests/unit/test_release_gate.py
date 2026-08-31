@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -302,6 +303,27 @@ def test_action_pin_validator_rejects_mutable_tags(tmp_path: Path) -> None:
 
     with pytest.raises(ReleaseGateError, match="full commit SHAs"):
         validate_action_pins(tmp_path)
+
+
+def test_workflows_pin_node24_actions_with_audited_provenance() -> None:
+    expected = {
+        "actions/checkout": "fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
+        "actions/setup-python": "ece7cb06caefa5fff74198d8649806c4678c61a1",
+        "actions/upload-artifact": "b7c566a772e6b6bfb58ed0dc250532a479d7789f",
+        "astral-sh/setup-uv": "37802adc94f370d6bfd71619e3f0bf239e1f3b78",
+    }
+    workflow_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((ROOT / ".github/workflows").glob("*.yml"))
+    )
+
+    for action, revision in expected.items():
+        lines = [line for line in workflow_text.splitlines() if f"{action}@" in line]
+        assert lines
+        assert all(f"{action}@{revision}" in line and "Node.js 24" in line for line in lines)
+        assert set(re.findall(rf"{re.escape(action)}@([0-9a-f]{{40}})", workflow_text)) == {
+            revision
+        }
 
 
 def test_release_security_workflow_prepares_sbom_output_directory() -> None:
