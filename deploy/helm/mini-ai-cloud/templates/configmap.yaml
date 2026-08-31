@@ -1,0 +1,38 @@
+{{- include "mini-ai-cloud.validate" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mini-ai-cloud.fullname" . }}-config
+  namespace: {{ include "mini-ai-cloud.systemNamespace" . }}
+  labels:
+    {{- include "mini-ai-cloud.labels" . | nindent 4 }}
+data:
+  APP_ENV: {{ .Values.config.appEnvironment | quote }}
+  API_HOST: "0.0.0.0"
+  API_PORT: "8000"
+  LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  CLUSTER_ID: {{ .Values.config.clusterId | quote }}
+  LEGACY_ANONYMOUS_ENABLED: "false"
+  BOOTSTRAP_ENABLED: {{ .Values.config.bootstrapEnabled | quote }}
+  RATE_LIMIT_FAIL_OPEN: "false"
+  KUBERNETES_IN_CLUSTER: "true"
+  KUBERNETES_KUBECONFIG: ""
+  KUBERNETES_NAMESPACE: {{ include "mini-ai-cloud.workloadNamespace" . | quote }}
+  KUBERNETES_SERVING_ENABLED: {{ .Values.config.servingEnabled | quote }}
+  KUBERNETES_SERVING_FAKE_ENABLED: {{ .Values.config.servingFakeEnabled | quote }}
+  KUBERNETES_SERVING_NAMESPACE: {{ include "mini-ai-cloud.workloadNamespace" . | quote }}
+  KUBERNETES_SERVING_CLUSTER_ID: {{ .Values.config.servingClusterId | quote }}
+  KUBERNETES_SERVING_IMAGE: {{ .Values.config.servingImage | quote }}
+  KUBERNETES_SERVING_SERVICE_ACCOUNT_NAME: {{ .Values.workload.serviceAccountName | quote }}
+  KUBERNETES_SERVING_IMAGE_PULL_SECRETS: {{ join "," .Values.workload.imagePullSecrets | quote }}
+  SERVICE_ENDPOINT_HOST_ALLOWLIST: {{ printf "*.%s.svc.cluster.local" (include "mini-ai-cloud.workloadNamespace" .) | quote }}
+  RUNTIME_PROFILE_MANIFEST_PATH: "/etc/mini-ai-cloud/runtime_profiles/manifest.json"
+  WORKER_RUNTIME_TYPES: "kubernetes"
+  WORKER_CONCURRENCY: {{ .Values.worker.concurrency | quote }}
+  WORKER_LABELS: "runtime=kubernetes"
+  ACCELERATOR_INVENTORY_PROVIDERS: "kubernetes-node"
+  ARTIFACT_BACKEND: {{ .Values.config.artifactBackend | quote }}
+  ARTIFACT_LOCAL_ROOT: "/var/lib/mini-ai-cloud/artifacts"
+  ARTIFACT_WORKSPACE_ROOT: "/var/lib/mini-ai-cloud/workspaces"
+  ARTIFACT_S3_BUCKET: {{ .Values.config.artifactS3Bucket | quote }}
+  ARTIFACT_S3_ENDPOINT_URL: {{ .Values.config.artifactS3EndpointUrl | quote }}

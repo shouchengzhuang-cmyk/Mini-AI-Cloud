@@ -463,6 +463,8 @@ class SchedulingRepository:
             or admission.worker_session_id != worker.worker_session_id
         ):
             raise PlacementConflict("vendor admission worker fence changed")
+        if admission is not None and not admission.node_name:
+            raise PlacementConflict("vendor admission node snapshot is missing")
         if worker.running_tasks >= worker.concurrency:
             raise PlacementConflict("worker has no free execution slot")
         if worker.reserved_cpu * 1000 + task.cpu_millicores > worker.cpu_allocatable_millicores:
@@ -490,6 +492,7 @@ class SchedulingRepository:
                         GPUDevice.accelerator_kind == admission.kind.value,
                         GPUDevice.model == admission.selected_model,
                         GPUDevice.kubernetes_resource_name == admission.accelerator_resource_name,
+                        GPUDevice.kubernetes_node_name == admission.node_name,
                     )
                     .order_by(GPUDevice.device_uuid)
                     .execution_options(populate_existing=True)
@@ -522,6 +525,7 @@ class SchedulingRepository:
                     session,
                     catalog=runtime_profile_catalog,
                     worker_id=worker.id,
+                    node_name=admission.node_name,
                     vendor=admission.vendor,
                     kind=admission.kind,
                     model=admission.selected_model,
@@ -627,6 +631,7 @@ class SchedulingRepository:
         task.gpu_device_ids = (
             [] if admission is not None else [device.device_uuid for device in devices]
         )
+        task.kubernetes_node_name = admission.node_name if admission is not None else None
         if admission is not None:
             task.selected_vendor = admission.vendor.value
             task.selected_kind = admission.kind.value

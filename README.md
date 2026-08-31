@@ -2,7 +2,7 @@
 
 *An evidence-driven experimental control plane for reliable AI workload scheduling and model serving.*
 
-Python distribution、CLI、Compose project 与默认镜像统一使用 `mini-ai-cloud` / `mini-cloud` 身份；当前准备版本为 `0.5.0`。本分支只完成发布准备，不代表已经创建 GitHub Release 或部署生产。
+Python distribution、CLI、Compose project 与默认镜像统一使用 `mini-ai-cloud` / `mini-cloud` 身份；当前准备版本为 `0.6.0`。本分支只完成发布准备，不代表已经创建 Git tag、GitHub Release 或部署生产。
 
 Mini AI Cloud 是一个面向 AI 工作负载控制面正确性的轻量级实验平台。它重点研究在并发调度、Worker、Pod、Controller 故障和在线请求缩容时，如何依靠 PostgreSQL 这一状态真相源、lease、execution fencing 与 reconciliation，让任务和模型服务状态收敛。
 
@@ -16,7 +16,7 @@ Mini AI Cloud 是一个面向 AI 工作负载控制面正确性的轻量级实�
 - **Model serving lifecycle**：Replica 如何经过 starting、loading、running、draining，Gateway 如何避开不健康或正在排空的副本，以及活跃 SSE 请求结束后如何完成缩容。
 - **Dual-vendor serving contracts**：NVIDIA 与 Huawei Ascend 的 Runtime Profile、准入、路由、fallback、circuit 与实际物理 variant 用量如何保持可审计；真实双硬件运行仍为 `REAL_HW_NOT_RUN`。
 
-功能存在、自动化测试通过和真实外部运行是三种不同证据。逐项状态见 [验证证据矩阵](docs/verification-matrix.md)，M6 A1–A11 与堆叠 PR 处置见 [M6 发布覆盖表](docs/m6-release-coverage.md)，Phase IV-A.1 的实时验收状态见 [Kubernetes Serving 验证报告](docs/verification-report-phase4a-2026-08-24.md)。
+功能存在、自动化测试通过和真实外部运行是三种不同证据。v0.6 的权威 Kubernetes 安装与运行边界见 [Kubernetes adaptation](docs/kubernetes-adaptation-v0.6.md)，发布准备状态见 [v0.6 release readiness](docs/v0.6-release-readiness.md)。逐项历史状态见 [验证证据矩阵](docs/verification-matrix.md)，M6 A1-A11 与堆叠 PR 处置见 [M6 发布覆盖表](docs/m6-release-coverage.md)。
 
 ## 五分钟 Quickstart
 
@@ -169,7 +169,7 @@ make test-integration
 make test-serving
 make test
 make config
-make test-release
+P4_EVIDENCE_BUNDLE=/absolute/path/to/p4-bundle make test-release
 
 make up
 make down
@@ -180,6 +180,7 @@ CONFIRM_CHAOS=YES make test-chaos
 make kind-up
 make test-k8s
 make kind-down
+make test-kind-kubernetes-adaptation
 
 make kind-serving-up
 make test-kind-serving
@@ -203,6 +204,8 @@ Kubernetes Pod、readiness、drain、恢复与 Kind 命令见 [Phase IV-A Kubern
 ## 文档入口
 
 - [架构与一致性边界](docs/architecture.md)
+- [v0.6 Kubernetes adaptation](docs/kubernetes-adaptation-v0.6.md)
+- [v0.6 发布准备状态与支持证据矩阵](docs/v0.6-release-readiness.md)
 - [API 与 CLI 示例](docs/api-cli.md)
 - [部署、回滚、备份恢复与排障](docs/operations.md)
 - [七个强制演示](docs/demos.md)
@@ -231,7 +234,7 @@ FastAPI 交互文档位于 `http://localhost:8000/docs`，OpenAPI JSON 位于 `h
 - Docker task 默认非 privileged、capabilities 全丢弃、`no-new-privileges`、只读 rootfs、受限 `/tmp`、PID/CPU/RAM 限制且网络关闭。允许网络只表达 `none`/`internet` 的粗粒度意图，不等于域名级 egress firewall。
 - Docker Worker 的 socket 权限是明确 trust boundary；Kubernetes Worker 也必须使用最小 RBAC。当前 Worker 直接连接 PostgreSQL/Redis，`WORKER_AUTH_TOKEN` 只是未来 internal worker API 的保留配置，不会认证这些直连；共享环境必须依靠独立凭据、网络 ACL，并最终引入节点 mTLS。
 - 默认 Compose 给 Worker 挂载随 `COMPOSE_PROJECT_NAME` 派生的 `artifact-workspace-data` 卷，任务容器只通过 Docker `VolumeOptions.Subpath` 获取声明的单个 input/output 文件；这避免 sibling Worker 路径误映射，也避免专用 DR stack 与日常栈共享 execution workspace。裸机 Worker 与 daemon 共享宿主路径时仍使用单文件 bind。两种模式都不暴露整个 workspace；真实 Docker named-volume Subpath input→container→output E2E 已执行通过。
-- Kubernetes task Pod 已固定非 root UID/GID 65532、`RuntimeDefault` seccomp、只读 rootfs 与丢弃全部 capabilities。Artifact mount 当前仍是 pinned node 上的单文件 `hostPath(type=File)`；只有 Worker workspace 与该 node 共享同一路径时才成立。仓库已有 Pod spec/mock 测试，但尚未在 Kind 做真实文件可见性 E2E，生产多节点应采用受控 object-store/PVC/CSI 数据面。
+- Kubernetes task Pod 已固定非 root UID/GID 65532、`RuntimeDefault` seccomp、只读 rootfs 与丢弃全部 capabilities。开发/测试环境的 legacy artifact mount 仍可能使用 pinned node 上的单文件 `hostPath(type=File)`；生产环境会在 Kubernetes API 调用前拒绝任何带 artifact mount 的任务，不会把该路径伪装成跨节点数据面。生产多节点仍需另行实现和验收受控 object-store、PVC 或 CSI 数据面。
 - Kubernetes serving Pod 使用非 root UID/GID 10001、只读 rootfs、受限 `/tmp`、drop ALL、`RuntimeDefault` seccomp、requests=limits，并关闭 token automount 和 host namespace。它不会挂载 Docker socket、kubeconfig 或 `hostPath`。Controller 的 namespace RBAC 仍是高权限基础设施边界，生产环境应使用独立 namespace 和 ServiceAccount。
 - Artifact grant 为 presigned URL 时，客户端不得转发平台 API Key。仓库演示脚本已把对象存储请求与平台认证头隔离。
 

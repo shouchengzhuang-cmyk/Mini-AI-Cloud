@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mini-ai-cloud-serving-pods
+  namespace: {{ include "mini-ai-cloud.workloadNamespace" . }}
+  labels:
+    {{- include "mini-ai-cloud.labels" . | nindent 4 }}
+    app.kubernetes.io/component: serving-workload
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: false
+  selector:
+    mini-ai-cloud/managed: "true"
+    mini-ai-cloud/runtime: kubernetes-serving
+    mini-ai-cloud/resource-kind: serving-pod
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP

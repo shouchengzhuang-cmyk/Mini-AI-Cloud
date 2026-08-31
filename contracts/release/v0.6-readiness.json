@@ -1,0 +1,39 @@
+{
+  "authorization_status": "READY_FOR_OWNER_AUTHORIZATION",
+  "deployment_status": "NOT_DEPLOYED",
+  "kind_evidence": {
+    "required_claim": "KIND_K8S_PASS",
+    "status": "PENDING_FINAL_P4_EVIDENCE"
+  },
+  "real_hardware_status": "REAL_HW_NOT_RUN",
+  "release_status": "NOT_RELEASED",
+  "schema_version": "1.0.0",
+  "support_matrix": [
+    {
+      "capability": "helm-single-cluster-install",
+      "implementation": "IMPLEMENTED",
+      "kind_evidence": "PENDING_FINAL_P4_EVIDENCE",
+      "real_evidence": "E1_NOT_RUN"
+    },
+    {
+      "capability": "fenced-kubernetes-batch-jobs",
+      "implementation": "IMPLEMENTED",
+      "kind_evidence": "PENDING_FINAL_P4_EVIDENCE",
+      "real_evidence": "E1_NOT_RUN"
+    },
+    {
+      "capability": "runtime-profile-serving",
+      "implementation": "IMPLEMENTED",
+      "kind_evidence": "PENDING_FINAL_P4_EVIDENCE",
+      "real_evidence": "REAL_HW_NOT_RUN"
+    },
+    {
+      "capability": "upgrade-uninstall-cleanup",
+      "implementation": "IMPLEMENTED",
+      "kind_evidence": "PENDING_FINAL_P4_EVIDENCE",
+      "real_evidence": "E1_NOT_RUN"
+    }
+  ],
+  "tag_status": "NOT_TAGGED",
+  "version": "0.6.0"
+}

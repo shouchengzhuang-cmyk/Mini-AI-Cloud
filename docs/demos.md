@@ -83,7 +83,7 @@ uv run pytest \
   tests/unit/test_phase2_demo.py -q
 ```
 
-`phase2_demo.py` 验证独立 Artifact API；Task-bound input/output 的真实执行证据来自 `tests/e2e/test_docker_runtime.py` 中的 Docker named-volume `Subpath` input→container→output 测试。裸机单文件 bind 与 Kubernetes pinned `hostPath(type=File)` 仍是 spec/单元证据；Kubernetes 必须单独标注“未做 Kind 文件可见性验证”。
+`phase2_demo.py` 验证独立 Artifact API；Task-bound input/output 的真实执行证据来自 `tests/e2e/test_docker_runtime.py` 中的 Docker named-volume `Subpath` input→container→output 测试。裸机单文件 bind 与 Kubernetes development/test pinned `hostPath(type=File)` 仍是 spec/单元证据；production Kubernetes 会在 API 调用前拒绝 artifact-bearing Job，不能把该 fail-closed 合同写成文件数据面已通过。
 
 ## Demo 3：GPU Scheduling
 

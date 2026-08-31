@@ -226,6 +226,52 @@ async def test_kubernetes_provider_reads_configured_cluster_without_kubectl() ->
     assert all(device.device_id.startswith("k8s-capacity:node-uid-1:") for device in result.devices)
 
 
+async def test_kubernetes_provider_inventories_every_cluster_node_when_unscoped() -> None:
+    node_a = json.loads(_fixture("kubernetes-node.json"))
+    node_a["metadata"]["name"] = "gpu-node-a"
+    node_b = json.loads(_fixture("kubernetes-node.json"))
+    node_b["metadata"]["name"] = "gpu-node-b"
+    node_b["metadata"]["uid"] = "node-uid-2"
+    nodes_reader = AsyncMock(return_value=(node_b, node_a))
+    all_pods_reader = AsyncMock(
+        return_value=(
+            {
+                "metadata": {"labels": {"app": "external"}},
+                "spec": {
+                    "nodeName": "gpu-node-b",
+                    "containers": [{"resources": {"limits": {"nvidia.com/gpu": "1"}}}],
+                    "initContainers": [],
+                },
+                "status": {"phase": "Running"},
+            },
+        )
+    )
+
+    result = await KubernetesNodeAcceleratorProvider(
+        node_name=None,
+        nodes_reader=nodes_reader,
+        all_pods_reader=all_pods_reader,
+    ).discover_async()
+
+    assert result.status == InventoryStatus.AVAILABLE
+    assert {device.kubernetes_node_name for device in result.devices} == {
+        "gpu-node-a",
+        "gpu-node-b",
+    }
+    assert len({device.device_index for device in result.devices}) == len(result.devices)
+    assert sum(device.health == "externally-allocated" for device in result.devices) == 1
+    nodes_reader.assert_awaited_once_with(
+        kubeconfig=None,
+        in_cluster=False,
+        request_timeout=5.0,
+    )
+    all_pods_reader.assert_awaited_once_with(
+        kubeconfig=None,
+        in_cluster=False,
+        request_timeout=5.0,
+    )
+
+
 async def test_kubernetes_provider_reads_node_via_real_python_client(
     tmp_path: Path,
 ) -> None:

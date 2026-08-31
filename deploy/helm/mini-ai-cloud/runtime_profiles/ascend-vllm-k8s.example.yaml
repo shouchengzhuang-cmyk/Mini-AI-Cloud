@@ -1,0 +1,80 @@
+schema_version: 1.0.0
+id: ascend-vllm-k8s-a2
+version: 1.0.0
+vendor: huawei-ascend
+kind: npu
+execution_mode: kubernetes
+engine: vllm-ascend
+
+# Reserved example domain and non-production digest. A8 must replace both with
+# an independently verified image while keeping the digest-pinning contract.
+image:
+  reference: registry.example.invalid/mini-ai-cloud/ascend-vllm@sha256:2222222222222222222222222222222222222222222222222222222222222222
+  digest_required: true
+
+kubernetes:
+  runtime_class_name: ascend
+  resource_name: huawei.com/Ascend910
+  node_selector:
+    accelerator.mini-ai-cloud/vendor: huawei-ascend
+  tolerations: []
+  requests_equal_limits: true
+  security:
+    privileged: false
+    hostPID: false
+    hostNetwork: false
+    hostPath: []
+    allow_privilege_escalation: false
+
+process:
+  command: [vllm, serve]
+  command_allowlist:
+    - [vllm, serve]
+  env_allowlist:
+    - VLLM_LOGGING_LEVEL
+  api_protocol: openai
+  visible_devices_source: device-plugin
+
+probes:
+  health:
+    path: /health
+    port: 8000
+    initial_delay_seconds: 30
+    period_seconds: 10
+    timeout_seconds: 5
+    failure_threshold: 6
+  readiness:
+    path: /health
+    port: 8000
+    initial_delay_seconds: 30
+    period_seconds: 5
+    timeout_seconds: 3
+    failure_threshold: 12
+
+compatibility:
+  hardware_families: [Atlas A2, Atlas A3]
+  python: profile-owned
+  vllm_version: pinned
+  vendor_plugin_version: pinned
+  driver_version: recorded-at-runtime
+  toolkit_version: recorded-at-runtime
+
+capabilities:
+  model_architectures: []
+  dtypes: [bfloat16]
+  features: [streaming]
+  tensor_parallel:
+    supported: true
+    scope: single-node
+    minimum_size: 1
+    maximum_size: null
+    maximum_size_source: runtime-observation
+
+allocation_authority: kubernetes_device_plugin
+evidence_status: SCHEMA_READY
+evidence_references: []
+limitations:
+  - The image and digest are non-production placeholders under a reserved example domain.
+  - Atlas A2 and Atlas A3 compatibility is declared only as an example and is not validated.
+  - CANN, torch-npu, device plugin, vLLM, vLLM Ascend, and model versions require A8 evidence.
+  - Real Ascend hardware has not been run for this profile.

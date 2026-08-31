@@ -6,6 +6,8 @@ from typing import Annotated
 from pydantic import BeforeValidator, Field, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from core.kubernetes_names import validate_kubernetes_dns_subdomain
+
 _LOCAL_API_KEY_PEPPER = "local-development-api-key-pepper-change-me"
 _LOCAL_WORKER_AUTH_TOKEN = "local-development-worker-token"
 _PRODUCTION_CREDENTIAL_MIN_BYTES = 32
@@ -41,8 +43,31 @@ def _blank_to_none(value: object) -> object:
     return value
 
 
+def _parse_kubernetes_names(value: object) -> tuple[str, ...]:
+    if value in (None, ""):
+        return ()
+    items: object
+    if isinstance(value, str):
+        items = value.split(",")
+    else:
+        items = value
+    if not isinstance(items, (list, tuple)) or any(not isinstance(item, str) for item in items):
+        raise ValueError("Kubernetes names must be a comma-separated string or string list")
+    names: list[str] = []
+    for item in items:
+        normalized = item.strip()
+        if normalized and normalized not in names:
+            names.append(normalized)
+    return tuple(names)
+
+
 Labels = Annotated[dict[str, str], NoDecode, BeforeValidator(_parse_labels)]
 OptionalNonEmptyString = Annotated[str | None, BeforeValidator(_blank_to_none)]
+KubernetesNames = Annotated[
+    tuple[str, ...],
+    NoDecode,
+    BeforeValidator(_parse_kubernetes_names),
+]
 
 
 class Settings(BaseSettings):
@@ -146,6 +171,8 @@ class Settings(BaseSettings):
     kubernetes_kubeconfig: str | None = None
     kubernetes_in_cluster: bool = False
     kubernetes_cleanup_grace_seconds: int = Field(default=30, ge=0, le=3600)
+    kubernetes_worker_pod_namespace: OptionalNonEmptyString = None
+    kubernetes_worker_statefulset_name: OptionalNonEmptyString = None
     runtime_profile_manifest_path: str = _DEFAULT_RUNTIME_PROFILE_MANIFEST
 
     kubernetes_serving_enabled: bool = False
@@ -167,6 +194,12 @@ class Settings(BaseSettings):
         min_length=1,
         max_length=512,
     )
+    kubernetes_serving_service_account_name: OptionalNonEmptyString = Field(
+        default=None,
+        min_length=1,
+        max_length=253,
+    )
+    kubernetes_serving_image_pull_secrets: KubernetesNames = Field(default_factory=tuple)
     kubernetes_serving_startup_timeout: float = Field(default=120.0, gt=0)
     kubernetes_serving_drain_timeout: float = Field(default=30.0, ge=0)
     kubernetes_serving_poll_interval: float = Field(default=1.0, gt=0)
@@ -245,6 +278,34 @@ class Settings(BaseSettings):
             raise ValueError("KUBERNETES_SERVING_FAKE_ENABLED requires KUBERNETES_SERVING_ENABLED")
         if self.kubernetes_serving_fake_enabled and self.app_env == "production":
             raise ValueError("Kubernetes fake serving must remain disabled in production")
+        if (self.kubernetes_worker_pod_namespace is None) != (
+            self.kubernetes_worker_statefulset_name is None
+        ):
+            raise ValueError(
+                "KUBERNETES_WORKER_POD_NAMESPACE and "
+                "KUBERNETES_WORKER_STATEFULSET_NAME must be configured together"
+            )
+        for field_name, value in (
+            (
+                "KUBERNETES_WORKER_POD_NAMESPACE",
+                self.kubernetes_worker_pod_namespace,
+            ),
+            (
+                "KUBERNETES_WORKER_STATEFULSET_NAME",
+                self.kubernetes_worker_statefulset_name,
+            ),
+            (
+                "KUBERNETES_SERVING_SERVICE_ACCOUNT_NAME",
+                self.kubernetes_serving_service_account_name,
+            ),
+        ):
+            if value is not None:
+                validate_kubernetes_dns_subdomain(value, field_name=field_name)
+        for image_pull_secret in self.kubernetes_serving_image_pull_secrets:
+            validate_kubernetes_dns_subdomain(
+                image_pull_secret,
+                field_name="KUBERNETES_SERVING_IMAGE_PULL_SECRETS",
+            )
         if self.fake_gpu_count and self.app_env == "production":
             raise ValueError("FAKE_GPU_COUNT must be zero in production")
         inventory_providers = tuple(

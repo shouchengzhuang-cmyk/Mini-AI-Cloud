@@ -1,0 +1,16 @@
+namespaces:
+  workload: mini-ai-cloud-ci-workloads
+
+image:
+  repository: registry.example.test/mini-ai-cloud
+  tag: "0.6.0"
+  digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+
+existingSecret:
+  name: mini-ai-cloud-ci
+
+controlPlane:
+  replicas: 1
+
+service:
+  type: ClusterIP

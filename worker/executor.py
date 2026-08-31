@@ -131,14 +131,22 @@ class TaskExecutor:
         self.worker_session_id = worker_session_id
         self.logger = get_logger("task_executor")
 
-    async def execute(self, execution: ActiveExecution) -> ExecutionResult:
-        handle: RuntimeHandle | None = None
+    async def execute(
+        self,
+        execution: ActiveExecution,
+        *,
+        recovered_handle: RuntimeHandle | None = None,
+    ) -> ExecutionResult:
+        handle: RuntimeHandle | None = recovered_handle
         log_task: asyncio.Task[None] | None = None
         resolved_secrets = ResolvedTaskSecrets({})
         secret_values: tuple[str, ...] = ()
         runtime_environment: dict[str, str] = {}
         prepared_artifacts: PreparedArtifactWorkspace | None = None
+        runtime_handle_durable = recovered_handle is not None
         deadline = 0.0
+        if runtime_handle_durable:
+            execution.runtime_handle_durable.set()
         try:
             task = await self._mark_pulling(execution)
             resolved_secrets = await self._resolve_secrets(task, execution)
@@ -163,36 +171,51 @@ class TaskExecutor:
                     deadline,
                 )
             await self._system_log(execution, f"pulling image {task.image}")
-            handle = await self._before_deadline(
-                self.runtime.prepare(
-                    self._execution_spec(
-                        task,
-                        execution,
-                        environment=runtime_environment,
-                        mounts=(
-                            tuple(
-                                RuntimeMount(
-                                    host_path=str(mount.host_path),
-                                    container_path=mount.container_path,
-                                    read_only=mount.read_only,
-                                    volume_name=mount.volume_name,
-                                    volume_subpath=mount.volume_subpath,
+            if handle is None:
+                handle = await self._before_deadline(
+                    self.runtime.prepare(
+                        self._execution_spec(
+                            task,
+                            execution,
+                            environment=runtime_environment,
+                            mounts=(
+                                tuple(
+                                    RuntimeMount(
+                                        host_path=str(mount.host_path),
+                                        container_path=mount.container_path,
+                                        read_only=mount.read_only,
+                                        volume_name=mount.volume_name,
+                                        volume_subpath=mount.volume_subpath,
+                                    )
+                                    for mount in prepared_artifacts.mounts
                                 )
-                                for mount in prepared_artifacts.mounts
-                            )
-                            if prepared_artifacts is not None
-                            else ()
-                        ),
-                    )
-                ),
-                deadline,
-            )
+                                if prepared_artifacts is not None
+                                else ()
+                            ),
+                        )
+                    ),
+                    deadline,
+                )
+            elif handle.runtime_type != task.runtime_type.value:
+                raise StaleExecutionError(
+                    "recovered runtime handle does not match the task runtime"
+                )
             assert handle is not None
+            await self._record_runtime_handle(execution, handle)
+            if handle.runtime_type == "kubernetes":
+                runtime_handle_durable = True
+                execution.runtime_handle_durable.set()
             pre_start_stop = await self._pre_start_stop_reason(execution)
+            if pre_start_stop == "relinquish":
+                return ExecutionResult(accepted=False, status=None)
             if pre_start_stop == "ownership_lost":
                 return ExecutionResult(accepted=False, status=None)
             if pre_start_stop == "cancelled":
-                await self._best_effort_stop(handle, secret_values=secret_values)
+                await self._best_effort_stop(
+                    handle,
+                    execution=execution,
+                    secret_values=secret_values,
+                )
                 return await self._finish(
                     execution,
                     target=TaskStatus.CANCELLED,
@@ -213,6 +236,7 @@ class TaskExecutor:
             await self._before_deadline(log_ready.wait(), deadline)
             if log_task.done():
                 await log_task
+            await self._record_runtime_handle(execution, handle)
             await self._before_deadline(self.runtime.start(handle), deadline)
             await self._mark_running(execution)
             await self._system_log(execution, f"{handle.resource_kind} {handle.display_id} started")
@@ -223,10 +247,16 @@ class TaskExecutor:
                 "ownership_lost",
                 "log_limit_exceeded",
             }:
-                await self.runtime.stop(handle)
-            if outcome.reason == "ownership_lost":
+                await self._stop_owned(handle, execution)
+            if outcome.reason == "relinquish":
+                await self._preserve_kubernetes_handoff_lease(execution, task, handle)
+            if outcome.reason in {"ownership_lost", "relinquish"}:
                 self.logger.warning(
-                    "container stopped after fencing token was revoked",
+                    (
+                        "runtime relinquished for worker restart"
+                        if outcome.reason == "relinquish"
+                        else "container stopped after fencing token was revoked"
+                    ),
                     task_id=str(execution.task_id),
                     worker_id=self.worker_id,
                 )
@@ -301,7 +331,11 @@ class TaskExecutor:
             return ExecutionResult(accepted=False, status=None)
         except RuntimeFailure as exc:
             if handle is not None:
-                await self._best_effort_stop(handle, secret_values=secret_values)
+                await self._best_effort_stop(
+                    handle,
+                    execution=execution,
+                    secret_values=secret_values,
+                )
             safe_error = redact_text(str(exc), secret_values)
             await self._best_effort_log(execution, f"runtime failed: {safe_error}")
             self.logger.error(
@@ -323,7 +357,11 @@ class TaskExecutor:
             )
         except (ExecutionTimedOut, TimeoutError):
             if handle is not None:
-                await self._best_effort_stop(handle, secret_values=secret_values)
+                await self._best_effort_stop(
+                    handle,
+                    execution=execution,
+                    secret_values=secret_values,
+                )
             await self._best_effort_log(execution, "task timed out")
             return await self._finish(
                 execution,
@@ -334,7 +372,11 @@ class TaskExecutor:
             )
         except Exception as exc:
             if handle is not None:
-                await self._best_effort_stop(handle, secret_values=secret_values)
+                await self._best_effort_stop(
+                    handle,
+                    execution=execution,
+                    secret_values=secret_values,
+                )
             safe_error = redact_text(str(exc), secret_values)
             await self._best_effort_log(execution, f"execution failed: {safe_error}")
             # Tracebacks can render arbitrary exception arguments. Avoid attaching
@@ -361,7 +403,33 @@ class TaskExecutor:
                 await asyncio.gather(log_task, return_exceptions=True)
             if handle is not None:
                 try:
-                    await self.runtime.cleanup(handle)
+                    relinquishing = (
+                        handle.runtime_type == "kubernetes"
+                        and runtime_handle_durable
+                        and execution.relinquish_requested.is_set()
+                    )
+                    if relinquishing:
+                        self.logger.info(
+                            "durable Kubernetes Job preserved for replacement worker adoption",
+                            task_id=str(execution.task_id),
+                            execution_id=str(execution.execution_id),
+                            runtime_object_id=handle.object_id,
+                        )
+                    elif handle.runtime_type == "kubernetes" and not runtime_handle_durable:
+                        # A newly prepared Job is suspended until its handle is
+                        # durable. Exact Kubernetes UID/session/spec fences make
+                        # this a safe compensation path even when the DB write
+                        # failed before cleanup ownership could be established.
+                        await self.runtime.cleanup(handle)
+                    elif await self._runtime_cleanup_owned(handle, execution):
+                        await self.runtime.cleanup(handle)
+                    else:
+                        self.logger.warning(
+                            "runtime cleanup skipped after DB ownership fence changed",
+                            task_id=str(execution.task_id),
+                            execution_id=str(execution.execution_id),
+                            runtime_object_id=handle.object_id,
+                        )
                 except Exception as exc:
                     self.logger.error(
                         "runtime cleanup failed",
@@ -370,7 +438,16 @@ class TaskExecutor:
                         runtime_object_id=handle.object_id,
                         error=redact_text(str(exc), secret_values),
                     )
-            if self.artifact_workspace is not None and prepared_artifacts is not None:
+            if (
+                self.artifact_workspace is not None
+                and prepared_artifacts is not None
+                and not (
+                    handle is not None
+                    and handle.runtime_type == "kubernetes"
+                    and runtime_handle_durable
+                    and execution.relinquish_requested.is_set()
+                )
+            ):
                 try:
                     await self.artifact_workspace.cleanup(prepared_artifacts)
                 except Exception as exc:
@@ -393,6 +470,41 @@ class TaskExecutor:
                 execution_id=execution.execution_id,
                 lease_seconds=self.settings.task_lease_seconds,
                 worker_session_id=self.worker_session_id,
+                kubernetes_cleanup_grace_seconds=self.settings.kubernetes_cleanup_grace_seconds,
+            )
+
+    async def _record_runtime_handle(
+        self,
+        execution: ActiveExecution,
+        handle: RuntimeHandle,
+    ) -> None:
+        if handle.runtime_type != "kubernetes":
+            return
+        if self.worker_session_id is None or handle.controller_session_id != self.worker_session_id:
+            raise StaleExecutionError("Kubernetes Job handle controller session is stale")
+        try:
+            runtime_worker_session_id = uuid.UUID(handle.labels["mini-ai-cloud/worker-session-id"])
+        except (KeyError, ValueError) as exc:
+            raise RuntimeError(
+                "Kubernetes Job handle has an invalid creation worker session"
+            ) from exc
+        async with self.database.session() as session, session.begin():
+            await TaskRepository.record_runtime_handle(
+                session,
+                task_id=execution.task_id,
+                worker_id=self.worker_id,
+                execution_id=execution.execution_id,
+                runtime_type=handle.runtime_type,
+                resource_kind=handle.resource_kind,
+                resource_name=handle.object_id,
+                namespace=handle.namespace,
+                resource_uid=handle.resource_uid,
+                runtime_worker_session_id=runtime_worker_session_id,
+                spec_hash=handle.spec_hash,
+                observed_pod_name=handle.observation.pod_name,
+                observed_pod_uid=handle.observation.pod_uid,
+                worker_session_id=self.worker_session_id,
+                kubernetes_cleanup_grace_seconds=self.settings.kubernetes_cleanup_grace_seconds,
             )
 
     async def _resolve_secrets(self, task: Task, execution: ActiveExecution) -> ResolvedTaskSecrets:
@@ -421,6 +533,28 @@ class TaskExecutor:
                 execution_id=execution.execution_id,
                 lease_seconds=self.settings.task_lease_seconds,
                 worker_session_id=self.worker_session_id,
+                kubernetes_cleanup_grace_seconds=self.settings.kubernetes_cleanup_grace_seconds,
+            )
+
+    async def _preserve_kubernetes_handoff_lease(
+        self,
+        execution: ActiveExecution,
+        task: Task,
+        handle: RuntimeHandle,
+    ) -> None:
+        if handle.runtime_type != "kubernetes" or self.worker_session_id is None:
+            raise StaleExecutionError("only a fenced Kubernetes Job can be relinquished")
+        # Kubernetes enforces the task timeout as Job.activeDeadlineSeconds. Keep
+        # the database lease through that deadline and Pod termination grace so
+        # lease recovery cannot start an overlapping retry.
+        async with self.database.session() as session, session.begin():
+            await TaskRepository.preserve_kubernetes_handoff_lease(
+                session,
+                task_id=execution.task_id,
+                worker_id=self.worker_id,
+                execution_id=execution.execution_id,
+                worker_session_id=self.worker_session_id,
+                cleanup_grace_seconds=self.settings.kubernetes_cleanup_grace_seconds,
             )
 
     async def _mark_starting(self, execution: ActiveExecution) -> None:
@@ -432,6 +566,7 @@ class TaskExecutor:
                 execution_id=execution.execution_id,
                 lease_seconds=self.settings.task_lease_seconds,
                 worker_session_id=self.worker_session_id,
+                kubernetes_cleanup_grace_seconds=self.settings.kubernetes_cleanup_grace_seconds,
             )
 
     async def _wait_for_outcome(
@@ -459,6 +594,8 @@ class TaskExecutor:
 
     async def _watch_for_stop(self, execution: ActiveExecution) -> str:
         while True:
+            if execution.relinquish_requested.is_set():
+                return "relinquish"
             if execution.ownership_lost.is_set():
                 return "ownership_lost"
             if execution.log_limit_exceeded.is_set():
@@ -475,6 +612,8 @@ class TaskExecutor:
             await asyncio.sleep(0.25)
 
     async def _pre_start_stop_reason(self, execution: ActiveExecution) -> str | None:
+        if execution.relinquish_requested.is_set():
+            return "relinquish"
         if execution.ownership_lost.is_set():
             return "ownership_lost"
         async with self.database.session() as session:
@@ -510,14 +649,32 @@ class TaskExecutor:
             LogStream.STDOUT: StreamingSecretRedactor(secret_values),
             LogStream.STDERR: StreamingSecretRedactor(secret_values),
         }
+        cursor_mode = handle.runtime_type == "kubernetes"
+        latest_cursor = {
+            LogStream.STDOUT: handle.observation.log_cursor_bytes,
+            LogStream.STDERR: handle.observation.log_cursor_bytes,
+        }
+        saw_durable_cursor = False
 
         async def finish_redactors() -> None:
             for stream in (LogStream.STDOUT, LogStream.STDERR):
                 tail = redactors[stream].finish()
-                if tail:
+                if (
+                    cursor_mode
+                    and saw_durable_cursor
+                    and (tail or latest_cursor[stream] > handle.observation.log_cursor_bytes)
+                ):
+                    await self._persist_cursor_log(
+                        handle,
+                        execution,
+                        stream,
+                        tail,
+                        cursor_bytes=latest_cursor[stream],
+                    )
+                elif tail:
                     await coalescer.add(stream, tail)
 
-        total = 0
+        total = handle.observation.log_cursor_bytes if cursor_mode else 0
         logs = self.runtime.logs(handle, ready=ready).__aiter__()
 
         async def next_log() -> RuntimeLog:
@@ -547,20 +704,40 @@ class TaskExecutor:
                     break
                 pending_item = None
                 stream = LogStream.STDOUT if item.stream == "stdout" else LogStream.STDERR
-                remaining = self.settings.max_task_log_bytes - total
+                remaining = max(0, self.settings.max_task_log_bytes - total)
                 accepted = item.content[:remaining]
                 if accepted:
                     redacted = redactors[stream].feed(accepted)
-                    if redacted:
+                    if item.cursor_bytes is not None:
+                        if not cursor_mode:
+                            raise RuntimeError("only Kubernetes logs may carry a durable cursor")
+                        saw_durable_cursor = True
+                        accepted_cursor = item.cursor_bytes - (len(item.content) - len(accepted))
+                        if accepted_cursor < latest_cursor[stream]:
+                            raise RuntimeError("Kubernetes log cursor moved backwards")
+                        latest_cursor[stream] = accepted_cursor
+                        safe_cursor = accepted_cursor - redactors[stream].pending_bytes
+                        if redacted or safe_cursor > handle.observation.log_cursor_bytes:
+                            await self._persist_cursor_log(
+                                handle,
+                                execution,
+                                stream,
+                                redacted,
+                                cursor_bytes=safe_cursor,
+                            )
+                    elif cursor_mode and handle.observation.log_cursor_bytes:
+                        raise RuntimeError("adopted Kubernetes logs require a durable cursor")
+                    elif redacted:
                         await coalescer.add(stream, redacted)
                     total += len(accepted)
-                    if coalescer.has_pending and flush_deadline is None:
+                    if not cursor_mode and coalescer.has_pending and flush_deadline is None:
                         flush_deadline = time.monotonic() + _LOG_COALESCE_FLUSH_INTERVAL_SECONDS
-                    elif not coalescer.has_pending:
+                    elif not cursor_mode and not coalescer.has_pending:
                         flush_deadline = None
                 if len(accepted) < len(item.content) or total >= self.settings.max_task_log_bytes:
                     await finish_redactors()
-                    await coalescer.flush_all()
+                    if not cursor_mode:
+                        await coalescer.flush_all()
                     await self._system_log(
                         execution,
                         "task log limit reached; stopping container to protect the control plane",
@@ -578,7 +755,8 @@ class TaskExecutor:
             # Async-generator completion, executor cancellation, and drain timeout
             # all pass through here, so a sub-threshold tail is still durable.
             await finish_redactors()
-            await coalescer.flush_all()
+            if not cursor_mode:
+                await coalescer.flush_all()
 
     async def _drain_log_task(
         self, log_task: asyncio.Task[None], execution: ActiveExecution
@@ -624,6 +802,66 @@ class TaskExecutor:
                 error=str(exc),
             )
 
+    async def _persist_cursor_log(
+        self,
+        handle: RuntimeHandle,
+        execution: ActiveExecution,
+        stream: LogStream,
+        content: bytes,
+        *,
+        cursor_bytes: int,
+    ) -> None:
+        if (
+            self.worker_session_id is None
+            or handle.resource_uid is None
+            or handle.spec_hash is None
+        ):
+            raise StaleExecutionError("Kubernetes log cursor is missing an execution fence")
+        if cursor_bytes < handle.observation.log_cursor_bytes:
+            raise StaleExecutionError("Kubernetes log cursor must be monotonic")
+        chunks = [
+            content[offset : offset + self.settings.max_log_chunk_bytes]
+            for offset in range(0, len(content), self.settings.max_log_chunk_bytes)
+        ]
+        persisted_logs = []
+        async with self.database.session() as session, session.begin():
+            for chunk in chunks:
+                persisted_logs.append(
+                    await TaskRepository.append_log(
+                        session,
+                        task_id=execution.task_id,
+                        execution_id=execution.execution_id,
+                        stream=stream,
+                        content=chunk.decode("utf-8", "replace"),
+                        worker_id=self.worker_id,
+                        worker_session_id=self.worker_session_id,
+                    )
+                )
+            await TaskRepository.advance_runtime_log_cursor(
+                session,
+                task_id=execution.task_id,
+                worker_id=self.worker_id,
+                execution_id=execution.execution_id,
+                cursor_bytes=cursor_bytes,
+                resource_name=handle.object_id,
+                resource_uid=handle.resource_uid,
+                spec_hash=handle.spec_hash,
+                worker_session_id=self.worker_session_id,
+            )
+        handle.observation.log_cursor_bytes = cursor_bytes
+        for log in persisted_logs:
+            try:
+                await self.queue.publish_log(
+                    task_id=execution.task_id,
+                    sequence=log.sequence,
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "Redis log wakeup failed; PostgreSQL log remains durable",
+                    task_id=str(execution.task_id),
+                    error=str(exc),
+                )
+
     async def _best_effort_log(self, execution: ActiveExecution, content: str) -> None:
         try:
             await self._system_log(execution, content)
@@ -631,16 +869,55 @@ class TaskExecutor:
             return
 
     async def _best_effort_stop(
-        self, handle: RuntimeHandle, *, secret_values: tuple[str, ...] = ()
+        self,
+        handle: RuntimeHandle,
+        *,
+        execution: ActiveExecution,
+        secret_values: tuple[str, ...] = (),
     ) -> None:
         try:
-            await self.runtime.stop(handle)
+            await self._stop_owned(handle, execution)
+        except StaleExecutionError:
+            return
         except Exception as exc:
             self.logger.error(
                 "failed to stop runtime object",
                 runtime_type=handle.runtime_type,
                 runtime_object_id=handle.object_id,
                 error=redact_text(str(exc), secret_values),
+            )
+
+    async def _stop_owned(
+        self,
+        handle: RuntimeHandle,
+        execution: ActiveExecution,
+    ) -> None:
+        if not await self._runtime_cleanup_owned(handle, execution):
+            raise StaleExecutionError(
+                "runtime deletion skipped because controller ownership changed"
+            )
+        await self.runtime.stop(handle)
+
+    async def _runtime_cleanup_owned(
+        self,
+        handle: RuntimeHandle,
+        execution: ActiveExecution,
+    ) -> bool:
+        if handle.runtime_type != "kubernetes":
+            return True
+        if self.worker_session_id is None:
+            return False
+        async with self.database.session() as session:
+            return await TaskRepository.runtime_cleanup_owned(
+                session,
+                task_id=execution.task_id,
+                worker_id=self.worker_id,
+                execution_id=execution.execution_id,
+                worker_session_id=self.worker_session_id,
+                runtime_type=handle.runtime_type,
+                resource_name=handle.object_id,
+                resource_uid=handle.resource_uid,
+                spec_hash=handle.spec_hash,
             )
 
     def _execution_spec(
@@ -675,7 +952,9 @@ class TaskExecutor:
             runtime_profile_digest=task.runtime_profile_digest,
             model_variant_id=task.model_variant_id,
             allocation_authority=task.allocation_authority,
+            kubernetes_node_name=task.kubernetes_node_name,
             mounts=mounts,
+            worker_session_id=self.worker_session_id,
         )
 
     async def _finish(

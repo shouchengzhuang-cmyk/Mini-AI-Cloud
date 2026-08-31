@@ -14,7 +14,7 @@
 | Host API/Worker | 调试 Python 进程 | 与 daemon 共享宿主路径时使用单文件 bind；URL host 应为 `localhost` |
 | Kind | Kubernetes runtime 测试 | 不永久切换用户既有 context；测试后清理 |
 
-默认 Compose 同时把 `artifact-data` 挂给 API 与 Worker，让 Worker 能读取 Local Artifact bytes；Worker 的 execution workspace 则位于 `artifact-workspace-data`。若未显式设置 `DOCKER_ARTIFACT_WORKSPACE_VOLUME`，实际卷名从 `COMPOSE_PROJECT_NAME` 派生为 `<project>-task-workspaces`，因此专用测试/DR stack 不会与默认栈共享 workspace。Worker 通过 Docker socket 创建 sibling task container 时，只用 `VolumeOptions.Subpath` 暴露声明的单个 input/output 文件，避免把 Worker 容器内绝对路径当成 daemon 宿主 bind 路径。裸机 Worker 才走宿主单文件 bind；Kubernetes 路径仍是 pinned node 的 `hostPath(type=File)`。配置、mount options 与真实 Docker Subpath input→container→output E2E 均已有证据。
+默认 Compose 同时把 `artifact-data` 挂给 API 与 Worker，让 Worker 能读取 Local Artifact bytes；Worker 的 execution workspace 则位于 `artifact-workspace-data`。若未显式设置 `DOCKER_ARTIFACT_WORKSPACE_VOLUME`，实际卷名从 `COMPOSE_PROJECT_NAME` 派生为 `<project>-task-workspaces`，因此专用测试/DR stack 不会与默认栈共享 workspace。Worker 通过 Docker socket 创建 sibling task container 时，只用 `VolumeOptions.Subpath` 暴露声明的单个 input/output 文件，避免把 Worker 容器内绝对路径当成 daemon 宿主 bind 路径。裸机 Worker 才走宿主单文件 bind；Kubernetes development/test legacy 路径仍可使用 pinned node 的 `hostPath(type=File)`，production 则在 API 调用前拒绝 artifact-bearing Job。配置、mount options、真实 Docker Subpath input→container→output E2E 和 production fail-closed 回归均已有证据。
 
 启动前检查：
 
@@ -253,6 +253,11 @@ Controller rollout 时不要手工删除 serving Pod。正常 API Deployment res
 ## 多节点 Worker 边界
 
 每个 Worker 必须有唯一 `WORKER_ID`/hostname/node name，声明 `WORKER_RUNTIME_TYPES`、总/可分配 CPU/RAM、GPU device inventory、labels 与 taints。固定 ID 重注册不能清零旧 lease reservation。
+
+Helm StatefulSet Worker 在滚动替换时只保留已经持久化完整 Job handle 的 Kubernetes batch
+execution；新 Pod 继续用相同 ordinal 接管。永久缩容时，被移除的 ordinal 必须停止 Job。
+Worker 通过只读 `get` 自身 StatefulSet 的 desired replicas 区分两者；StatefulSet 正在删除、
+ordinal 不再期望、配置缺失或读取失败时一律 fail closed，不执行 relinquish。
 
 当前 shared token 只是一条过渡边界。跨主机部署前至少：
 

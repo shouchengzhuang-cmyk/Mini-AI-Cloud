@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mini-ai-cloud.fullname" . }}-runtime-profiles
+  namespace: {{ include "mini-ai-cloud.systemNamespace" . }}
+  labels:
+    {{- include "mini-ai-cloud.labels" . | nindent 4 }}
+    app.kubernetes.io/component: runtime-profiles
+data:
+  {{- range $path, $_ := .Files.Glob "runtime_profiles/*" }}
+  {{ base $path }}: |
+    {{- $.Files.Get $path | nindent 4 }}
+  {{- end }}

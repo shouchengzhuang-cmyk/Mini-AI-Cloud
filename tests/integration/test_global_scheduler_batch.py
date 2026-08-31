@@ -357,6 +357,7 @@ async def test_ascend_batch_uses_typed_quota_without_database_device_binding(
                     "runtime_profile_ids": [binding_id],
                     "capabilities": ["bfloat16", "streaming"],
                     "kubernetes_resource_name": "huawei.com/Ascend910",
+                    "kubernetes_node_name": "ascend-gpu-node",
                 }
                 for index in range(2)
             ],
@@ -427,6 +428,7 @@ async def test_ascend_batch_uses_typed_quota_without_database_device_binding(
     assert loaded_task is not None and loaded_task.selected_vendor == "huawei-ascend"
     assert loaded_task.runtime_profile_version == "2.0.0"
     assert loaded_task.gpu_device_ids == []
+    assert loaded_task.kubernetes_node_name == "ascend-gpu-node"
     assert reservation is not None
     assert reservation.allocation_authority == "kubernetes_device_plugin"
     assert reservation.requested_vendor == "huawei-ascend"

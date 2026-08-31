@@ -128,7 +128,7 @@ prepare -> start -> logs + wait -> stop -> cleanup
 ```
 
 - Docker：创建受限容器，使用具体 NVIDIA device request，不使用 `--gpus all`。
-- Kubernetes：创建带 task/project/execution labels 的对象，支持资源 request/limit、GPU、日志、停止和 reconciliation；Pod/Container 固定 UID/GID 65532、`runAsNonRoot`、`RuntimeDefault` seccomp、只读 rootfs 与 drop ALL。
+- Kubernetes：创建带 task/project/execution labels 的对象，支持资源 request/limit、GPU、日志、停止和 reconciliation；Pod/Container 固定 UID/GID 65532、`runAsNonRoot`、`RuntimeDefault` seccomp、只读 rootfs 与 drop ALL。batch Job 日志把已消费 raw-byte cursor 保存在 fenced runtime handle 中；TaskLog 写入与 cursor 前移使用同一 PostgreSQL 事务，rollout adoption 从该 cursor 跳过旧前缀并继续用完整执行输出计算上限。
 - Fake：只用于 development/test，使无 GPU、无 vLLM 环境仍可验证完整控制面。
 - Docker vLLM controller：默认关闭，只能在具备 Docker socket 与真实 NVIDIA inventory 的专用 serving node 显式启用。它以独立 draining Worker 身份领取 replica intent，按 generation/execution/session fencing 管理容器，并为每个 Project/Service 使用隔离的缓存卷；本机无 GPU 时只验证 lifecycle/spec，不把它写成真实推理实测。
 - Kubernetes serving：采用独立 long-running runtime boundary，不复用 batch `wait/logs/terminal` 语义。它为 Fake Replica 只创建 Pod，通过预置的 headless Service 获得 Pod 专属 DNS，等 Kubernetes Ready condition 成立后才开放 Gateway 流量；controller 没有 Service 写权限。应用 shutdown 只关闭 client，启动恢复会 adopt 仍由数据库 execution 持有的 Pod。
@@ -183,7 +183,7 @@ Task schema 可声明 `inputs` 与输出 `artifacts`。`ArtifactWorkspaceManager
 
 Docker runtime 有两种文件交付方式。默认 Compose 中，Worker 在随 Compose project 派生的 `artifact-workspace-data` 卷内准备 workspace；通过 socket 创建的 sibling task container 使用同一 Docker volume，并以 `VolumeOptions.Subpath` 逐个挂载已声明文件，从而不依赖 Worker 容器路径在 daemon 宿主命名空间中可见，也不与其他 Compose project 共享 workspace。裸机 Worker 与 Docker daemon 共享宿主文件系统时，不配置 workspace volume，runtime 继续使用受控的单文件 bind。两种方式都是 input `ro`、output `rw`，都不把整个 artifact root 暴露给 workload。
 
-Kubernetes runtime 把 Pod 固定到 Worker 声明的 node，并为每个文件生成 `hostPath(type=File)`；这要求 Worker workspace 与目标 node 共享同一绝对路径。当前证据包括 executor/workspace 自动化测试和真实 Docker named-volume Subpath input→container→output E2E；Kubernetes 仍只有 Pod/NetworkPolicy spec 测试，尚未在 Kind 验证真实文件可见性。生产多节点更适合受控 object-store download/upload、PVC 或 CSI，而不是跨节点假设 hostPath 可见。
+Kubernetes runtime 只在 development/test 的 legacy artifact 路径把非 Runtime Profile Job 固定到 Worker 声明的 node，并为每个文件生成 `hostPath(type=File)`；这要求 Worker workspace 与目标 node 共享同一绝对路径。production 会在 Kubernetes API 调用前拒绝所有声明 artifact mount 的任务，不会把该路径当作跨节点数据面。当前证据包括 executor/workspace 自动化测试、真实 Docker named-volume Subpath input→container→output E2E，以及 production fail-closed 单元回归；生产多节点仍需另行实现和验收受控 object-store download/upload、PVC 或 CSI。
 
 ## DAG
 

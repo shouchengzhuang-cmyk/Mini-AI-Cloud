@@ -158,6 +158,7 @@ class Task(Base):
     gpu_memory_mb: Mapped[int] = mapped_column(Integer, default=0)
     gpu_model: Mapped[str | None] = mapped_column(String(255))
     gpu_device_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    kubernetes_node_name: Mapped[str | None] = mapped_column(String(253))
     accelerator_request_json: Mapped[dict[str, object] | None] = mapped_column(
         JSON(none_as_null=True)
     )

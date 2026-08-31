@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.accelerators import kind_for_vendor
@@ -126,6 +126,7 @@ class BatchAdmissionSnapshot:
     allocation_authority: AllocationAuthority
     accelerator_resource_name: str
     selection_policy: AcceleratorSelectionPolicy
+    node_name: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,6 +331,7 @@ def _batch_homogeneous_compatible_devices(
     *,
     inventory: Sequence[InventoryDeviceSnapshot],
     worker_id: str,
+    node_name: str | None = None,
     vendor: AcceleratorVendor,
     kind: AcceleratorKind,
     model: str,
@@ -350,6 +352,7 @@ def _batch_homogeneous_compatible_devices(
         (device.worker_id, device.node_name)
         for device in inventory
         if device.worker_id == worker_id
+        and (node_name is None or device.node_name == node_name)
         and device.health in {"healthy", "inventory-only"}
         and device.vendor == vendor
         and device.kind == kind
@@ -387,6 +390,7 @@ def _batch_pool_available_capacity(
     *,
     inventory: Sequence[InventoryDeviceSnapshot],
     worker_id: str,
+    node_name: str | None = None,
     vendor: AcceleratorVendor,
     kind: AcceleratorKind,
     model: str,
@@ -414,6 +418,7 @@ def _batch_pool_available_capacity(
     for device in _batch_homogeneous_compatible_devices(
         inventory=inventory,
         worker_id=worker_id,
+        node_name=node_name,
         vendor=vendor,
         kind=kind,
         model=model,
@@ -573,8 +578,8 @@ class AdmissionRepository:
             if runtime_type == RuntimeType.KUBERNETES:
                 try:
                     node_name = validate_kubernetes_dns_subdomain(
-                        worker.node_name,
-                        field_name="worker node_name",
+                        device.kubernetes_node_name or worker.node_name,
+                        field_name="accelerator node_name",
                     )
                 except (TypeError, ValueError):
                     continue
@@ -646,6 +651,7 @@ class AdmissionRepository:
         *,
         catalog: RuntimeProfileCatalog,
         worker_id: str,
+        node_name: str,
         vendor: AcceleratorVendor,
         kind: AcceleratorKind,
         model: str,
@@ -695,6 +701,7 @@ class AdmissionRepository:
         return _batch_pool_available_capacity(
             inventory=inventory,
             worker_id=worker_id,
+            node_name=node_name,
             vendor=vendor,
             kind=kind,
             model=model,
@@ -818,7 +825,7 @@ class AdmissionRepository:
         candidates: list[AdmissionCandidate] = []
         bindings: dict[str, tuple[InventoryDeviceSnapshot, str, str, str]] = {}
         groups: dict[
-            tuple[str, AcceleratorVendor, AcceleratorKind, str, str, str, str, str],
+            tuple[str, str, AcceleratorVendor, AcceleratorKind, str, str, str, str, str],
             list[InventoryDeviceSnapshot],
         ] = {}
         for device in candidate_inventory:
@@ -847,6 +854,7 @@ class AdmissionRepository:
                     continue
                 group_key = (
                     device.worker_id,
+                    device.node_name,
                     device.vendor,
                     device.kind,
                     device.model,
@@ -862,6 +870,7 @@ class AdmissionRepository:
         ):
             (
                 worker_id,
+                node_name,
                 vendor,
                 kind,
                 model,
@@ -879,6 +888,7 @@ class AdmissionRepository:
             compatible_devices = _batch_homogeneous_compatible_devices(
                 inventory=inventory,
                 worker_id=worker_id,
+                node_name=node_name,
                 vendor=vendor,
                 kind=kind,
                 model=model,
@@ -898,7 +908,7 @@ class AdmissionRepository:
                 )
                 | profile_capabilities
             )
-            candidate_id = f"{worker_id}:{profile_id}@{profile_version}:{model}:{index}"
+            candidate_id = f"{worker_id}:{node_name}:{profile_id}@{profile_version}:{model}:{index}"
             finite_quota = typed_quota_available(quota, vendor)
             candidate = AdmissionCandidate(
                 candidate_id=candidate_id,
@@ -913,6 +923,7 @@ class AdmissionRepository:
                 available_capacity=_batch_pool_available_capacity(
                     inventory=inventory,
                     worker_id=worker_id,
+                    node_name=node_name,
                     vendor=vendor,
                     kind=kind,
                     model=model,
@@ -985,6 +996,7 @@ class AdmissionRepository:
                 allocation_authority=selected.allocation_authority,
                 accelerator_resource_name=resource_name,
                 selection_policy=request.selection_policy,
+                node_name=device.node_name,
             ),
             reason=None,
             rejected_vendor=None,
@@ -1833,7 +1845,7 @@ async def _active_deferred_accelerators(
         select(
             ResourceReservation.worker_id,
             ResourceReservation.worker_session_id,
-            Worker.node_name,
+            func.coalesce(Task.kubernetes_node_name, Worker.node_name),
             Worker.worker_session_id,
             ResourceReservation.requested_vendor,
             ResourceReservation.requested_profile_id,
@@ -1843,6 +1855,7 @@ async def _active_deferred_accelerators(
             ResourceReservation.observed_device_ids_json,
         )
         .join(Worker, Worker.id == ResourceReservation.worker_id)
+        .join(Task, Task.id == ResourceReservation.task_id)
         .where(
             ResourceReservation.released_at.is_(None),
             ResourceReservation.allocation_authority

@@ -7,6 +7,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from kubernetes_asyncio import client
 from kubernetes_asyncio.client.exceptions import ApiException
 
 from scripts.validate_runtime_profiles import load_profile
@@ -184,6 +185,110 @@ def test_nonaccelerator_contract_hash_remains_compatible_with_a4() -> None:
     )
 
     assert selector[SPEC_HASH_LABEL] == "9ae65e930dfffd128522b1a3d56861f6"
+
+
+async def test_configured_service_account_enters_serving_contract_hash() -> None:
+    base = _runtime(SimpleNamespace())._selector_labels(
+        _spec(),
+        worker_id="k8s-serving-worker",
+        worker_session_id=WORKER_SESSION_ID,
+    )
+    runtime = KubernetesServingRuntimeAdapter(
+        namespace="serving-tests",
+        cluster_id="kind-serving-test",
+        termination_grace_seconds=17,
+        service_account_name="serving-runtime",
+        image_pull_secrets=("registry-pull", "secondary-registry", "registry-pull"),
+        api=SimpleNamespace(),
+    )
+    configured = runtime._selector_labels(
+        _spec(),
+        worker_id="k8s-serving-worker",
+        worker_session_id=WORKER_SESSION_ID,
+    )
+    pod = runtime._build_pod(_spec(), configured)
+
+    assert pod.spec.service_account_name == "serving-runtime"
+    assert [item.name for item in pod.spec.image_pull_secrets] == [
+        "registry-pull",
+        "secondary-registry",
+    ]
+    assert configured[SPEC_HASH_LABEL] != base[SPEC_HASH_LABEL]
+
+    api = _prepare_api()
+    api.create_namespaced_pod.side_effect = ApiException(status=409)
+    api.read_namespaced_pod = AsyncMock(return_value=pod)
+    changed = KubernetesServingRuntimeAdapter(
+        namespace="serving-tests",
+        cluster_id="kind-serving-test",
+        termination_grace_seconds=17,
+        service_account_name="new-serving-runtime",
+        api=api,
+    )
+
+    with pytest.raises(KubernetesServingOwnershipError, match="fencing labels"):
+        await changed.prepare(
+            _spec(),
+            worker_id="k8s-serving-worker",
+            worker_session_id=WORKER_SESSION_ID,
+        )
+
+
+async def test_prepare_accepts_default_service_account_with_configured_pull_secret() -> None:
+    api = _prepare_api()
+    runtime = KubernetesServingRuntimeAdapter(
+        namespace="serving-tests",
+        cluster_id="kind-serving-test",
+        image_pull_secrets=("registry-pull",),
+        api=api,
+    )
+    spec = _spec()
+    selector = runtime._selector_labels(
+        spec,
+        worker_id="k8s-serving-worker",
+        worker_session_id=WORKER_SESSION_ID,
+    )
+    pod = runtime._build_pod(spec, selector)
+    pod.spec.service_account_name = "default"
+    pod.spec.image_pull_secrets.append(client.V1LocalObjectReference(name="injected-registry"))
+    api.create_namespaced_pod.side_effect = ApiException(status=409)
+    api.read_namespaced_pod = AsyncMock(return_value=pod)
+
+    handle = await runtime.prepare(
+        spec,
+        worker_id="k8s-serving-worker",
+        worker_session_id=WORKER_SESSION_ID,
+    )
+
+    assert handle.object_id == pod.metadata.name
+
+
+async def test_prepare_accepts_service_account_injected_pull_secret() -> None:
+    api = _prepare_api()
+    runtime = KubernetesServingRuntimeAdapter(
+        namespace="serving-tests",
+        cluster_id="kind-serving-test",
+        service_account_name="serving-runtime",
+        api=api,
+    )
+    spec = _spec()
+    selector = runtime._selector_labels(
+        spec,
+        worker_id="k8s-serving-worker",
+        worker_session_id=WORKER_SESSION_ID,
+    )
+    pod = runtime._build_pod(spec, selector)
+    pod.spec.image_pull_secrets = [client.V1LocalObjectReference(name="service-account-pull")]
+    api.create_namespaced_pod.side_effect = ApiException(status=409)
+    api.read_namespaced_pod = AsyncMock(return_value=pod)
+
+    handle = await runtime.prepare(
+        spec,
+        worker_id="k8s-serving-worker",
+        worker_session_id=WORKER_SESSION_ID,
+    )
+
+    assert handle.object_id == pod.metadata.name
 
 
 async def test_prepare_builds_secure_fenced_pod_with_static_headless_dns() -> None:

@@ -1,0 +1,399 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "Mini AI Cloud Helm values",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "global",
+    "namespaces",
+    "image",
+    "existingSecret",
+    "config",
+    "workload",
+    "controlPlane",
+    "worker",
+    "service",
+    "storage",
+    "migration"
+  ],
+  "properties": {
+    "nameOverride": {
+      "type": "string",
+      "maxLength": 63
+    },
+    "fullnameOverride": {
+      "type": "string",
+      "maxLength": 63
+    },
+    "global": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["testMode"],
+      "properties": {
+        "testMode": {"type": "boolean"}
+      }
+    },
+    "namespaces": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["system", "workload"],
+      "properties": {
+        "system": {
+          "type": "string",
+          "pattern": "^$|^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$"
+        },
+        "workload": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 63,
+          "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$"
+        }
+      }
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "tag", "digest", "pullPolicy", "pullSecrets"],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "tag": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "not": {"const": "latest"}
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^$|^sha256:[a-f0-9]{64}$"
+        },
+        "pullPolicy": {
+          "type": "string",
+          "enum": ["Always", "IfNotPresent", "Never"]
+        },
+        "pullSecrets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 253
+          }
+        }
+      }
+    },
+    "existingSecret": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "keys"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253,
+          "pattern": "^[a-z0-9](?:[-.a-z0-9]{0,251}[a-z0-9])?$"
+        },
+        "keys": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "databaseUrl",
+            "redisUrl",
+            "apiKeyPepper",
+            "workerAuthToken",
+            "secretMasterKey",
+            "bootstrapToken"
+          ],
+          "properties": {
+            "databaseUrl": {"$ref": "#/definitions/secretKey"},
+            "redisUrl": {"$ref": "#/definitions/secretKey"},
+            "apiKeyPepper": {"$ref": "#/definitions/secretKey"},
+            "workerAuthToken": {"$ref": "#/definitions/secretKey"},
+            "secretMasterKey": {"$ref": "#/definitions/secretKey"},
+            "bootstrapToken": {"$ref": "#/definitions/secretKey"}
+          }
+        }
+      }
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "appEnvironment",
+        "clusterId",
+        "servingClusterId",
+        "logLevel",
+        "bootstrapEnabled",
+        "artifactBackend",
+        "artifactS3Bucket",
+        "artifactS3EndpointUrl",
+        "servingEnabled",
+        "servingFakeEnabled",
+        "servingImage"
+      ],
+      "properties": {
+        "appEnvironment": {
+          "type": "string",
+          "enum": ["development", "test", "production"]
+        },
+        "clusterId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 63,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+        },
+        "servingClusterId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 63,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$"
+        },
+        "logLevel": {
+          "type": "string",
+          "enum": ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+        },
+        "bootstrapEnabled": {"type": "boolean"},
+        "artifactBackend": {
+          "type": "string",
+          "enum": ["local", "s3"]
+        },
+        "artifactS3Bucket": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "artifactS3EndpointUrl": {
+          "type": "string",
+          "maxLength": 2048
+        },
+        "servingEnabled": {"type": "boolean"},
+        "servingFakeEnabled": {"type": "boolean"},
+        "servingImage": {
+          "type": "string",
+          "maxLength": 512
+        }
+      }
+    },
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["serviceAccountName", "imagePullSecrets"],
+      "properties": {
+        "serviceAccountName": {
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^$|^[a-z0-9](?:[-.a-z0-9]{0,251}[a-z0-9])?$"
+        },
+        "imagePullSecrets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 253,
+            "pattern": "^[a-z0-9](?:[-.a-z0-9]{0,251}[a-z0-9])?$"
+          }
+        }
+      }
+    },
+    "controlPlane": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["replicas", "terminationGracePeriodSeconds", "resources"],
+      "properties": {
+        "replicas": {
+          "type": "integer",
+          "const": 1
+        },
+        "terminationGracePeriodSeconds": {
+          "type": "integer",
+          "minimum": 10,
+          "maximum": 3600
+        },
+        "resources": {"$ref": "#/definitions/resources"}
+      }
+    },
+    "worker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "replicas",
+        "concurrency",
+        "terminationGracePeriodSeconds",
+        "resources"
+      ],
+      "properties": {
+        "replicas": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 128
+        },
+        "concurrency": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 128
+        },
+        "terminationGracePeriodSeconds": {
+          "type": "integer",
+          "minimum": 10,
+          "maximum": 3600
+        },
+        "resources": {"$ref": "#/definitions/resources"}
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "port", "nodePort"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["ClusterIP", "LoadBalancer", "NodePort"]
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "nodePort": {
+          "anyOf": [
+            {"type": "null"},
+            {"type": "integer", "minimum": 30000, "maximum": 32767}
+          ]
+        }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tmpSizeLimit", "localDataSizeLimit"],
+      "properties": {
+        "tmpSizeLimit": {"$ref": "#/definitions/quantity"},
+        "localDataSizeLimit": {"$ref": "#/definitions/quantity"}
+      }
+    },
+    "migration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["activeDeadlineSeconds", "ttlSecondsAfterFinished", "resources"],
+      "properties": {
+        "activeDeadlineSeconds": {
+          "type": "integer",
+          "minimum": 30,
+          "maximum": 7200
+        },
+        "ttlSecondsAfterFinished": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 86400
+        },
+        "resources": {"$ref": "#/definitions/resources"}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "service": {
+            "properties": {
+              "type": {"const": "NodePort"}
+            },
+            "required": ["type"]
+          }
+        },
+        "required": ["service"]
+      },
+      "then": {
+        "properties": {
+          "global": {
+            "properties": {
+              "testMode": {"const": true}
+            },
+            "required": ["testMode"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "config": {
+            "properties": {
+              "servingFakeEnabled": {"const": true}
+            },
+            "required": ["servingFakeEnabled"]
+          }
+        },
+        "required": ["config"]
+      },
+      "then": {
+        "properties": {
+          "config": {
+            "properties": {
+              "appEnvironment": {"enum": ["development", "test"]},
+              "servingEnabled": {"const": true}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "config": {
+            "properties": {
+              "servingEnabled": {"const": true}
+            },
+            "required": ["servingEnabled"]
+          }
+        },
+        "required": ["config"]
+      },
+      "then": {
+        "properties": {
+          "config": {
+            "properties": {
+              "servingImage": {"minLength": 1}
+            }
+          }
+        }
+      }
+    }
+  ],
+  "definitions": {
+    "secretKey": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 253,
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "quantity": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32,
+      "pattern": "^[0-9]+(?:[EPTGMK]i?|m)?$"
+    },
+    "resourceMap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpu", "memory"],
+      "properties": {
+        "cpu": {"$ref": "#/definitions/quantity"},
+        "memory": {"$ref": "#/definitions/quantity"}
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requests", "limits"],
+      "properties": {
+        "requests": {"$ref": "#/definitions/resourceMap"},
+        "limits": {"$ref": "#/definitions/resourceMap"}
+      }
+    }
+  }
+}
