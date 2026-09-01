@@ -790,7 +790,7 @@ class KindAdaptationHarness:
             outcomes,
             claim,
             "helm-lint",
-            (self.config.tools.helm, "lint", str(self.config.chart_root)),
+            self._helm_lint_command(),
         )
         self._record(
             outcomes,
@@ -1901,6 +1901,14 @@ class KindAdaptationHarness:
         for flag, name, value in values:
             result.extend((flag, f"{name}={value}"))
         return tuple(result)
+
+    def _helm_lint_command(self) -> tuple[str, ...]:
+        return (
+            self.config.tools.helm,
+            "lint",
+            str(self.config.chart_root),
+            *self._helm_values(),
+        )
 
     def _helm_command(self, *, log_level: str) -> list[str]:
         return [
