@@ -168,7 +168,7 @@ def _assert_security(documents: list[dict[str, Any]]) -> None:
     inventory_role = inventory_roles[0]
     inventory_name = str(inventory_role["metadata"]["name"])
     if canonical_rules(inventory_role) != {
-        (("",), ("nodes",), ("get",)),
+        (("",), ("nodes",), ("list",)),
         (("",), ("pods",), ("list",)),
     }:
         raise RuntimeError("Worker inventory ClusterRole exceeds its read-only contract")
