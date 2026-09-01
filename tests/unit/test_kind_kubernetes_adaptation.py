@@ -254,6 +254,13 @@ def test_helm_values_bind_unique_scopes_digest_and_typed_test_flags(tmp_path: Pa
         assert f"config.servingImage={PINNED_APP}" in joined
         assert harness.credentials.bootstrap_token not in joined
         assert chart_fullname(harness.identity.release_name) == "mac-1234abcd-mini-ai-cloud"
+        lint_values = harness._helm_values()
+        assert harness._helm_lint_command() == (
+            "helm",
+            "lint",
+            str(harness.config.chart_root),
+            *lint_values,
+        )
     finally:
         assert harness._remove_temporary_state() is None
 
