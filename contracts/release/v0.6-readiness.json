@@ -1,44 +1,39 @@
 {
-  "authorization_status": "OWNER_AUTHORIZED_AND_PUBLISHED",
+  "authorization_status": "READY_FOR_OWNER_AUTHORIZATION",
   "deployment_status": "NOT_DEPLOYED",
   "kind_evidence": {
-    "git_sha": "ca0254230c988aef8327a3b078bc2fc86d95537e",
     "required_claim": "KIND_K8S_PASS",
-    "run_id": "m7-20260904135447-113f0c3a",
-    "status": "KIND_K8S_PASS"
+    "status": "PENDING_FINAL_P4_EVIDENCE"
   },
-  "publication_workflow_run": 33880679629,
   "real_hardware_status": "REAL_HW_NOT_RUN",
-  "real_non_kind_kubernetes_status": "E1_NOT_RUN",
-  "release_commit": "ca0254230c988aef8327a3b078bc2fc86d95537e",
-  "release_status": "RELEASED",
+  "release_status": "NOT_RELEASED",
   "schema_version": "1.0.0",
   "support_matrix": [
     {
       "capability": "helm-single-cluster-install",
       "implementation": "IMPLEMENTED",
-      "kind_evidence": "KIND_K8S_PASS",
+      "kind_evidence": "PENDING_FINAL_P4_EVIDENCE",
       "real_evidence": "E1_NOT_RUN"
     },
     {
       "capability": "fenced-kubernetes-batch-jobs",
       "implementation": "IMPLEMENTED",
-      "kind_evidence": "KIND_K8S_PASS",
+      "kind_evidence": "PENDING_FINAL_P4_EVIDENCE",
       "real_evidence": "E1_NOT_RUN"
     },
     {
       "capability": "runtime-profile-serving",
       "implementation": "IMPLEMENTED",
-      "kind_evidence": "KIND_K8S_PASS",
+      "kind_evidence": "PENDING_FINAL_P4_EVIDENCE",
       "real_evidence": "REAL_HW_NOT_RUN"
     },
     {
       "capability": "upgrade-uninstall-cleanup",
       "implementation": "IMPLEMENTED",
-      "kind_evidence": "KIND_K8S_PASS",
+      "kind_evidence": "PENDING_FINAL_P4_EVIDENCE",
       "real_evidence": "E1_NOT_RUN"
     }
   ],
-  "tag_status": "TAGGED_V0.6.0",
+  "tag_status": "NOT_TAGGED",
   "version": "0.6.0"
 }
