@@ -1,5 +1,33 @@
 # 验证证据矩阵与缺口台账
 
+## 2026-09-04 v0.6.0 发布收口
+
+发布基线：`v0.6.0` @ `ca0254230c988aef8327a3b078bc2fc86d95537e`。该 annotated tag 已解析到这一 exact commit；后续仅治理/文档收口的 `main` 提交不改变已发布基线。
+
+| 验收项 | 最终证据 | 状态 |
+| --- | --- | --- |
+| exact-SHA 发布前置门 | owner-gated workflow 要求 release candidate 等于当时 default-branch head，并要求该 SHA 的 `ci.yml` 与 `release-security.yml` 成功 | PASS |
+| 最终 P4 / Kind Kubernetes adaptation | `KIND_K8S_PASS`，run id `m7-20260904135447-113f0c3a`，绑定 release SHA `ca0254230c988aef8327a3b078bc2fc86d95537e` | PASS |
+| 完整 release gate | `1081 passed, 15 skipped`；Ruff format/check PASS；mypy 对 296 source files PASS；lock、Compose、evidence validation 均通过 | PASS |
+| wheel / package | `mini_ai_cloud-0.6.0-py3-none-any.whl` 构建成功，wheel smoke PASS，发布后重新下载并校验 | PASS |
+| bounded restart/fencing soak | 3/3 rounds，cleanup PASS | PASS |
+| isolated DR rehearsal | rehearsal PASS，cleanup PASS，redacted evidence artifact retained | PASS |
+| security / supply-chain publication gates | repository/image Trivy publication steps成功；CycloneDX SBOM、image SPDX SBOM、release checksums/evidence archive生成并在发布前重新下载校验 | PASS（见下方工具边界说明） |
+| Git tag / GitHub Release | annotated `v0.6.0` 创建并解析到 exact release SHA；Release 为 non-draft、non-prerelease、latest | PASS |
+| Real non-Kind Kubernetes | 未执行真实非 Kind 集群验收 | `E1_NOT_RUN` |
+| Real NVIDIA / CUDA / NCCL / vLLM | 未执行物理 NVIDIA 硬件验收 | `REAL_HW_NOT_RUN` |
+| Real Huawei Ascend / CANN / vLLM-Ascend | 未执行物理 Ascend 硬件验收 | `REAL_HW_NOT_RUN` |
+| Production deployment / HA / SLA | 未部署，未做生产 HA/SLA 认证 | `NOT_DEPLOYED` / NOT RUN |
+| Cross-repo Scheduler v2 producer→consumer smoke | Scheduler 有 v2 schema/golden fixture/consumer tests；Mini v0.6.0 release baseline 尚无匹配 v2 producer | `NOT_COMPLETE`，转真实硬件计划 G0 |
+
+安全工具边界：发布 workflow 中 Trivy 的 Helm 子扫描器曾输出其内部默认 Kubernetes `v1.20.0` 与 Chart `kubeVersion >=1.27.0-0` 不兼容的 render error；该 Trivy action 最终仍为 success，且 release workflow 另有实际 Kind/Kubernetes adaptation、Helm/release gate 与 exact-SHA security gate。这里记录真实工具行为，不把这条子扫描器 render error 擦掉，也不将其误写成独立 Helm security scan PASS。
+
+跨仓库最终软件基线、Scheduler v1/v2 契约和真实硬件前 G0 blocker 见 [`pre-real-hardware-baseline.md`](pre-real-hardware-baseline.md)。
+
+---
+
+以下保留 2026-08-25 的历史审计快照，用于追踪 v0.6.0 之前的证据演进；它不覆盖上面的最终发布收口事实。
+
 审计快照：2026-08-25。Phase IV-A.1 验收代码 head 为 `db26c3a2b1297f589f5323b87cbbe1cf9c20b766`。[GitHub Actions run 32812823700](https://github.com/shouchengzhuang-cmyk/Mini-AI-Cloud/actions/runs/32812823700) 的 `quality`、真实 PostgreSQL `integration` 与真实 `kind-serving-e2e` 均已通过。
 
 ## 状态含义
