@@ -59,4 +59,4 @@ GPU-Scheduler-Lab Issue #23 remains a deliberate deferred research item, not a r
 
 ## Gate to the next plan
 
-The software release closure is complete when this record, the v0.6 readiness documents and their machine-readable readiness contract are merged and stale M7-0 governance is closed. The next execution plan may then be the real-hardware plan, with G0 above as its first cross-repository prerequisite.
+The software release closure is complete when this record and the human-facing v0.6 readiness/verification documents are merged, the pre-publication machine readiness contract remains valid under `scripts/release_gate.py validate`, and stale M7-0 governance is closed. The next execution plan may then be the real-hardware plan, with G0 above as its first cross-repository prerequisite.
