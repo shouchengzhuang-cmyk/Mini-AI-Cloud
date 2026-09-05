@@ -1,9 +1,11 @@
+from sqlalchemy import Select
 from sqlalchemy.dialects import postgresql
 
+from models.task import Task
 from repositories.scheduling import SchedulingRepository
 
 
-def _compile(query: object) -> str:
+def _compile(query: Select[tuple[Task]]) -> str:
     return str(query.compile(dialect=postgresql.dialect()))
 
 
