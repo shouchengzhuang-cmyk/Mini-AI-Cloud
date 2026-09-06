@@ -152,6 +152,43 @@ async def test_batch_size_places_multiple_tasks_but_bounds_each_tick(database: D
     assert statuses.count(TaskStatus.QUEUED) == 1
 
 
+async def test_batch_commits_each_placement_before_selecting_the_next_candidate(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _register_worker(database, concurrency=2)
+    first_id = await _create_task(database, priority=60)
+    second_id = await _create_task(database, priority=50)
+    choose_candidates = SchedulingRepository.choose_candidates
+    calls = 0
+
+    async def assert_previous_placement_committed(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            async with database.session() as probe:
+                status = await probe.scalar(select(Task.status).where(Task.id == first_id))
+            assert status == TaskStatus.ASSIGNED
+        return await choose_candidates(*args, **kwargs)
+
+    monkeypatch.setattr(
+        SchedulingRepository,
+        "choose_candidates",
+        assert_previous_placement_committed,
+    )
+
+    result = await _scheduler(database, batch_size=2).run_once()
+
+    assert result.attempted_count == 2
+    assert result.placed_count == 2
+    assert calls == 2
+    async with database.session() as session:
+        statuses = list(
+            await session.scalars(select(Task.status).where(Task.id.in_((first_id, second_id))))
+        )
+    assert statuses == [TaskStatus.ASSIGNED, TaskStatus.ASSIGNED]
+
+
 async def test_batch_refreshes_drf_share_after_each_placement(database: Database) -> None:
     second_project_id = uuid.uuid4()
     async with database.session() as session, session.begin():

@@ -73,23 +73,28 @@ class GlobalScheduler:
         self._logger = get_logger("global_scheduler")
 
     async def run_once(self) -> GlobalSchedulerResult:
-        async with self._session_factory() as session, session.begin():
-            candidates = await SchedulingRepository.choose_candidates(
-                session,
-                aging_interval_seconds=self._aging_interval_seconds,
-                scan_limit=self._candidate_scan_limit,
-            )
-            if not candidates:
-                return GlobalSchedulerResult(None, None, False, "queue_empty")
+        first_result: GlobalSchedulerResult | None = None
+        attempted_count = 0
+        placed_count = 0
+        excluded_task_ids: set[uuid.UUID] = set()
 
-            workers = await SchedulingRepository.worker_snapshots(session)
-            first_result: GlobalSchedulerResult | None = None
-            attempted_count = 0
-            placed_count = 0
-            excluded_task_ids: set[uuid.UUID] = set()
-            pending_candidates = candidates
-            while pending_candidates and attempted_count < self._batch_size:
-                candidate = pending_candidates.pop(0)
+        while attempted_count < self._batch_size:
+            # A candidate mutation must not retain its Task, Worker, quota, or
+            # accelerator-inventory fences while the scheduler considers the
+            # next candidate. Each iteration obtains a fresh policy snapshot
+            # and commits before the following iteration begins.
+            async with self._session_factory() as session, session.begin():
+                candidates = await SchedulingRepository.choose_candidates(
+                    session,
+                    aging_interval_seconds=self._aging_interval_seconds,
+                    scan_limit=self._candidate_scan_limit,
+                    excluded_task_ids=frozenset(excluded_task_ids),
+                )
+                if not candidates:
+                    break
+
+                workers = await SchedulingRepository.worker_snapshots(session)
+                candidate = candidates[0]
                 attempted_count += 1
                 task_id = candidate.task.id
                 excluded_task_ids.add(task_id)
@@ -271,28 +276,17 @@ class GlobalScheduler:
                 _record_scheduler_metric("placed", None)
                 if first_result is None:
                     first_result = GlobalSchedulerResult(task.id, placement.worker_id, True)
-                # Subsequent candidates must see capacity and concrete GPU
-                # reservations consumed earlier in this same tick. Rebuilding
-                # the bounded pool also refreshes project dominant shares, so a
-                # batch cannot consume all slots from one project using a stale
-                # pre-placement DRF snapshot.
-                workers = await SchedulingRepository.worker_snapshots(session)
-                pending_candidates = await SchedulingRepository.choose_candidates(
-                    session,
-                    aging_interval_seconds=self._aging_interval_seconds,
-                    scan_limit=self._candidate_scan_limit,
-                    excluded_task_ids=frozenset(excluded_task_ids),
-                )
 
-            assert first_result is not None
-            return GlobalSchedulerResult(
-                task_id=first_result.task_id,
-                worker_id=first_result.worker_id,
-                placed=first_result.placed,
-                reason=first_result.reason,
-                attempted_count=attempted_count,
-                placed_count=placed_count,
-            )
+        if first_result is None:
+            return GlobalSchedulerResult(None, None, False, "queue_empty")
+        return GlobalSchedulerResult(
+            task_id=first_result.task_id,
+            worker_id=first_result.worker_id,
+            placed=first_result.placed,
+            reason=first_result.reason,
+            attempted_count=attempted_count,
+            placed_count=placed_count,
+        )
 
 
 def _admission_reason(rejected: Mapping[str, object]) -> str:
