@@ -50,6 +50,10 @@ class PlacementConflict(RuntimeError):
     """A concurrent scheduler changed a placement input."""
 
 
+class PreemptionContention(RuntimeError):
+    """Another scheduler holds the incoming task's preemption fence."""
+
+
 @dataclass(frozen=True, slots=True)
 class SchedulerCandidate:
     task: Task
@@ -789,11 +793,12 @@ class SchedulingRepository:
             # retain incoming-task locks in different orders and deadlock.
             .with_for_update(skip_locked=True)
         )
-        if (
-            incoming_task is None
-            or incoming_task.status != TaskStatus.QUEUED
-            or incoming_task.cancel_requested
-        ):
+        if incoming_task is None:
+            # A snapshot candidate disappearing is harmless: either another
+            # scheduler owns its preemption fence or it has left the queue.
+            # The caller must not fall through to a blocking task mutation.
+            raise PreemptionContention("incoming task is locked by another scheduler")
+        if incoming_task.status != TaskStatus.QUEUED or incoming_task.cancel_requested:
             return None
         incoming_snapshot = task_snapshot(incoming_task)
 
