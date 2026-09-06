@@ -113,12 +113,14 @@ class SchedulingRepository:
         excluded_task_ids: frozenset[uuid.UUID] = frozenset(),
         effective_priority_expression: ColumnElement[int] | None = None,
     ) -> Select[tuple[Task]]:
-        """Return a bounded effective-priority lane.
+        """Return a bounded effective-priority snapshot lane.
 
         ``choose_candidates`` supplies the database-specific aging expression.
         The oldest-first fallback keeps this query independently useful to
         diagnostics and compile-only tests without hiding aging behind a raw
-        priority cutoff.
+        priority cutoff. Candidate discovery deliberately does not lock rows;
+        ``place`` is the authoritative fenced mutation and resolves concurrent
+        scheduler races under row locks.
         """
 
         conditions = _candidate_conditions(excluded_task_ids)
@@ -141,7 +143,6 @@ class SchedulingRepository:
                 Task.id,
             )
             .limit(scan_limit)
-            .with_for_update(of=Task, skip_locked=True)
         )
 
     @staticmethod
@@ -150,7 +151,7 @@ class SchedulingRepository:
         *,
         excluded_task_ids: frozenset[uuid.UUID] = frozenset(),
     ) -> Select[tuple[Task]]:
-        """Return the bounded raw-priority lane used alongside the safety lanes."""
+        """Return the bounded raw-priority snapshot lane used alongside safety lanes."""
 
         return (
             select(Task)
@@ -163,7 +164,6 @@ class SchedulingRepository:
                 Task.id,
             )
             .limit(scan_limit)
-            .with_for_update(of=Task, skip_locked=True)
         )
 
     @staticmethod
@@ -176,7 +176,7 @@ class SchedulingRepository:
         excluded_task_ids: frozenset[uuid.UUID] = frozenset(),
         effective_priority_expression: ColumnElement[int] | None = None,
     ) -> Select[tuple[Task]]:
-        """Return one queue head per least-served project, with bounded locks."""
+        """Return one snapshot queue head per least-served project."""
 
         project_order: tuple[Any, ...]
         if effective_priority_expression is None:
@@ -242,7 +242,6 @@ class SchedulingRepository:
                 Task.id,
             )
             .limit(scan_limit)
-            .with_for_update(of=Task, skip_locked=True)
         )
 
     @staticmethod
@@ -253,7 +252,7 @@ class SchedulingRepository:
         scan_limit: int = 128,
         excluded_task_ids: frozenset[uuid.UUID] = frozenset(),
     ) -> list[SchedulerCandidate]:
-        """Build an exact policy order from three independently bounded lanes."""
+        """Build an exact policy order from three independently bounded snapshot lanes."""
 
         if scan_limit < 1:
             raise ValueError("scan_limit must be at least one")
