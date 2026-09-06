@@ -780,11 +780,25 @@ class SchedulingRepository:
         fenced ``preempted`` result.
         """
 
+        incoming_task = await session.scalar(
+            select(Task)
+            .where(Task.id == candidate.task.id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        if (
+            incoming_task is None
+            or incoming_task.status != TaskStatus.QUEUED
+            or incoming_task.cancel_requested
+        ):
+            return None
+        incoming_snapshot = task_snapshot(incoming_task)
+
         existing = list(
             await session.scalars(
                 select(PreemptionPlan)
                 .where(
-                    PreemptionPlan.incoming_task_id == candidate.task.id,
+                    PreemptionPlan.incoming_task_id == incoming_task.id,
                     PreemptionPlan.state == "requested",
                 )
                 .order_by(PreemptionPlan.created_at, PreemptionPlan.id)
@@ -792,7 +806,7 @@ class SchedulingRepository:
         )
         if existing:
             return PreemptionDecision(
-                incoming_task_id=candidate.task.id,
+                incoming_task_id=incoming_task.id,
                 worker_id=existing[0].worker_id,
                 victim_task_ids=tuple(plan.victim_task_id for plan in existing),
                 already_requested=True,
@@ -857,7 +871,7 @@ class SchedulingRepository:
                         for device in worker.gpu_devices
                     ),
                 )
-                reason, _device_ids = evaluate_snapshot(simulated, candidate.snapshot)
+                reason, _device_ids = evaluate_snapshot(simulated, incoming_snapshot)
                 if reason is None:
                     score = (
                         sum(item.priority for item in selected),
@@ -885,11 +899,11 @@ class SchedulingRepository:
                 previous_status=previous_status,
                 event_type="task.preemption_requested",
                 created_at=now,
-                details={"incoming_task_id": str(candidate.task.id)},
+                details={"incoming_task_id": str(incoming_task.id)},
             )
             session.add(
                 PreemptionPlan(
-                    incoming_task_id=candidate.task.id,
+                    incoming_task_id=incoming_task.id,
                     victim_task_id=victim.id,
                     worker_id=worker.id,
                     state="requested",
@@ -902,15 +916,15 @@ class SchedulingRepository:
                 event_type="task.preemption_requested",
                 payload={
                     "task_id": str(victim.id),
-                    "incoming_task_id": str(candidate.task.id),
+                    "incoming_task_id": str(incoming_task.id),
                     "worker_id": worker.id,
                 },
                 available_at=now,
             )
-        candidate.task.unschedulable_reason = "preemption_in_progress"
-        candidate.task.version += 1
+        incoming_task.unschedulable_reason = "preemption_in_progress"
+        incoming_task.version += 1
         return PreemptionDecision(
-            incoming_task_id=candidate.task.id,
+            incoming_task_id=incoming_task.id,
             worker_id=worker.id,
             victim_task_ids=tuple(victim.id for victim in selected_victims),
         )
