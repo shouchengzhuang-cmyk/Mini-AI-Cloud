@@ -784,7 +784,10 @@ class SchedulingRepository:
             select(Task)
             .where(Task.id == candidate.task.id)
             .execution_options(populate_existing=True)
-            .with_for_update()
+            # `run_once` can process several candidates in one transaction.
+            # Skip a task another scheduler is fencing so competing batches cannot
+            # retain incoming-task locks in different orders and deadlock.
+            .with_for_update(skip_locked=True)
         )
         if (
             incoming_task is None

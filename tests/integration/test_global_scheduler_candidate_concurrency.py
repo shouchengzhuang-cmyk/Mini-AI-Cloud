@@ -119,7 +119,7 @@ async def test_candidate_discovery_does_not_hide_ranked_tasks_between_schedulers
         assert quota_state.queued_tasks == queued_before
 
 
-async def test_preemption_request_fences_incoming_task(
+async def test_preemption_request_skips_incoming_task_locked_by_another_scheduler(
     scheduler_live_database: Database,
 ) -> None:
     task_id = await _create_candidate(scheduler_live_database, queue_order=-(10**9))
@@ -142,18 +142,19 @@ async def test_preemption_request_fences_incoming_task(
                     scan_limit=1,
                 )
                 candidate = next(item for item in candidates if item.task.id == task_id)
-                request = asyncio.create_task(
-                    SchedulingRepository.request_preemption(
-                        second_session,
-                        candidate=candidate,
-                        workers=[],
-                        min_priority_delta=1,
+                assert (
+                    await asyncio.wait_for(
+                        SchedulingRepository.request_preemption(
+                            second_session,
+                            candidate=candidate,
+                            workers=[],
+                            min_priority_delta=1,
+                        ),
+                        timeout=2,
                     )
+                    is None
                 )
-                await asyncio.sleep(0.05)
-                assert not request.done()
                 await first_transaction.rollback()
-                assert await asyncio.wait_for(request, timeout=2) is None
             finally:
                 if first_transaction.is_active:
                     await first_transaction.rollback()
