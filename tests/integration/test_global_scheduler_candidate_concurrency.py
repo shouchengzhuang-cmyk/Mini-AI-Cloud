@@ -42,7 +42,9 @@ async def scheduler_live_database() -> AsyncIterator[Database]:
         await database.dispose()
 
 
-async def _create_candidate(database: Database, *, queue_order: int) -> uuid.UUID:
+async def _create_candidate(
+    database: Database, *, queue_order: int, labels: dict[str, str] | None = None
+) -> uuid.UUID:
     async with database.session() as session, session.begin():
         task = await TaskRepository.create_queued(
             session,
@@ -53,7 +55,7 @@ async def _create_candidate(database: Database, *, queue_order: int) -> uuid.UUI
             max_retries=0,
             cpu_limit=0.25,
             memory_limit_mb=64,
-            labels={},
+            labels=labels or {},
             network_enabled=False,
             gpu_count=0,
             priority=100,
@@ -124,7 +126,11 @@ async def test_candidate_discovery_does_not_hide_ranked_tasks_between_schedulers
 async def test_global_scheduler_skips_preemption_contention_without_task_fallback_lock(
     scheduler_live_database: Database,
 ) -> None:
-    task_id = await _create_candidate(scheduler_live_database, queue_order=-(10**9))
+    task_id = await _create_candidate(
+        scheduler_live_database,
+        queue_order=-(10**9),
+        labels={"scheduler-test-isolation": str(uuid.uuid4())},
+    )
     scheduler = GlobalScheduler(
         scheduler_live_database.session_factory,
         scheduler_id="scheduler-preemption-contention-test",
