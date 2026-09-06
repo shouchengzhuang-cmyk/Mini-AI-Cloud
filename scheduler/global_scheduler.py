@@ -16,7 +16,7 @@ from core.metrics import SCHEDULER_ATTEMPTS, SCHEDULING_ATTEMPTS
 from core.runtime_profiles import RuntimeProfileCatalog
 from repositories.admission import AdmissionRepository, BatchAdmissionSnapshot
 from repositories.quotas import QuotaExceededError
-from repositories.scheduling import PlacementConflict, SchedulingRepository
+from repositories.scheduling import PlacementConflict, PreemptionContention, SchedulingRepository
 from scheduler.admission import AdmissionRequest
 from scheduler.policies import Placement, choose_placement, evaluate_snapshot
 
@@ -148,21 +148,39 @@ class GlobalScheduler:
                     outcome = "rejected"
                     detail: str | None = None
                     if self._preemption_enabled:
-                        decision = await SchedulingRepository.request_preemption(
-                            session,
-                            candidate=candidate,
-                            workers=workers,
-                            min_priority_delta=self._preemption_min_delta,
-                        )
-                        if decision is not None:
-                            reason = "preemption_in_progress"
-                            worker_id = decision.worker_id
-                            outcome = "preemption_requested"
-                            detail = ",".join(str(item) for item in decision.victim_task_ids)
+                        try:
+                            decision = await SchedulingRepository.request_preemption(
+                                session,
+                                candidate=candidate,
+                                workers=workers,
+                                min_priority_delta=self._preemption_min_delta,
+                            )
+                        except PreemptionContention:
+                            # Do not call ``mark_unschedulable`` here: its
+                            # blocking task lock could recreate a cross-batch
+                            # deadlock with the scheduler holding this fence.
+                            reason = "preemption_contention"
+                            outcome = "conflict"
+                            detail = "incoming_task_locked"
+                        else:
+                            if decision is not None:
+                                reason = "preemption_in_progress"
+                                worker_id = decision.worker_id
+                                outcome = "preemption_requested"
+                                detail = ",".join(str(item) for item in decision.victim_task_ids)
                     if outcome == "rejected":
                         await SchedulingRepository.mark_unschedulable(
                             session, task_id=task_id, reason=reason
                         )
+                    if outcome == "conflict":
+                        # PlacementAttempt has a task foreign key, whose
+                        # KEY SHARE check would also wait behind the other
+                        # scheduler's FOR UPDATE fence. Metrics preserve the
+                        # contention signal without recreating that wait.
+                        _record_scheduler_metric(outcome, reason)
+                        if first_result is None:
+                            first_result = GlobalSchedulerResult(task_id, None, False, reason)
+                        continue
                     SchedulingRepository.record_attempt(
                         session,
                         task_id=task_id,

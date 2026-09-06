@@ -10,11 +10,13 @@ from sqlalchemy import delete, select, text
 from core.database import Database
 from core.enums import TaskStatus
 from models.outbox import OutboxEvent
+from models.scheduling import PlacementAttempt
 from models.task import Task, TaskEvent
 from models.usage import ProjectQuotaState
 from repositories.quotas import QuotaRepository
 from repositories.scheduling import SchedulingRepository
 from repositories.tasks import LEGACY_PROJECT_ID, TaskRepository
+from scheduler.global_scheduler import GlobalScheduler
 
 pytestmark = [pytest.mark.integration, pytest.mark.live]
 
@@ -119,46 +121,50 @@ async def test_candidate_discovery_does_not_hide_ranked_tasks_between_schedulers
         assert quota_state.queued_tasks == queued_before
 
 
-async def test_preemption_request_skips_incoming_task_locked_by_another_scheduler(
+async def test_global_scheduler_skips_preemption_contention_without_task_fallback_lock(
     scheduler_live_database: Database,
 ) -> None:
     task_id = await _create_candidate(scheduler_live_database, queue_order=-(10**9))
+    scheduler = GlobalScheduler(
+        scheduler_live_database.session_factory,
+        scheduler_id="scheduler-preemption-contention-test",
+        lease_seconds=30,
+        policy="binpack",
+        aging_interval_seconds=60,
+        cpu_price_per_hour=0.05,
+        memory_price_per_gb_hour=0.005,
+        gpu_price_per_hour=1.0,
+        preemption_enabled=True,
+        preemption_min_delta=1,
+        batch_size=1,
+        candidate_scan_limit=1,
+    )
 
     try:
-        async with (
-            scheduler_live_database.session() as first_session,
-            scheduler_live_database.session() as second_session,
-        ):
+        async with scheduler_live_database.session() as first_session:
             first_transaction = await first_session.begin()
-            second_transaction = await second_session.begin()
             try:
                 locked_task = await first_session.scalar(
                     select(Task).where(Task.id == task_id).with_for_update()
                 )
                 assert locked_task is not None
-                candidates = await SchedulingRepository.choose_candidates(
-                    second_session,
-                    aging_interval_seconds=60,
-                    scan_limit=1,
-                )
-                candidate = next(item for item in candidates if item.task.id == task_id)
-                assert (
-                    await asyncio.wait_for(
-                        SchedulingRepository.request_preemption(
-                            second_session,
-                            candidate=candidate,
-                            workers=[],
-                            min_priority_delta=1,
-                        ),
-                        timeout=2,
-                    )
-                    is None
-                )
+                result = await asyncio.wait_for(scheduler.run_once(), timeout=2)
+                assert result.task_id == task_id
+                assert result.reason == "preemption_contention"
                 await first_transaction.rollback()
             finally:
                 if first_transaction.is_active:
                     await first_transaction.rollback()
-                if second_transaction.is_active:
-                    await second_transaction.rollback()
+
+        async with scheduler_live_database.session() as session:
+            task = await session.get(Task, task_id)
+            assert task is not None
+            assert task.unschedulable_reason is None
+            attempts = list(
+                await session.scalars(
+                    select(PlacementAttempt).where(PlacementAttempt.task_id == task_id)
+                )
+            )
+            assert attempts == []
     finally:
         await _cleanup_candidates(scheduler_live_database, [task_id])
