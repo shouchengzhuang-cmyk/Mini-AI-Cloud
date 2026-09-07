@@ -390,7 +390,7 @@ async def test_global_schedulers_keep_quota_after_worker_inventory_lock_order(
                 max_retries=0,
                 cpu_limit=0.25,
                 memory_limit_mb=256,
-                labels={"live-test-run": str(run_id), "scheduler": "worker-pull"},
+                labels={"live-test-run": str(run_id)},
                 network_enabled=False,
                 gpu_count=0,
                 runtime_type=RuntimeType.DOCKER.value,
