@@ -1,7 +1,7 @@
 import asyncio
 import os
 import uuid
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -24,8 +24,8 @@ from models.scheduling import GPUDevice, PlacementAttempt, ReservationGPUDevice,
 from models.task import Task, TaskEvent
 from models.usage import ProjectQuotaState
 from models.worker import Worker
-from repositories.admission import AdmissionRepository, InventoryDeviceSnapshot
-from repositories.quotas import QuotaRepository, QuotaSnapshot
+from repositories.admission import AdmissionRepository
+from repositories.quotas import QuotaRepository
 from repositories.scheduling import SchedulerCandidate, SchedulingRepository
 from repositories.tasks import LEGACY_PROJECT_ID, TaskRepository
 from repositories.workers import WorkerRepository
@@ -231,12 +231,13 @@ async def test_global_schedulers_keep_quota_after_worker_inventory_lock_order(
 ) -> None:
     """Exercise the former quota -> inventory / worker -> quota lock cycle on PostgreSQL.
 
-    The CPU scheduler retains the authoritative Task -> Worker fence until it
-    reserves quota. The Kubernetes scheduler pauses immediately before its
-    advisory inventory scan. Before the fix that scan was reached with the
-    project quota row locked, creating a real PostgreSQL cycle. It must now be
-    an unlocked snapshot; ``place`` reacquires and validates inventory only
-    after it has acquired the authoritative Task and Worker fences.
+    A service-equivalent transaction takes the same authoritative quota then
+    inventory locks as Kubernetes service admission. Two ``GlobalScheduler``
+    instances with ``batch_size=2`` race it for CPU and Kubernetes GPU work.
+    With the old batch Worker/GPU -> quota order, one scheduler and the
+    service transaction formed a PostgreSQL deadlock; canonical quota ->
+    Worker/GPU ordering makes the schedulers wait at quota until service
+    inventory admission commits.
     """
 
     run_id = uuid.uuid4()
@@ -263,10 +264,7 @@ async def test_global_schedulers_keep_quota_after_worker_inventory_lock_order(
     )
     task_ids: dict[str, set[uuid.UUID]] = {"cpu": set(), "gpu": set()}
     active_lane: ContextVar[str | None] = ContextVar("scheduler_lane", default=None)
-    gpu_inventory_ready = asyncio.Event()
-    cpu_quota_ready = asyncio.Event()
-    gpu_inventory_gate_used = False
-    cpu_quota_gate_used = False
+    service_quota_locked = asyncio.Event()
 
     def _lane_session_factory(lane: str) -> Callable[[], AsyncSession]:
         @asynccontextmanager
@@ -299,61 +297,10 @@ async def test_global_schedulers_keep_quota_after_worker_inventory_lock_order(
         assert lane is not None
         return [candidate for candidate in candidates if candidate.task.id in task_ids[lane]]
 
-    original_inventory = AdmissionRepository.list_healthy_inventory_devices
-
-    async def coordinate_gpu_inventory(
-        session: AsyncSession,
-        *,
-        vendors: Sequence[AcceleratorVendor],
-        kinds: Sequence[AcceleratorKind],
-        minimum_memory_mb: int = 0,
-        runtime_type: RuntimeType | None = None,
-        for_update: bool = False,
-        include_unavailable: bool = False,
-    ) -> list[InventoryDeviceSnapshot]:
-        nonlocal gpu_inventory_gate_used
-        if active_lane.get() == "gpu" and not gpu_inventory_gate_used:
-            gpu_inventory_gate_used = True
-            gpu_inventory_ready.set()
-            await asyncio.wait_for(cpu_quota_ready.wait(), timeout=2)
-        return await original_inventory(
-            session,
-            vendors=vendors,
-            kinds=kinds,
-            minimum_memory_mb=minimum_memory_mb,
-            runtime_type=runtime_type,
-            for_update=for_update,
-            include_unavailable=include_unavailable,
-        )
-
-    original_get_locked = QuotaRepository.get_locked
-
-    async def coordinate_cpu_quota_fence(
-        session: AsyncSession,
-        *,
-        project_id: uuid.UUID,
-    ) -> QuotaSnapshot:
-        nonlocal cpu_quota_gate_used
-        if active_lane.get() == "cpu" and not cpu_quota_gate_used:
-            cpu_quota_gate_used = True
-            await asyncio.wait_for(gpu_inventory_ready.wait(), timeout=2)
-            cpu_quota_ready.set()
-        return await original_get_locked(session, project_id=project_id)
-
     monkeypatch.setattr(
         SchedulingRepository,
         "choose_candidates",
         staticmethod(choose_lane_candidates),
-    )
-    monkeypatch.setattr(
-        AdmissionRepository,
-        "list_healthy_inventory_devices",
-        staticmethod(coordinate_gpu_inventory),
-    )
-    monkeypatch.setattr(
-        QuotaRepository,
-        "get_locked",
-        staticmethod(coordinate_cpu_quota_fence),
     )
 
     try:
@@ -452,8 +399,36 @@ async def test_global_schedulers_keep_quota_after_worker_inventory_lock_order(
         cpu_scheduler = _scheduler("cpu", "live-lock-order-cpu")
         gpu_scheduler = _scheduler("gpu", "live-lock-order-gpu")
 
-        cpu_result, gpu_result = await asyncio.wait_for(
-            asyncio.gather(cpu_scheduler.run_once(), gpu_scheduler.run_once()), timeout=5
+        async def run_service_inventory_fence() -> None:
+            async with scheduler_live_database.session() as session, session.begin():
+                await QuotaRepository.get_locked(session, project_id=project_id)
+                service_quota_locked.set()
+                # Give both schedulers a chance to enter authoritative
+                # placement. With a Worker/GPU -> quota regression they own
+                # inventory here and PostgreSQL detects the inverse cycle.
+                await asyncio.sleep(0.2)
+                inventory = await AdmissionRepository.list_healthy_inventory_devices(
+                    session,
+                    vendors=(AcceleratorVendor.NVIDIA,),
+                    kinds=(AcceleratorKind.GPU,),
+                    runtime_type=RuntimeType.KUBERNETES,
+                    for_update=True,
+                    include_unavailable=True,
+                )
+                assert len(inventory) == 2
+
+        service_fence = asyncio.create_task(
+            run_service_inventory_fence(),
+            name="service-quota-inventory-fence",
+        )
+        await asyncio.wait_for(service_quota_locked.wait(), timeout=2)
+        _, cpu_result, gpu_result = await asyncio.wait_for(
+            asyncio.gather(
+                service_fence,
+                cpu_scheduler.run_once(),
+                gpu_scheduler.run_once(),
+            ),
+            timeout=5,
         )
 
         assert cpu_result.placed_count == 2

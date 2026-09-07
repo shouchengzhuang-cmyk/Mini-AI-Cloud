@@ -12,11 +12,12 @@ Keep candidate discovery cheap and non-owning, keep placement as the single Post
 
 **Status: CLOSED (2026-09-07).** Candidate discovery remains non-owning and
 placement is the sole mutation authority. Authoritative placement follows
-`Task -> project quota -> Worker/GPU inventory`; service admission holds its
-project quota fence before inventory. The closure regression runs two
-`GlobalScheduler` instances with `batch_size=2` against live PostgreSQL,
-forces the formerly inverted admission/placement interleaving, and asserts all
-placements and quota counters converge.
+`Task -> project quota -> Worker/GPU inventory`; active reservation release
+acquires the same project quota fence before Worker/GPU capacity, and service
+admission holds quota before inventory. The closure regression runs two
+`GlobalScheduler` instances with `batch_size=2` plus a real PostgreSQL
+service-equivalent quota-to-inventory transaction, then asserts all placements
+and quota counters converge.
 
 Candidate ranking is a snapshot operation. It must not reserve a large candidate lane for the lifetime of a scheduler batch transaction.
 
@@ -29,7 +30,8 @@ Candidate ranking is a snapshot operation. It must not reserve a large candidate
 Acceptance criteria:
 
 - Candidate query SQL contains no `FOR UPDATE` clause.
-- `place` still locks Task, Worker, and concrete accelerator state before mutation.
+- `place` and active reservation release lock the project quota before Worker
+  and concrete accelerator state before mutation.
 - Two concurrent candidate scans return the same top-ranked tasks rather than hiding them behind `SKIP LOCKED`.
 - Unit, integration, Ruff, and mypy CI remain green.
 
