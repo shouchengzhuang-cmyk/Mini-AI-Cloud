@@ -93,6 +93,27 @@ class QuotaRepository:
         return QuotaSnapshot(quota=quota, state=state)
 
     @staticmethod
+    async def get_snapshot(
+        session: AsyncSession,
+        *,
+        project_id: uuid.UUID,
+    ) -> QuotaSnapshot:
+        """Read quota state for an advisory admission decision without reserving it.
+
+        Callers must revalidate the quota through ``reserve_execution`` before
+        committing a placement. Keeping this read non-locking prevents an
+        admission snapshot from holding a project quota fence while it scans
+        worker or accelerator inventory.
+        """
+
+        quota = await session.get(ProjectQuota, project_id)
+        state = await session.get(ProjectQuotaState, project_id)
+        if quota is None or state is None:
+            raise QuotaNotFoundError("project quota state does not exist")
+        _assert_state_nonnegative(state)
+        return QuotaSnapshot(quota=quota, state=state)
+
+    @staticmethod
     async def replace(
         session: AsyncSession,
         *,

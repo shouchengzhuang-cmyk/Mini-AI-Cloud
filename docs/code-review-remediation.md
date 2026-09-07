@@ -10,6 +10,12 @@ Keep candidate discovery cheap and non-owning, keep placement as the single Post
 
 ### P0 — Remove long-lived candidate row locks
 
+**Status: CLOSED (2026-09-07).** Candidate discovery remains non-owning and
+placement is the sole mutation authority. The closure regression runs two
+`GlobalScheduler` instances with `batch_size=2` against live PostgreSQL,
+forces the former Worker -> quota / quota -> inventory interleaving, and
+asserts all placements and quota counters converge.
+
 Candidate ranking is a snapshot operation. It must not reserve a large candidate lane for the lifetime of a scheduler batch transaction.
 
 - Remove `FOR UPDATE SKIP LOCKED` from effective-priority, raw-priority, and project-fair candidate queries.
@@ -65,4 +71,7 @@ Acceptance criteria:
 
 ## Scope boundary
 
-P0 is the only code change in the current scheduler-lock PR. P1 and P2 are deliberately separate follow-ups because they change accelerator/preemption semantics and persistent accounting respectively. Do not combine them into the release-fix PR merely to reduce PR count.
+P0 is closed in the dedicated scheduler-lock PR. P1 and P2 remain deliberately
+separate follow-ups because they change accelerator/preemption semantics and
+persistent accounting respectively. Do not combine them merely to reduce PR
+count.

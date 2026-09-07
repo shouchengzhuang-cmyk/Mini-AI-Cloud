@@ -793,17 +793,17 @@ class AdmissionRepository:
 
         if task.runtime_type != RuntimeType.KUBERNETES:
             raise ValueError("vendor-aware batch admission requires runtime_type='kubernetes'")
-        try:
-            quota = await QuotaRepository.get_locked(session, project_id=task.project_id)
-        except QuotaNotFoundError:
-            quota = await QuotaRepository.initialize(session, project_id=task.project_id)
+        quota = await QuotaRepository.get_snapshot(session, project_id=task.project_id)
         inventory = await AdmissionRepository.list_healthy_inventory_devices(
             session,
             vendors=tuple(sorted(request.allowed_vendors, key=lambda item: item.value)),
             kinds=tuple(sorted(request.allowed_kinds, key=lambda item: item.value)),
             minimum_memory_mb=0,
             runtime_type=RuntimeType.KUBERNETES,
-            for_update=True,
+            # This is a decision snapshot, not a reservation. ``place``
+            # reacquires and revalidates the selected worker and inventory
+            # under its canonical mutation lock order.
+            for_update=False,
             include_unavailable=True,
         )
         candidate_inventory = [

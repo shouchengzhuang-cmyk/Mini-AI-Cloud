@@ -788,9 +788,10 @@ class SchedulingRepository:
             select(Task)
             .where(Task.id == candidate.task.id)
             .execution_options(populate_existing=True)
-            # `run_once` can process several candidates in one transaction.
-            # Skip a task another scheduler is fencing so competing batches cannot
-            # retain incoming-task locks in different orders and deadlock.
+            # A scheduler may concurrently evaluate another candidate while this
+            # preemption fence is active. Skip a task another scheduler is
+            # fencing so competing schedulers cannot wait on the same incoming
+            # task lock while they retain other placement fences.
             .with_for_update(skip_locked=True)
         )
         if incoming_task is None:
