@@ -4,7 +4,6 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from decimal import Decimal
 from pathlib import Path
 from typing import cast
 
@@ -26,7 +25,7 @@ from models.task import Task, TaskEvent
 from models.usage import ProjectQuotaState
 from models.worker import Worker
 from repositories.admission import AdmissionRepository, InventoryDeviceSnapshot
-from repositories.quotas import QuotaRepository
+from repositories.quotas import QuotaRepository, QuotaSnapshot
 from repositories.scheduling import SchedulerCandidate, SchedulingRepository
 from repositories.tasks import LEGACY_PROJECT_ID, TaskRepository
 from repositories.workers import WorkerRepository
@@ -327,32 +326,19 @@ async def test_global_schedulers_keep_quota_after_worker_inventory_lock_order(
             include_unavailable=include_unavailable,
         )
 
-    original_reserve_execution = QuotaRepository.reserve_execution
+    original_get_locked = QuotaRepository.get_locked
 
-    async def coordinate_cpu_quota(
+    async def coordinate_cpu_quota_fence(
         session: AsyncSession,
         *,
         project_id: uuid.UUID,
-        cpu_millicores: int,
-        memory_mb: int,
-        gpu_count: int,
-        estimated_cost: Decimal = Decimal("0"),
-        accelerator_vendor: AcceleratorVendor | str | None = None,
-    ) -> ProjectQuotaState:
+    ) -> QuotaSnapshot:
         nonlocal cpu_quota_gate_used
         if active_lane.get() == "cpu" and not cpu_quota_gate_used:
             cpu_quota_gate_used = True
             await asyncio.wait_for(gpu_inventory_ready.wait(), timeout=2)
             cpu_quota_ready.set()
-        return await original_reserve_execution(
-            session,
-            project_id=project_id,
-            cpu_millicores=cpu_millicores,
-            memory_mb=memory_mb,
-            gpu_count=gpu_count,
-            estimated_cost=estimated_cost,
-            accelerator_vendor=accelerator_vendor,
-        )
+        return await original_get_locked(session, project_id=project_id)
 
     monkeypatch.setattr(
         SchedulingRepository,
@@ -366,8 +352,8 @@ async def test_global_schedulers_keep_quota_after_worker_inventory_lock_order(
     )
     monkeypatch.setattr(
         QuotaRepository,
-        "reserve_execution",
-        staticmethod(coordinate_cpu_quota),
+        "get_locked",
+        staticmethod(coordinate_cpu_quota_fence),
     )
 
     try:

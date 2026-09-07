@@ -11,10 +11,12 @@ Keep candidate discovery cheap and non-owning, keep placement as the single Post
 ### P0 — Remove long-lived candidate row locks
 
 **Status: CLOSED (2026-09-07).** Candidate discovery remains non-owning and
-placement is the sole mutation authority. The closure regression runs two
+placement is the sole mutation authority. Authoritative placement follows
+`Task -> project quota -> Worker/GPU inventory`; service admission holds its
+project quota fence before inventory. The closure regression runs two
 `GlobalScheduler` instances with `batch_size=2` against live PostgreSQL,
-forces the former Worker -> quota / quota -> inventory interleaving, and
-asserts all placements and quota counters converge.
+forces the formerly inverted admission/placement interleaving, and asserts all
+placements and quota counters converge.
 
 Candidate ranking is a snapshot operation. It must not reserve a large candidate lane for the lifetime of a scheduler batch transaction.
 
