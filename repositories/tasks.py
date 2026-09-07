@@ -867,6 +867,10 @@ class TaskRepository:
             raise ClaimRejected("task is no longer queued")
         if not await TaskRepository.dependencies_ready(session, task.id):
             raise ClaimRejected("task dependencies are not ready")
+        # Worker-pull scheduling mutates the same capacity and quota state as
+        # GlobalScheduler placement. Keep its authoritative lock order
+        # Task -> project quota -> Worker/GPU as well.
+        await QuotaRepository.get_locked(session, project_id=task.project_id)
         worker = await session.scalar(
             select(Worker)
             .where(Worker.id == worker_id)

@@ -121,13 +121,12 @@ async def _cleanup_lock_order_regression(
         await session.execute(
             delete(PlacementAttempt).where(PlacementAttempt.task_id.in_(task_ids))
         )
-        await session.execute(
-            delete(AdmissionEvent).where(AdmissionEvent.workload_id.in_(task_ids))
-        )
         await session.execute(delete(OutboxEvent).where(OutboxEvent.aggregate_id.in_(task_ids)))
         await session.execute(delete(Task).where(Task.id.in_(task_ids)))
         await session.execute(delete(GPUDevice).where(GPUDevice.worker_id == worker_id))
         await session.execute(delete(Worker).where(Worker.id == worker_id))
+        await session.execute(delete(AdmissionEvent).where(AdmissionEvent.project_id == project_id))
+        await session.flush()
         await session.execute(delete(Project).where(Project.id == project_id))
 
 
@@ -233,8 +232,9 @@ async def test_global_schedulers_keep_quota_after_worker_inventory_lock_order(
 
     A service-equivalent transaction takes the same authoritative quota then
     inventory locks as Kubernetes service admission. Two ``GlobalScheduler``
-    instances with ``batch_size=2`` race it for CPU and Kubernetes GPU work.
-    With the old batch Worker/GPU -> quota order, one scheduler and the
+    instances with ``batch_size=2`` plus a worker-pull ``claim`` race it for
+    CPU and Kubernetes GPU work. With the old batch or claim Worker/GPU ->
+    quota order, one scheduler or claim transaction and the
     service transaction formed a PostgreSQL deadlock; canonical quota ->
     Worker/GPU ordering makes the schedulers wait at quota until service
     inventory admission commits.
@@ -263,6 +263,7 @@ async def test_global_schedulers_keep_quota_after_worker_inventory_lock_order(
         }
     )
     task_ids: dict[str, set[uuid.UUID]] = {"cpu": set(), "gpu": set()}
+    worker_pull_task_id: uuid.UUID | None = None
     active_lane: ContextVar[str | None] = ContextVar("scheduler_lane", default=None)
     service_quota_locked = asyncio.Event()
 
@@ -317,7 +318,7 @@ async def test_global_schedulers_keep_quota_after_worker_inventory_lock_order(
                 session,
                 worker_id=worker_id,
                 hostname=f"{worker_id}.invalid",
-                concurrency=4,
+                concurrency=5,
                 cpu_count=8,
                 memory_total_mb=16_384,
                 docker_version="live-integration-test",
@@ -380,6 +381,25 @@ async def test_global_schedulers_keep_quota_after_worker_inventory_lock_order(
                         project_id=project_id,
                     )
                     task_ids[lane].add(task.id)
+            worker_pull_task = await TaskRepository.create_queued(
+                session,
+                image="alpine:3.21",
+                command=["true"],
+                environment={},
+                timeout_seconds=30,
+                max_retries=0,
+                cpu_limit=0.25,
+                memory_limit_mb=256,
+                labels={"live-test-run": str(run_id), "scheduler": "worker-pull"},
+                network_enabled=False,
+                gpu_count=0,
+                runtime_type=RuntimeType.DOCKER.value,
+                priority=1,
+                idempotency_key=None,
+                request_hash=None,
+                project_id=project_id,
+            )
+            worker_pull_task_id = worker_pull_task.id
 
         def _scheduler(lane: str, scheduler_id: str) -> GlobalScheduler:
             return GlobalScheduler(
@@ -398,6 +418,7 @@ async def test_global_schedulers_keep_quota_after_worker_inventory_lock_order(
 
         cpu_scheduler = _scheduler("cpu", "live-lock-order-cpu")
         gpu_scheduler = _scheduler("gpu", "live-lock-order-gpu")
+        assert worker_pull_task_id is not None
 
         async def run_service_inventory_fence() -> None:
             async with scheduler_live_database.session() as session, session.begin():
@@ -417,33 +438,48 @@ async def test_global_schedulers_keep_quota_after_worker_inventory_lock_order(
                 )
                 assert len(inventory) == 2
 
+        async def run_worker_pull_claim() -> tuple[Task, uuid.UUID]:
+            async with scheduler_live_database.session() as session, session.begin():
+                return await TaskRepository.claim(
+                    session,
+                    task_id=worker_pull_task_id,
+                    worker_id=worker_id,
+                    lease_seconds=30,
+                )
+
         service_fence = asyncio.create_task(
             run_service_inventory_fence(),
             name="service-quota-inventory-fence",
         )
         await asyncio.wait_for(service_quota_locked.wait(), timeout=2)
-        _, cpu_result, gpu_result = await asyncio.wait_for(
+        _, cpu_result, gpu_result, (claimed_task, _) = await asyncio.wait_for(
             asyncio.gather(
                 service_fence,
                 cpu_scheduler.run_once(),
                 gpu_scheduler.run_once(),
+                run_worker_pull_claim(),
             ),
             timeout=5,
         )
 
         assert cpu_result.placed_count == 2
         assert gpu_result.placed_count == 2
+        assert claimed_task.id == worker_pull_task_id
         async with scheduler_live_database.session() as session:
             tasks = list(
                 await session.scalars(
-                    select(Task).where(Task.id.in_(task_ids["cpu"] | task_ids["gpu"]))
+                    select(Task).where(
+                        Task.id.in_(task_ids["cpu"] | task_ids["gpu"] | {worker_pull_task_id})
+                    )
                 )
             )
             state = await session.get(ProjectQuotaState, project_id)
             reservations = list(
                 await session.scalars(
                     select(ResourceReservation).where(
-                        ResourceReservation.task_id.in_(task_ids["cpu"] | task_ids["gpu"]),
+                        ResourceReservation.task_id.in_(
+                            task_ids["cpu"] | task_ids["gpu"] | {worker_pull_task_id}
+                        ),
                         ResourceReservation.released_at.is_(None),
                     )
                 )
@@ -452,13 +488,13 @@ async def test_global_schedulers_keep_quota_after_worker_inventory_lock_order(
         assert {task.status for task in tasks} == {TaskStatus.ASSIGNED}
         assert state is not None
         assert state.queued_tasks == 0
-        assert state.running_tasks == 4
-        assert state.reserved_cpu_millicores == 1_000
-        assert state.reserved_memory_mb == 1_024
+        assert state.running_tasks == 5
+        assert state.reserved_cpu_millicores == 1_250
+        assert state.reserved_memory_mb == 1_280
         assert state.reserved_gpus == 2
         assert state.reserved_nvidia_gpus == 2
         assert state.reserved_ascend_npus == 0
-        assert len(reservations) == 4
+        assert len(reservations) == 5
         assert sum(reservation.gpu_count for reservation in reservations) == 2
     finally:
         await _cleanup_lock_order_regression(
