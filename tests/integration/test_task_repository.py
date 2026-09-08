@@ -1,14 +1,18 @@
 import asyncio
 import uuid
 from datetime import timedelta
+from typing import Any
 
 import pytest
 from sqlalchemy import func, select, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database import Database
 from core.enums import RuntimeType, TaskStatus
+from models.base import utcnow
 from models.outbox import OutboxEvent
 from models.worker import Worker
+from repositories.quotas import QuotaRepository, QuotaSnapshot
 from repositories.tasks import ClaimRejected, TaskRepository
 from repositories.workers import WorkerRepository
 from scheduler import AssignmentSource, Scheduler
@@ -218,6 +222,80 @@ async def test_stale_execution_result_cannot_overwrite_new_owner(database: Datab
     assert task.worker_id == "worker-b"
     assert task.execution_id == current_execution_id
     assert worker_b is not None and worker_b.running_tasks == 1
+
+
+async def test_recovery_fences_quota_before_legacy_worker_release(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker_id = "worker-legacy-recovery"
+    task_id = await _create_task(database)
+    await _register_worker(database, worker_id)
+
+    async with database.session() as session, session.begin():
+        _task, _execution_id = await TaskRepository.claim(
+            session,
+            task_id=task_id,
+            worker_id=worker_id,
+            lease_seconds=30,
+        )
+        task = await TaskRepository.get(session, task_id, for_update=True)
+        assert task is not None
+        task.execution_id = None
+        task.lease_expires_at = utcnow() - timedelta(seconds=1)
+        project_id = task.project_id
+
+    quota_fences: list[uuid.UUID] = []
+    original_get_locked = QuotaRepository.get_locked
+
+    async def record_quota_fence(
+        session: AsyncSession,
+        *,
+        project_id: uuid.UUID,
+        reset_daily: bool = True,
+    ) -> QuotaSnapshot:
+        quota_fences.append(project_id)
+        return await original_get_locked(
+            session,
+            project_id=project_id,
+            reset_daily=reset_daily,
+        )
+
+    monkeypatch.setattr(QuotaRepository, "get_locked", record_quota_fence)
+
+    async with database.session() as session, session.begin():
+        original_session_get = session.get
+
+        async def require_quota_before_worker_lock(
+            entity: type[Any], ident: Any, **kwargs: Any
+        ) -> Any:
+            if entity is Worker and ident == worker_id and kwargs.get("with_for_update"):
+                assert quota_fences == [project_id]
+            return await original_session_get(entity, ident, **kwargs)
+
+        monkeypatch.setattr(session, "get", require_quota_before_worker_lock)
+        recovered = await TaskRepository.recover_expired(
+            session,
+            limit=10,
+            max_recovery_attempts=1,
+        )
+
+    assert recovered == [task_id]
+
+    async with database.session() as session:
+        task = await TaskRepository.get(session, task_id)
+        worker = await WorkerRepository.get(session, worker_id)
+
+    assert task is not None
+    assert task.status == TaskStatus.RETRYING
+    assert task.worker_id is None
+    assert task.execution_id is None
+    assert task.lease_expires_at is None
+    assert worker is not None
+    assert worker.running_tasks == 0
+    assert worker.reserved_cpu == 0
+    assert worker.reserved_memory_mb == 0
+    assert worker.reserved_gpus == 0
 
 
 async def test_pull_claim_rechecks_worker_runtime_compatibility(database: Database) -> None:

@@ -1811,7 +1811,7 @@ class TaskRepository:
         # or accelerator row, so an earlier release cannot invert a later
         # project's quota -> Worker/GPU placement order.
         for project_id in sorted(
-            {task.project_id for task in tasks if task.execution_id is not None},
+            {task.project_id for task in tasks},
             key=str,
         ):
             await QuotaRepository.get_locked(session, project_id=project_id)
