@@ -25,7 +25,7 @@ from models.task import Task, TaskEvent
 from models.usage import ProjectQuotaState
 from models.worker import Worker
 from repositories.admission import AdmissionRepository
-from repositories.quotas import QuotaRepository
+from repositories.quotas import QuotaRepository, QuotaSnapshot
 from repositories.scheduling import SchedulerCandidate, SchedulingRepository
 from repositories.tasks import LEGACY_PROJECT_ID, TaskRepository
 from repositories.workers import WorkerRepository
@@ -266,6 +266,8 @@ async def test_global_schedulers_keep_quota_after_worker_inventory_lock_order(
     worker_pull_task_id: uuid.UUID | None = None
     active_lane: ContextVar[str | None] = ContextVar("scheduler_lane", default=None)
     service_quota_locked = asyncio.Event()
+    quota_arrivals: set[str] = set()
+    all_placement_actors_at_quota = asyncio.Event()
 
     def _lane_session_factory(lane: str) -> Callable[[], AsyncSession]:
         @asynccontextmanager
@@ -302,6 +304,25 @@ async def test_global_schedulers_keep_quota_after_worker_inventory_lock_order(
         SchedulingRepository,
         "choose_candidates",
         staticmethod(choose_lane_candidates),
+    )
+    original_get_locked = QuotaRepository.get_locked
+
+    async def coordinate_quota_arrival(
+        session: AsyncSession,
+        *,
+        project_id: uuid.UUID,
+    ) -> QuotaSnapshot:
+        actor = active_lane.get()
+        if actor in {"cpu", "gpu", "claim"}:
+            quota_arrivals.add(actor)
+            if quota_arrivals == {"cpu", "gpu", "claim"}:
+                all_placement_actors_at_quota.set()
+        return await original_get_locked(session, project_id=project_id)
+
+    monkeypatch.setattr(
+        QuotaRepository,
+        "get_locked",
+        staticmethod(coordinate_quota_arrival),
     )
 
     try:
@@ -424,10 +445,11 @@ async def test_global_schedulers_keep_quota_after_worker_inventory_lock_order(
             async with scheduler_live_database.session() as session, session.begin():
                 await QuotaRepository.get_locked(session, project_id=project_id)
                 service_quota_locked.set()
-                # Give both schedulers a chance to enter authoritative
-                # placement. With a Worker/GPU -> quota regression they own
-                # inventory here and PostgreSQL detects the inverse cycle.
-                await asyncio.sleep(0.2)
+                # Do not use timing: all authoritative placement actors must
+                # be blocked at their quota fence before service requests
+                # Worker/GPU inventory. A Worker/GPU -> quota regression
+                # therefore establishes the inverse PostgreSQL lock cycle.
+                await asyncio.wait_for(all_placement_actors_at_quota.wait(), timeout=2)
                 inventory = await AdmissionRepository.list_healthy_inventory_devices(
                     session,
                     vendors=(AcceleratorVendor.NVIDIA,),
@@ -439,13 +461,17 @@ async def test_global_schedulers_keep_quota_after_worker_inventory_lock_order(
                 assert len(inventory) == 2
 
         async def run_worker_pull_claim() -> tuple[Task, uuid.UUID]:
-            async with scheduler_live_database.session() as session, session.begin():
-                return await TaskRepository.claim(
-                    session,
-                    task_id=worker_pull_task_id,
-                    worker_id=worker_id,
-                    lease_seconds=30,
-                )
+            token = active_lane.set("claim")
+            try:
+                async with scheduler_live_database.session() as session, session.begin():
+                    return await TaskRepository.claim(
+                        session,
+                        task_id=worker_pull_task_id,
+                        worker_id=worker_id,
+                        lease_seconds=30,
+                    )
+            finally:
+                active_lane.reset(token)
 
         service_fence = asyncio.create_task(
             run_service_inventory_fence(),

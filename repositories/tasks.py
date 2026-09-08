@@ -1806,6 +1806,15 @@ class TaskRepository:
                 .with_for_update(skip_locked=True)
             )
         )
+        # One recovery transaction can release several expired executions.
+        # Take every quota fence in a stable order before it owns any Worker
+        # or accelerator row, so an earlier release cannot invert a later
+        # project's quota -> Worker/GPU placement order.
+        for project_id in sorted(
+            {task.project_id for task in tasks if task.execution_id is not None},
+            key=str,
+        ):
+            await QuotaRepository.get_locked(session, project_id=project_id)
         recovered: list[uuid.UUID] = []
         for task in tasks:
             worker_id = task.worker_id

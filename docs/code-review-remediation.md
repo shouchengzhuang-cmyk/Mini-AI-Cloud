@@ -13,9 +13,9 @@ Keep candidate discovery cheap and non-owning, keep placement as the single Post
 **Status: CLOSED (2026-09-07).** Candidate discovery remains non-owning and
 placement is the sole mutation authority. Authoritative placement follows
 `Task -> project quota -> Worker/GPU inventory` for both GlobalScheduler
-placement and worker-pull claims; active reservation release
-acquires the same project quota fence before Worker/GPU capacity, and service
-admission holds quota before inventory. The closure regression runs two
+placement and worker-pull claims; active reservation release and multi-item
+lease recovery acquire project quota fences before Worker/GPU capacity, and
+service admission holds quota before inventory. The closure regression runs two
 `GlobalScheduler` instances with `batch_size=2`, a worker-pull claim, and a
 real PostgreSQL service-equivalent quota-to-inventory transaction, then
 asserts all placements and quota counters converge.
