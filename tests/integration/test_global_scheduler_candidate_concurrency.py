@@ -294,7 +294,7 @@ async def test_canonical_inventory_fence_refreshes_stale_identity_map_entities(
                 gpu_count=1,
                 gpu_model="NVIDIA-A100",
                 gpu_memory_mb=40_960,
-                runtime_types=[RuntimeType.KUBERNETES.value],
+                runtime_types=[RuntimeType.DOCKER.value],
             )
             await WorkerRepository.replace_gpu_inventory(
                 session,
@@ -366,7 +366,12 @@ async def test_canonical_inventory_fence_refreshes_stale_identity_map_entities(
             assert stale_worker is not None
             assert stale_device is not None
             assert stale_worker.status == WorkerStatus.ONLINE
+            assert stale_worker.runtime_types == [RuntimeType.DOCKER.value]
             assert stale_device.health == "healthy"
+            async with scheduler_live_database.session() as writer, writer.begin():
+                current_worker = await writer.get(Worker, worker_id, with_for_update=True)
+                assert current_worker is not None
+                current_worker.runtime_types = [RuntimeType.KUBERNETES.value]
             inventory = await AdmissionRepository.lock_inventory_canonical(
                 session,
                 vendors=(AcceleratorVendor.NVIDIA,),
@@ -376,6 +381,7 @@ async def test_canonical_inventory_fence_refreshes_stale_identity_map_entities(
             )
             assert inventory == []
             assert stale_worker.status == WorkerStatus.OFFLINE
+            assert stale_worker.runtime_types == [RuntimeType.KUBERNETES.value]
             assert stale_worker.inventory_generation == 2
             assert stale_device.health == "missing"
             assert stale_device.memory_free_mb == 0

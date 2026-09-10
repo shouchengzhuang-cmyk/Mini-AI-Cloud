@@ -569,6 +569,11 @@ class AdmissionRepository:
                 GPUDevice.device_uuid,
                 GPUDevice.id,
             )
+            # Admission snapshots can run in a long-lived AsyncSession before
+            # the authoritative fence. Refresh cached entities so Python-side
+            # runtime and Kubernetes-node validation uses this query's current
+            # database snapshot rather than stale identity-map attributes.
+            .execution_options(populate_existing=True)
         )
         if not include_unavailable:
             query = query.where(GPUDevice.health.in_(accepted_health))

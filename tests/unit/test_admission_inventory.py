@@ -98,6 +98,7 @@ def test_inventory_snapshot_cannot_lock_and_canonical_fence_is_physically_split(
 
     assert "for_update" not in snapshot_signature.parameters
     assert "with_for_update" not in snapshot_source
+    assert ".execution_options(populate_existing=True)" in snapshot_source
     assert fence_source.count(".with_for_update()") == 2
     assert fence_source.count(".execution_options(populate_existing=True)") == 2
     assert fence_source.index("select(Worker)") < fence_source.index("select(GPUDevice)")
