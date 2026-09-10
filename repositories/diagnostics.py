@@ -259,12 +259,32 @@ class DiagnosticsRepository:
         # projects in one outer transaction. Fence every project before the
         # first release acquires a Worker/GPU row, otherwise a later release
         # could invert placement's quota -> Worker/GPU order.
+        unfenced_project_ids: set[uuid.UUID] = set()
         for reservation_project_id in sorted(
             {reservation.project_id for reservation, _task in reservation_rows},
             key=str,
         ):
-            await QuotaRepository.get_locked(session, project_id=reservation_project_id)
+            # Diagnostics deliberately contains accounting failures to the
+            # affected project. Keep that property while retaining each
+            # successful project fence for the rest of this transaction.
+            try:
+                async with session.begin_nested():
+                    await QuotaRepository.get_locked(session, project_id=reservation_project_id)
+            except (QuotaInvariantViolation, QuotaNotFoundError):
+                unfenced_project_ids.add(reservation_project_id)
         for reservation, task in reservation_rows:
+            if reservation.project_id in unfenced_project_ids:
+                actions.append(
+                    RepairActionDiagnostic(
+                        check="terminal_task_with_active_reservation",
+                        resource_type="reservation",
+                        resource_id=str(reservation.id),
+                        action="release_reservation",
+                        outcome="skipped",
+                        reason="resource accounting could not be proven safe",
+                    )
+                )
+                continue
             try:
                 async with session.begin_nested():
                     released = await ReservationRepository.release_and_settle(
