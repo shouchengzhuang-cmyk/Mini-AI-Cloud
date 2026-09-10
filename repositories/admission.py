@@ -682,13 +682,19 @@ class AdmissionRepository:
         ):
             return 0
         profile_capabilities = _runtime_profile_capabilities(profile)
+        # ``SchedulingRepository.place`` has already locked the selected
+        # Worker and its candidate pool rows before this planner runs. The
+        # remaining cluster-wide inventory is only an accounting snapshot for
+        # service and deferred usage. Locking it here would expand a local
+        # placement into unrelated Worker locks after the selected Worker is
+        # held, allowing two placements to form a Worker -> Worker cycle.
         inventory = await AdmissionRepository.list_healthy_inventory_devices(
             session,
             vendors=(vendor,),
             kinds=(kind,),
             minimum_memory_mb=0,
             runtime_type=RuntimeType.KUBERNETES,
-            for_update=True,
+            for_update=False,
             include_unavailable=True,
         )
         service_usage = await _active_service_accelerators(session)

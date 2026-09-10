@@ -15,10 +15,17 @@ placement is the sole mutation authority. Authoritative placement follows
 `Task -> project quota -> Worker/GPU inventory` for both GlobalScheduler
 placement and worker-pull claims; active reservation release and multi-item
 lease recovery acquire project quota fences before Worker/GPU capacity, and
-service admission holds quota before inventory. The closure regression runs two
+service admission holds quota before inventory. Kubernetes batch placement locks
+only its selected Worker/node GPU pool; broader inventory used for
+service/deferred accounting is a non-locking snapshot, so a local placement
+cannot acquire unrelated Worker locks after it holds its selected Worker. The
+closure regressions run two
 `GlobalScheduler` instances with `batch_size=2`, a worker-pull claim, and a
 real PostgreSQL service-equivalent quota-to-inventory transaction, then
-asserts all placements and quota counters converge.
+assert all placements and quota counters converge. A separate real PostgreSQL
+two-project/two-Worker Kubernetes regression fences each placement at its local
+pool before global accounting, then asserts both placements, quotas, and
+device-plugin reservations converge without a cross-Worker lock cycle.
 
 Candidate ranking is a snapshot operation. It must not reserve a large candidate lane for the lifetime of a scheduler batch transaction.
 

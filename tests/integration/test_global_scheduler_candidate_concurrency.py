@@ -14,7 +14,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.schemas.accelerators import AcceleratorRequest
 from core.database import Database
-from core.enums import AcceleratorKind, AcceleratorVendor, RuntimeType, TaskStatus
+from core.enums import (
+    AcceleratorKind,
+    AcceleratorSelectionPolicy,
+    AcceleratorVendor,
+    RuntimeType,
+    TaskStatus,
+)
 from core.rbac import ProjectStatus
 from core.runtime_profiles import RuntimeProfileCatalog, runtime_profile_binding_id
 from models.admission import AdmissionEvent
@@ -24,11 +30,12 @@ from models.scheduling import GPUDevice, PlacementAttempt, ReservationGPUDevice,
 from models.task import Task, TaskEvent
 from models.usage import ProjectQuotaState
 from models.worker import Worker
-from repositories.admission import AdmissionRepository
+from repositories.admission import AdmissionRepository, BatchAdmissionSnapshot
 from repositories.quotas import QuotaRepository, QuotaSnapshot
 from repositories.scheduling import SchedulerCandidate, SchedulingRepository
 from repositories.tasks import LEGACY_PROJECT_ID, TaskRepository
 from repositories.workers import WorkerRepository
+from scheduler.admission import AdmissionRequest
 from scheduler.global_scheduler import GlobalScheduler
 
 pytestmark = [pytest.mark.integration, pytest.mark.live]
@@ -128,6 +135,42 @@ async def _cleanup_lock_order_regression(
         await session.execute(delete(AdmissionEvent).where(AdmissionEvent.project_id == project_id))
         await session.flush()
         await session.execute(delete(Project).where(Project.id == project_id))
+
+
+async def _cleanup_cross_worker_lock_order_regression(
+    database: Database,
+    *,
+    project_ids: tuple[uuid.UUID, uuid.UUID],
+    worker_ids: tuple[str, str],
+) -> None:
+    """Remove the rows owned by the isolated cross-worker live regression."""
+
+    async with database.session() as session, session.begin():
+        task_ids = select(Task.id).where(Task.project_id.in_(project_ids))
+        reservation_ids = select(ResourceReservation.id).where(
+            ResourceReservation.task_id.in_(task_ids)
+        )
+        await session.execute(
+            delete(ReservationGPUDevice).where(
+                ReservationGPUDevice.reservation_id.in_(reservation_ids)
+            )
+        )
+        await session.execute(
+            delete(ResourceReservation).where(ResourceReservation.task_id.in_(task_ids))
+        )
+        await session.execute(delete(TaskEvent).where(TaskEvent.task_id.in_(task_ids)))
+        await session.execute(
+            delete(PlacementAttempt).where(PlacementAttempt.task_id.in_(task_ids))
+        )
+        await session.execute(delete(OutboxEvent).where(OutboxEvent.aggregate_id.in_(task_ids)))
+        await session.execute(delete(Task).where(Task.id.in_(task_ids)))
+        await session.execute(delete(GPUDevice).where(GPUDevice.worker_id.in_(worker_ids)))
+        await session.execute(delete(Worker).where(Worker.id.in_(worker_ids)))
+        await session.execute(
+            delete(AdmissionEvent).where(AdmissionEvent.project_id.in_(project_ids))
+        )
+        await session.flush()
+        await session.execute(delete(Project).where(Project.id.in_(project_ids)))
 
 
 async def test_candidate_discovery_does_not_hide_ranked_tasks_between_schedulers(
@@ -527,4 +570,267 @@ async def test_global_schedulers_keep_quota_after_worker_inventory_lock_order(
             scheduler_live_database,
             project_id=project_id,
             worker_id=worker_id,
+        )
+
+
+async def test_kubernetes_placements_do_not_lock_unselected_workers(
+    scheduler_live_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep two project-local placements from forming a Worker A <-> Worker B cycle.
+
+    Each placement locks its own quota, Worker, and Kubernetes pool rows before
+    the rendezvous. The old batch-capacity planner then locked every matching
+    inventory row, so the two transactions deadlocked while trying to lock the
+    other's Worker. The planner's global accounting snapshot must remain
+    non-locking; only the selected pool is authoritative for this mutation.
+    """
+
+    run_id = uuid.uuid4()
+    project_ids = (uuid.uuid4(), uuid.uuid4())
+    worker_ids = (
+        f"live-cross-worker-a-{run_id.hex}",
+        f"live-cross-worker-b-{run_id.hex}",
+    )
+    task_ids: dict[str, uuid.UUID] = {}
+    catalog = RuntimeProfileCatalog.from_path(REPOSITORY_ROOT / "runtime_profiles/manifest.json")
+    profile = next(
+        item for item in catalog.manifest.profiles if item.identity == "nvidia-vllm-k8s@2.0.0"
+    )
+    profile_binding_id = runtime_profile_binding_id(
+        profile_id=profile.profile_id,
+        profile_version=profile.profile_version,
+        semantic_digest=profile.semantic_digest,
+    )
+    accelerator = AcceleratorRequest.model_validate(
+        {
+            "count": 1,
+            "allowed_vendors": [AcceleratorVendor.NVIDIA.value],
+            "allowed_kinds": [AcceleratorKind.GPU.value],
+            "allowed_models": ["NVIDIA-A100"],
+            "runtime_profile": profile.profile_id,
+            "selection_policy": AcceleratorSelectionPolicy.NVIDIA_ONLY.value,
+        }
+    )
+    request = AdmissionRequest(
+        count=1,
+        allowed_vendors=frozenset({AcceleratorVendor.NVIDIA}),
+        allowed_kinds=frozenset({AcceleratorKind.GPU}),
+        allowed_models=frozenset({"NVIDIA-A100"}),
+        runtime_profile_id=profile.profile_id,
+        selection_policy=AcceleratorSelectionPolicy.NVIDIA_ONLY,
+    )
+    admissions: dict[str, BatchAdmissionSnapshot] = {}
+    local_pool_locks: set[str] = set()
+    both_local_pools_locked = asyncio.Event()
+
+    try:
+        async with scheduler_live_database.session() as session, session.begin():
+            for index, project_id in enumerate(project_ids):
+                session.add(
+                    Project(
+                        id=project_id,
+                        name=f"cross worker lock order {run_id} {index}",
+                        slug=f"cross-worker-lock-{run_id.hex}-{index}",
+                        status=ProjectStatus.ACTIVE,
+                    )
+                )
+
+            for index, (project_id, worker_id) in enumerate(
+                zip(project_ids, worker_ids, strict=True)
+            ):
+                node_name = f"cross-worker-node-{index}-{run_id.hex}"
+                worker = await WorkerRepository.register(
+                    session,
+                    worker_id=worker_id,
+                    hostname=f"{worker_id}.invalid",
+                    concurrency=1,
+                    cpu_count=4,
+                    memory_total_mb=8_192,
+                    docker_version="live-integration-test",
+                    labels={"live-test-run": str(run_id)},
+                    gpu_count=1,
+                    gpu_model="NVIDIA-A100",
+                    gpu_memory_mb=40_960,
+                    node_name=node_name,
+                    runtime_types=[RuntimeType.KUBERNETES.value],
+                )
+                await session.flush()
+                await WorkerRepository.replace_gpu_inventory(
+                    session,
+                    worker_id=worker.id,
+                    worker_session_id=worker.worker_session_id,
+                    devices=[
+                        {
+                            "uuid": f"GPU-{run_id}-{index}",
+                            "index": 0,
+                            "vendor": AcceleratorVendor.NVIDIA.value,
+                            "accelerator_kind": AcceleratorKind.GPU.value,
+                            "model": "NVIDIA-A100",
+                            "memory_total_mb": 40_960,
+                            "memory_free_mb": 40_960,
+                            "compute_capability": "8.0",
+                            "runtime_profile_ids": [profile_binding_id],
+                            "capabilities": ["streaming"],
+                            "kubernetes_resource_name": "nvidia.com/gpu",
+                            "kubernetes_node_name": node_name,
+                        }
+                    ],
+                )
+                task = await TaskRepository.create_queued(
+                    session,
+                    image="alpine:3.21",
+                    command=["true"],
+                    environment={},
+                    timeout_seconds=30,
+                    max_retries=0,
+                    cpu_limit=0.25,
+                    memory_limit_mb=256,
+                    labels={"live-test-run": str(run_id)},
+                    network_enabled=False,
+                    gpu_count=1,
+                    gpu_memory_mb=8_000,
+                    accelerator_request_json=accelerator.model_dump(mode="json"),
+                    runtime_type=RuntimeType.KUBERNETES.value,
+                    priority=100,
+                    idempotency_key=None,
+                    request_hash=None,
+                    project_id=project_id,
+                )
+                task_ids[worker_id] = task.id
+
+        for worker_id in worker_ids:
+            async with scheduler_live_database.session() as session, session.begin():
+                queued_task = await TaskRepository.get(session, task_ids[worker_id])
+                assert queued_task is not None
+                result = await AdmissionRepository.admit_batch_task(
+                    session,
+                    catalog=catalog,
+                    task=queued_task,
+                    request=request,
+                    allowed_worker_ids=frozenset({worker_id}),
+                )
+                assert result.snapshot is not None
+                assert result.snapshot.worker_id == worker_id
+                admissions[worker_id] = result.snapshot
+
+        original_available = AdmissionRepository.available_batch_accelerators_for_pool
+
+        async def rendezvous_before_global_accounting(
+            session: AsyncSession,
+            *,
+            catalog: RuntimeProfileCatalog,
+            worker_id: str,
+            node_name: str,
+            vendor: AcceleratorVendor,
+            kind: AcceleratorKind,
+            model: str,
+            profile_id: str,
+            profile_version: str,
+            profile_digest: str,
+            resource_name: str,
+            minimum_memory_mb: int,
+            required_capabilities: frozenset[str] = frozenset(),
+        ) -> int:
+            local_pool_locks.add(worker_id)
+            if local_pool_locks == set(worker_ids):
+                both_local_pools_locked.set()
+            await asyncio.wait_for(both_local_pools_locked.wait(), timeout=2)
+            return await original_available(
+                session,
+                catalog=catalog,
+                worker_id=worker_id,
+                node_name=node_name,
+                vendor=vendor,
+                kind=kind,
+                model=model,
+                profile_id=profile_id,
+                profile_version=profile_version,
+                profile_digest=profile_digest,
+                resource_name=resource_name,
+                minimum_memory_mb=minimum_memory_mb,
+                required_capabilities=required_capabilities,
+            )
+
+        monkeypatch.setattr(
+            AdmissionRepository,
+            "available_batch_accelerators_for_pool",
+            staticmethod(rendezvous_before_global_accounting),
+        )
+
+        async def place_on_selected_worker(worker_id: str) -> tuple[Task, uuid.UUID]:
+            async with scheduler_live_database.session() as session, session.begin():
+                return await SchedulingRepository.place(
+                    session,
+                    task_id=task_ids[worker_id],
+                    worker_id=worker_id,
+                    gpu_device_ids=(),
+                    lease_seconds=30,
+                    cpu_price_per_hour=0.05,
+                    memory_price_per_gb_hour=0.005,
+                    gpu_price_per_hour=1.0,
+                    admission=admissions[worker_id],
+                    runtime_profile_catalog=catalog,
+                )
+
+        placements = await asyncio.wait_for(
+            asyncio.gather(*(place_on_selected_worker(worker_id) for worker_id in worker_ids)),
+            timeout=5,
+        )
+        assert {task.id for task, _execution_id in placements} == set(task_ids.values())
+
+        async with scheduler_live_database.session() as session:
+            tasks = list(await session.scalars(select(Task).where(Task.id.in_(task_ids.values()))))
+            workers = list(await session.scalars(select(Worker).where(Worker.id.in_(worker_ids))))
+            states = [
+                await session.get(ProjectQuotaState, project_id) for project_id in project_ids
+            ]
+            reservations = list(
+                await session.scalars(
+                    select(ResourceReservation).where(
+                        ResourceReservation.task_id.in_(task_ids.values()),
+                        ResourceReservation.released_at.is_(None),
+                    )
+                )
+            )
+            reservation_device_bindings = list(
+                await session.scalars(
+                    select(ReservationGPUDevice).where(
+                        ReservationGPUDevice.reservation_id.in_(
+                            [reservation.id for reservation in reservations]
+                        )
+                    )
+                )
+            )
+
+        assert {task.status for task in tasks} == {TaskStatus.ASSIGNED}
+        assert {task.worker_id for task in tasks} == set(worker_ids)
+        assert all(task.gpu_device_ids == [] for task in tasks)
+        assert {worker.id for worker in workers} == set(worker_ids)
+        assert all(
+            worker.running_tasks == 1
+            and worker.reserved_gpus == 1
+            and worker.reserved_cpu == 0.25
+            and worker.reserved_memory_mb == 256
+            for worker in workers
+        )
+        assert all(state is not None for state in states)
+        assert all(
+            state.queued_tasks == 0
+            and state.running_tasks == 1
+            and state.reserved_cpu_millicores == 250
+            and state.reserved_memory_mb == 256
+            and state.reserved_gpus == 1
+            and state.reserved_nvidia_gpus == 1
+            and state.reserved_ascend_npus == 0
+            for state in states
+            if state is not None
+        )
+        assert len(reservations) == 2
+        assert reservation_device_bindings == []
+    finally:
+        await _cleanup_cross_worker_lock_order_regression(
+            scheduler_live_database,
+            project_ids=project_ids,
+            worker_ids=worker_ids,
         )
