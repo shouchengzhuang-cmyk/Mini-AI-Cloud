@@ -652,6 +652,7 @@ class AdmissionRepository:
                 select(Worker)
                 .where(Worker.id.in_(candidate_worker_ids))
                 .order_by(Worker.id)
+                .execution_options(populate_existing=True)
                 .with_for_update()
             )
         )
@@ -676,6 +677,7 @@ class AdmissionRepository:
                     GPUDevice.accelerator_kind.in_(kind_values),
                 )
                 .order_by(GPUDevice.worker_id, GPUDevice.device_uuid, GPUDevice.id)
+                .execution_options(populate_existing=True)
                 .with_for_update()
             )
         )

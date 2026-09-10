@@ -20,6 +20,7 @@ from core.enums import (
     AcceleratorVendor,
     RuntimeType,
     TaskStatus,
+    WorkerStatus,
 )
 from core.rbac import ProjectStatus
 from core.runtime_profiles import RuntimeProfileCatalog, runtime_profile_binding_id
@@ -269,6 +270,119 @@ async def test_global_scheduler_skips_preemption_contention_without_task_fallbac
             assert attempts == []
     finally:
         await _cleanup_candidates(scheduler_live_database, [task_id])
+
+
+async def test_canonical_inventory_fence_refreshes_stale_identity_map_entities(
+    scheduler_live_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Locked inventory revalidation must not reuse pre-lock ORM attributes."""
+
+    worker_id = f"live-inventory-refresh-{uuid.uuid4()}"
+    device_uuid = f"GPU-{uuid.uuid4()}"
+    try:
+        async with scheduler_live_database.session() as session, session.begin():
+            worker = await WorkerRepository.register(
+                session,
+                worker_id=worker_id,
+                hostname=f"{worker_id}.invalid",
+                concurrency=1,
+                cpu_count=4,
+                memory_total_mb=8_192,
+                docker_version="live-integration-test",
+                labels={},
+                gpu_count=1,
+                gpu_model="NVIDIA-A100",
+                gpu_memory_mb=40_960,
+                runtime_types=[RuntimeType.KUBERNETES.value],
+            )
+            await WorkerRepository.replace_gpu_inventory(
+                session,
+                worker_id=worker.id,
+                worker_session_id=worker.worker_session_id,
+                devices=[
+                    {
+                        "uuid": device_uuid,
+                        "index": 0,
+                        "vendor": AcceleratorVendor.NVIDIA.value,
+                        "accelerator_kind": AcceleratorKind.GPU.value,
+                        "model": "NVIDIA-A100",
+                        "memory_total_mb": 40_960,
+                        "memory_free_mb": 40_960,
+                        "kubernetes_resource_name": "nvidia.com/gpu",
+                        "kubernetes_node_name": worker.node_name,
+                    }
+                ],
+            )
+
+        original_discovery = AdmissionRepository.list_healthy_inventory_devices
+        state_changed = False
+
+        async def change_state_after_discovery(
+            session: AsyncSession,
+            *,
+            vendors: tuple[AcceleratorVendor, ...],
+            kinds: tuple[AcceleratorKind, ...],
+            minimum_memory_mb: int = 0,
+            runtime_type: RuntimeType | None = None,
+            include_unavailable: bool = False,
+        ) -> list[InventoryDeviceSnapshot]:
+            nonlocal state_changed
+            discovery = await original_discovery(
+                session,
+                vendors=vendors,
+                kinds=kinds,
+                minimum_memory_mb=minimum_memory_mb,
+                runtime_type=runtime_type,
+                include_unavailable=include_unavailable,
+            )
+            assert discovery
+            if not state_changed:
+                state_changed = True
+                async with scheduler_live_database.session() as writer, writer.begin():
+                    current_worker = await writer.get(Worker, worker_id, with_for_update=True)
+                    current_device = await writer.scalar(
+                        select(GPUDevice).where(GPUDevice.worker_id == worker_id)
+                    )
+                    assert current_worker is not None
+                    assert current_device is not None
+                    current_worker.status = WorkerStatus.OFFLINE
+                    current_worker.inventory_generation += 1
+                    current_device.health = "missing"
+                    current_device.memory_free_mb = 0
+            return discovery
+
+        monkeypatch.setattr(
+            AdmissionRepository,
+            "list_healthy_inventory_devices",
+            staticmethod(change_state_after_discovery),
+        )
+
+        async with scheduler_live_database.session() as session, session.begin():
+            stale_worker = await session.get(Worker, worker_id)
+            stale_device = await session.scalar(
+                select(GPUDevice).where(GPUDevice.worker_id == worker_id)
+            )
+            assert stale_worker is not None
+            assert stale_device is not None
+            assert stale_worker.status == WorkerStatus.ONLINE
+            assert stale_device.health == "healthy"
+            inventory = await AdmissionRepository.lock_inventory_canonical(
+                session,
+                vendors=(AcceleratorVendor.NVIDIA,),
+                kinds=(AcceleratorKind.GPU,),
+                runtime_type=RuntimeType.KUBERNETES,
+                include_unavailable=True,
+            )
+            assert inventory == []
+            assert stale_worker.status == WorkerStatus.OFFLINE
+            assert stale_worker.inventory_generation == 2
+            assert stale_device.health == "missing"
+            assert stale_device.memory_free_mb == 0
+    finally:
+        async with scheduler_live_database.session() as session, session.begin():
+            await session.execute(delete(GPUDevice).where(GPUDevice.worker_id == worker_id))
+            await session.execute(delete(Worker).where(Worker.id == worker_id))
 
 
 async def test_global_schedulers_keep_quota_after_worker_inventory_lock_order(
