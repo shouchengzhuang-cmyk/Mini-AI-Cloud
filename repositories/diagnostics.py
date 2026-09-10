@@ -21,7 +21,7 @@ from models.task import Task
 from models.usage import ProjectQuotaState
 from models.worker import Worker
 from repositories.clock import database_utcnow
-from repositories.quotas import QuotaInvariantViolation, QuotaNotFoundError
+from repositories.quotas import QuotaInvariantViolation, QuotaNotFoundError, QuotaRepository
 from repositories.reservations import ReservationRepository, ResourceInvariantViolation
 
 
@@ -255,6 +255,15 @@ class DiagnosticsRepository:
                 )
             ).all()
         )
+        # A platform-wide repair can release reservations from several
+        # projects in one outer transaction. Fence every project before the
+        # first release acquires a Worker/GPU row, otherwise a later release
+        # could invert placement's quota -> Worker/GPU order.
+        for reservation_project_id in sorted(
+            {reservation.project_id for reservation, _task in reservation_rows},
+            key=str,
+        ):
+            await QuotaRepository.get_locked(session, project_id=reservation_project_id)
         for reservation, task in reservation_rows:
             try:
                 async with session.begin_nested():
