@@ -30,7 +30,11 @@ from models.scheduling import GPUDevice, PlacementAttempt, ReservationGPUDevice,
 from models.task import Task, TaskEvent
 from models.usage import ProjectQuotaState
 from models.worker import Worker
-from repositories.admission import AdmissionRepository, BatchAdmissionSnapshot
+from repositories.admission import (
+    AdmissionRepository,
+    BatchAdmissionSnapshot,
+    InventoryDeviceSnapshot,
+)
 from repositories.quotas import QuotaRepository, QuotaSnapshot
 from repositories.scheduling import SchedulerCandidate, SchedulingRepository
 from repositories.tasks import LEGACY_PROJECT_ID, TaskRepository
@@ -493,12 +497,11 @@ async def test_global_schedulers_keep_quota_after_worker_inventory_lock_order(
                 # Worker/GPU inventory. A Worker/GPU -> quota regression
                 # therefore establishes the inverse PostgreSQL lock cycle.
                 await asyncio.wait_for(all_placement_actors_at_quota.wait(), timeout=2)
-                inventory = await AdmissionRepository.list_healthy_inventory_devices(
+                inventory = await AdmissionRepository.lock_inventory_canonical(
                     session,
                     vendors=(AcceleratorVendor.NVIDIA,),
                     kinds=(AcceleratorKind.GPU,),
                     runtime_type=RuntimeType.KUBERNETES,
-                    for_update=True,
                     include_unavailable=True,
                 )
                 assert len(inventory) == 2
@@ -778,6 +781,69 @@ async def test_kubernetes_placements_do_not_lock_unselected_workers(
             timeout=5,
         )
         assert {task.id for task, _execution_id in placements} == set(task_ids.values())
+
+        service_snapshot_arrivals: set[str] = set()
+        both_service_snapshots_ready = asyncio.Event()
+        original_inventory_snapshot = AdmissionRepository.list_healthy_inventory_devices
+
+        async def coordinate_service_snapshot(
+            session: AsyncSession,
+            *,
+            vendors: tuple[AcceleratorVendor, ...],
+            kinds: tuple[AcceleratorKind, ...],
+            minimum_memory_mb: int = 0,
+            runtime_type: RuntimeType | None = None,
+            include_unavailable: bool = False,
+        ) -> list[InventoryDeviceSnapshot]:
+            inventory = await original_inventory_snapshot(
+                session,
+                vendors=vendors,
+                kinds=kinds,
+                minimum_memory_mb=minimum_memory_mb,
+                runtime_type=runtime_type,
+                include_unavailable=include_unavailable,
+            )
+            current_task = asyncio.current_task()
+            if current_task is not None and current_task.get_name().startswith("service-fence-"):
+                service_snapshot_arrivals.add(current_task.get_name())
+                if len(service_snapshot_arrivals) == 2:
+                    both_service_snapshots_ready.set()
+                await asyncio.wait_for(both_service_snapshots_ready.wait(), timeout=2)
+            return inventory
+
+        monkeypatch.setattr(
+            AdmissionRepository,
+            "list_healthy_inventory_devices",
+            staticmethod(coordinate_service_snapshot),
+        )
+
+        async def fence_service_inventory(project_id: uuid.UUID) -> tuple[str, ...]:
+            async with scheduler_live_database.session() as session, session.begin():
+                await QuotaRepository.get_locked(session, project_id=project_id)
+                inventory = await AdmissionRepository.lock_inventory_canonical(
+                    session,
+                    vendors=(AcceleratorVendor.NVIDIA,),
+                    kinds=(AcceleratorKind.GPU,),
+                    runtime_type=RuntimeType.KUBERNETES,
+                    include_unavailable=True,
+                )
+                return tuple(device.worker_id for device in inventory)
+
+        service_fences = await asyncio.wait_for(
+            asyncio.gather(
+                asyncio.create_task(
+                    fence_service_inventory(project_ids[0]),
+                    name="service-fence-a",
+                ),
+                asyncio.create_task(
+                    fence_service_inventory(project_ids[1]),
+                    name="service-fence-b",
+                ),
+            ),
+            timeout=5,
+        )
+        assert service_snapshot_arrivals == {"service-fence-a", "service-fence-b"}
+        assert service_fences == [worker_ids, worker_ids]
 
         async with scheduler_live_database.session() as session:
             tasks = list(await session.scalars(select(Task).where(Task.id.in_(task_ids.values()))))

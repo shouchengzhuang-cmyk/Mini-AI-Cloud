@@ -19,6 +19,10 @@ service admission holds quota before inventory. Kubernetes batch placement locks
 only its selected Worker/node GPU pool; broader inventory used for
 service/deferred accounting is a non-locking snapshot, so a local placement
 cannot acquire unrelated Worker locks after it holds its selected Worker. The
+authoritative accelerator invariant is `project quota -> Worker rows ordered by
+Worker.id -> GPUDevice rows ordered by (worker_id, device_uuid)`. No joined
+Worker/GPUDevice `SELECT ... FOR UPDATE` is permitted: snapshot inventory APIs
+cannot lock, and service admission uses the canonical two-statement fence. The
 closure regressions run two
 `GlobalScheduler` instances with `batch_size=2`, a worker-pull claim, and a
 real PostgreSQL service-equivalent quota-to-inventory transaction, then
