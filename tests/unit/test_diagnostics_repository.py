@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
+import pytest
 import pytest_asyncio
 from sqlalchemy import event, insert, select
 
@@ -18,6 +19,8 @@ from models.task import Task
 from models.usage import ProjectQuota, ProjectQuotaState, TaskExecution
 from models.worker import Worker
 from repositories.diagnostics import DiagnosticsRepository
+from repositories.quotas import QuotaRepository
+from repositories.reservations import ReservationRepository
 
 
 @pytest_asyncio.fixture
@@ -433,6 +436,257 @@ async def test_conservative_repair_releases_terminal_reservation_and_lease_idemp
         )
     assert second.candidates_total == 0
     assert second.repaired_total == 0
+
+
+async def test_conservative_repair_fences_all_projects_before_releasing_workers(
+    diagnostics_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Multi-project repair cannot acquire a later quota after a worker lock."""
+
+    now = datetime.now(UTC)
+    project_ids = (uuid.uuid4(), uuid.uuid4())
+    worker_id = "repair-lock-order-worker"
+    session_id = uuid.uuid4()
+    async with diagnostics_database.session() as session, session.begin():
+        session.add(
+            Worker(
+                id=worker_id,
+                worker_session_id=session_id,
+                hostname=worker_id,
+                status=WorkerStatus.ONLINE,
+                started_at=now,
+                last_heartbeat_at=now,
+                concurrency=2,
+                cpu_count=4,
+                memory_total_mb=8_192,
+            )
+        )
+        task_specs: list[tuple[uuid.UUID, uuid.UUID, uuid.UUID, int]] = []
+        for index, project_id in enumerate(project_ids):
+            task_id = uuid.uuid4()
+            execution_id = uuid.uuid4()
+            session.add_all(
+                [
+                    Project(
+                        id=project_id,
+                        name=f"Repair ordering {index}",
+                        slug=f"repair-ordering-{index}-{project_id.hex[:8]}",
+                        status=ProjectStatus.ACTIVE,
+                    ),
+                    ProjectQuota(project_id=project_id),
+                    ProjectQuotaState(project_id=project_id, accounting_date=now.date()),
+                ]
+            )
+            task_specs.append((project_id, task_id, execution_id, index))
+        await session.flush()
+        for project_id, task_id, execution_id, _index in task_specs:
+            session.add(
+                Task(
+                    id=task_id,
+                    project_id=project_id,
+                    image="python:3.12",
+                    command=["true"],
+                    status=TaskStatus.SUCCEEDED,
+                    worker_id=worker_id,
+                    execution_id=execution_id,
+                    finished_at=now,
+                )
+            )
+        await session.flush()
+        for project_id, task_id, execution_id, _index in task_specs:
+            session.add(
+                TaskExecution(
+                    id=execution_id,
+                    task_id=task_id,
+                    project_id=project_id,
+                    worker_id=worker_id,
+                    worker_session_id=session_id,
+                    attempt=0,
+                    status="running",
+                    cpu_millicores=1_000,
+                    memory_mb=256,
+                    gpu_count=0,
+                    cpu_price_per_hour=Decimal("0.05"),
+                    memory_price_per_gb_hour=Decimal("0.005"),
+                    gpu_price_per_hour=Decimal("1"),
+                    assigned_at=now,
+                    runtime_type="docker",
+                )
+            )
+        await session.flush()
+        for project_id, task_id, execution_id, index in task_specs:
+            session.add(
+                ResourceReservation(
+                    project_id=project_id,
+                    task_id=task_id,
+                    execution_id=execution_id,
+                    worker_id=worker_id,
+                    worker_session_id=session_id,
+                    cpu_millicores=1_000,
+                    memory_mb=256,
+                    gpu_count=0,
+                    created_at=now + timedelta(seconds=index),
+                )
+            )
+
+    calls: list[tuple[str, uuid.UUID | None]] = []
+    original_get_locked = QuotaRepository.get_locked
+
+    async def record_quota_fence(
+        session: Any,
+        *,
+        project_id: uuid.UUID,
+        reset_daily: bool = True,
+    ) -> Any:
+        calls.append(("quota", project_id))
+        return await original_get_locked(
+            session,
+            project_id=project_id,
+            reset_daily=reset_daily,
+        )
+
+    async def record_release(_session: Any, **_kwargs: Any) -> bool:
+        calls.append(("release", None))
+        return True
+
+    monkeypatch.setattr(QuotaRepository, "get_locked", staticmethod(record_quota_fence))
+    monkeypatch.setattr(
+        ReservationRepository,
+        "release_and_settle",
+        staticmethod(record_release),
+    )
+
+    async with diagnostics_database.session() as session, session.begin():
+        result = await DiagnosticsRepository.repair_conservative(
+            session,
+            project_id=None,
+        )
+
+    assert result.repaired_total == 2
+    assert calls[:2] == [("quota", project_id) for project_id in sorted(project_ids, key=str)]
+    assert calls[2:] == [("release", None), ("release", None)]
+
+
+async def test_conservative_repair_skips_only_project_with_unfenceable_quota(
+    diagnostics_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broken quota must not abort repairable reservations in other projects."""
+
+    now = datetime.now(UTC)
+    good_project_id = uuid.uuid4()
+    bad_project_id = uuid.uuid4()
+    worker_id = "repair-quota-isolation-worker"
+    task_specs = (
+        (good_project_id, uuid.uuid4(), uuid.uuid4()),
+        (bad_project_id, uuid.uuid4(), uuid.uuid4()),
+    )
+    reservation_ids = {project_id: uuid.uuid4() for project_id, _, _ in task_specs}
+    async with diagnostics_database.session() as session, session.begin():
+        session.add(
+            Worker(
+                id=worker_id,
+                worker_session_id=uuid.uuid4(),
+                hostname=worker_id,
+                status=WorkerStatus.ONLINE,
+                started_at=now,
+                last_heartbeat_at=now,
+                concurrency=2,
+                cpu_count=4,
+                memory_total_mb=8_192,
+            )
+        )
+        for index, (project_id, _task_id, _execution_id) in enumerate(task_specs):
+            session.add(
+                Project(
+                    id=project_id,
+                    name=f"Repair quota isolation {index}",
+                    slug=f"repair-quota-isolation-{index}-{project_id.hex[:8]}",
+                    status=ProjectStatus.ACTIVE,
+                )
+            )
+            if project_id == good_project_id:
+                session.add_all(
+                    [
+                        ProjectQuota(project_id=project_id),
+                        ProjectQuotaState(project_id=project_id, accounting_date=now.date()),
+                    ]
+                )
+        await session.flush()
+        for project_id, task_id, _execution_id in task_specs:
+            session.add(
+                Task(
+                    id=task_id,
+                    project_id=project_id,
+                    image="python:3.12",
+                    command=["true"],
+                    status=TaskStatus.SUCCEEDED,
+                    worker_id=worker_id,
+                    finished_at=now,
+                )
+            )
+        await session.flush()
+        for project_id, task_id, execution_id in task_specs:
+            session.add(
+                TaskExecution(
+                    id=execution_id,
+                    task_id=task_id,
+                    project_id=project_id,
+                    worker_id=worker_id,
+                    worker_session_id=uuid.uuid4(),
+                    attempt=0,
+                    status="running",
+                    cpu_millicores=1_000,
+                    memory_mb=256,
+                    gpu_count=0,
+                    cpu_price_per_hour=Decimal("0"),
+                    memory_price_per_gb_hour=Decimal("0"),
+                    gpu_price_per_hour=Decimal("0"),
+                    assigned_at=now,
+                    runtime_type="docker",
+                )
+            )
+        await session.flush()
+        for project_id, task_id, execution_id in task_specs:
+            session.add(
+                ResourceReservation(
+                    id=reservation_ids[project_id],
+                    project_id=project_id,
+                    task_id=task_id,
+                    execution_id=execution_id,
+                    worker_id=worker_id,
+                    worker_session_id=uuid.uuid4(),
+                    cpu_millicores=1_000,
+                    memory_mb=256,
+                    gpu_count=0,
+                    created_at=now,
+                )
+            )
+
+    released_task_ids: list[uuid.UUID] = []
+
+    async def record_release(_session: Any, **kwargs: Any) -> bool:
+        released_task_ids.append(kwargs["task"].id)
+        return True
+
+    monkeypatch.setattr(
+        ReservationRepository,
+        "release_and_settle",
+        staticmethod(record_release),
+    )
+
+    async with diagnostics_database.session() as session, session.begin():
+        result = await DiagnosticsRepository.repair_conservative(session, project_id=None)
+
+    good_task_id = task_specs[0][1]
+    bad_task_id = task_specs[1][1]
+    assert released_task_ids == [good_task_id]
+    assert result.repaired_total == 1
+    assert result.skipped_total == 1
+    skipped = next(action for action in result.actions if action.outcome == "skipped")
+    assert skipped.resource_id == str(reservation_ids[bad_project_id])
+    assert bad_task_id not in released_task_ids
 
 
 async def test_reservation_without_task_is_reported_but_never_auto_repaired(

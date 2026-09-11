@@ -867,6 +867,10 @@ class TaskRepository:
             raise ClaimRejected("task is no longer queued")
         if not await TaskRepository.dependencies_ready(session, task.id):
             raise ClaimRejected("task dependencies are not ready")
+        # Worker-pull scheduling mutates the same capacity and quota state as
+        # GlobalScheduler placement. Keep its authoritative lock order
+        # Task -> project quota -> Worker/GPU as well.
+        await QuotaRepository.get_locked(session, project_id=task.project_id)
         worker = await session.scalar(
             select(Worker)
             .where(Worker.id == worker_id)
@@ -1507,22 +1511,20 @@ class TaskRepository:
         task = await TaskRepository.get(session, task_id, for_update=True)
         if task is None or task.worker_id != worker_id or task.execution_id != execution_id:
             return ExecutionResult(accepted=False, status=None)
-        if worker_session_id is not None and not await TaskRepository._session_owns_execution(
-            session,
-            worker_id=worker_id,
-            execution_id=execution_id,
-            worker_session_id=worker_session_id,
-        ):
-            return ExecutionResult(accepted=False, status=None)
         if task.status not in ACTIVE_TASK_STATUSES:
             return ExecutionResult(accepted=False, status=task.status)
+        if worker_session_id is not None:
+            # Session fencing locks Worker. Acquire the project fence first so
+            # a normal worker completion keeps the placement lock order.
+            await QuotaRepository.get_locked(session, project_id=task.project_id)
+            if not await TaskRepository._session_owns_execution(
+                session,
+                worker_id=worker_id,
+                execution_id=execution_id,
+                worker_session_id=worker_session_id,
+            ):
+                return ExecutionResult(accepted=False, status=None)
 
-        worker = await session.scalar(
-            select(Worker)
-            .where(Worker.id == worker_id)
-            .execution_options(populate_existing=True)
-            .with_for_update()
-        )
         now = await database_utcnow(session)
         preemption_requested = task.status == TaskStatus.PREEMPTING
         user_cancelled_preemption = preemption_requested and task.failure_category == "CANCELLED"
@@ -1578,10 +1580,17 @@ class TaskRepository:
             now=now,
             release_reason=target.value,
         )
-        if not released and worker is not None:
+        if not released:
             # Compatibility for an in-flight Phase I execution encountered
             # before the reservation backfill migration completed.
-            _release_worker_capacity(worker, task)
+            worker = await session.scalar(
+                select(Worker)
+                .where(Worker.id == worker_id)
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            )
+            if worker is not None:
+                _release_worker_capacity(worker, task)
         execution = await session.get(TaskExecution, execution_id, with_for_update=True)
         if execution is not None:
             execution.error_category = category_value
@@ -1797,6 +1806,15 @@ class TaskRepository:
                 .with_for_update(skip_locked=True)
             )
         )
+        # One recovery transaction can release several expired executions.
+        # Take every quota fence in a stable order before it owns any Worker
+        # or accelerator row, so an earlier release cannot invert a later
+        # project's quota -> Worker/GPU placement order.
+        for project_id in sorted(
+            {task.project_id for task in tasks},
+            key=str,
+        ):
+            await QuotaRepository.get_locked(session, project_id=project_id)
         recovered: list[uuid.UUID] = []
         for task in tasks:
             worker_id = task.worker_id
@@ -1814,11 +1832,10 @@ class TaskRepository:
                 recovered_status = TaskStatus.PREEMPTED
             else:
                 recovered_status = TaskStatus.FAILED
-            worker = (
-                await session.get(Worker, worker_id, with_for_update=True)
-                if worker_id is not None
-                else None
-            )
+            # This read only selects the recovery reason. The authoritative
+            # release below locks quota before Worker/GPU capacity, matching
+            # placement and avoiding a Worker -> quota cycle.
+            worker = await session.get(Worker, worker_id) if worker_id is not None else None
             recovery_code = (
                 ErrorCode.WORKER_LOST
                 if worker is None or worker.status == WorkerStatus.OFFLINE

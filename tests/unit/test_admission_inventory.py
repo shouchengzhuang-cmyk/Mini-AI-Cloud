@@ -1,3 +1,4 @@
+import inspect
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -86,3 +87,21 @@ async def test_kubernetes_capacity_slots_are_admissible_but_unknown_cli_health_i
     assert [(device.vendor, device.device_uuid) for device in devices] == [
         (AcceleratorVendor.NVIDIA, "k8s-capacity:node:nvidia.com/gpu:0")
     ]
+
+
+def test_inventory_snapshot_cannot_lock_and_canonical_fence_is_physically_split() -> None:
+    """Keep Worker/GPU fences out of joined ``FOR UPDATE`` statements."""
+
+    snapshot_signature = inspect.signature(AdmissionRepository.list_healthy_inventory_devices)
+    snapshot_source = inspect.getsource(AdmissionRepository.list_healthy_inventory_devices)
+    fence_source = inspect.getsource(AdmissionRepository.lock_inventory_canonical)
+
+    assert "for_update" not in snapshot_signature.parameters
+    assert "with_for_update" not in snapshot_source
+    assert ".execution_options(populate_existing=True)" in snapshot_source
+    assert fence_source.count(".with_for_update()") == 2
+    assert fence_source.count(".execution_options(populate_existing=True)") == 2
+    assert fence_source.index("select(Worker)") < fence_source.index("select(GPUDevice)")
+    assert fence_source.index("select(Worker)") < fence_source.index(".with_for_update()")
+    assert fence_source.index("select(GPUDevice)") < fence_source.rindex(".with_for_update()")
+    assert ".join(" not in fence_source

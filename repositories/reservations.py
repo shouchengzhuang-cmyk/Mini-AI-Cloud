@@ -174,6 +174,10 @@ class ReservationRepository:
         )
         if reservation is None:
             return False
+        # Release takes the same project fence as placement before it owns
+        # Worker or accelerator rows. A completing execution otherwise
+        # inverts placement's quota -> Worker/GPU order.
+        await QuotaRepository.get_locked(session, project_id=reservation.project_id)
         worker = await session.get(Worker, reservation.worker_id, with_for_update=True)
         if worker is not None:
             expected_cpu = reservation.cpu_millicores / 1000

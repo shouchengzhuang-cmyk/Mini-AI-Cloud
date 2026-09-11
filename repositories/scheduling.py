@@ -449,16 +449,22 @@ class SchedulingRepository:
             .execution_options(populate_existing=True)
             .with_for_update()
         )
+        if task is None or task.status != TaskStatus.QUEUED or task.cancel_requested:
+            raise PlacementConflict("task is no longer queued")
+        if not await TaskRepository.dependencies_ready(session, task.id):
+            raise PlacementConflict("task dependencies are not ready")
+        # Every authoritative resource mutation takes the project quota fence
+        # before Worker and accelerator inventory. Service admission already
+        # owns quota before its inventory fence; preserving this order avoids a
+        # service/batch quota <-> inventory cycle. ``reserve_execution`` below
+        # reuses the same row lock for the counter mutation.
+        await QuotaRepository.get_locked(session, project_id=task.project_id)
         worker = await session.scalar(
             select(Worker)
             .where(Worker.id == worker_id)
             .execution_options(populate_existing=True)
             .with_for_update()
         )
-        if task is None or task.status != TaskStatus.QUEUED or task.cancel_requested:
-            raise PlacementConflict("task is no longer queued")
-        if not await TaskRepository.dependencies_ready(session, task.id):
-            raise PlacementConflict("task dependencies are not ready")
         if worker is None or worker.status != WorkerStatus.ONLINE or worker.overcommitted:
             raise PlacementConflict("worker is unavailable")
         if admission is not None and (
@@ -788,9 +794,10 @@ class SchedulingRepository:
             select(Task)
             .where(Task.id == candidate.task.id)
             .execution_options(populate_existing=True)
-            # `run_once` can process several candidates in one transaction.
-            # Skip a task another scheduler is fencing so competing batches cannot
-            # retain incoming-task locks in different orders and deadlock.
+            # A scheduler may concurrently evaluate another candidate while this
+            # preemption fence is active. Skip a task another scheduler is
+            # fencing so competing schedulers cannot wait on the same incoming
+            # task lock while they retain other placement fences.
             .with_for_update(skip_locked=True)
         )
         if incoming_task is None:

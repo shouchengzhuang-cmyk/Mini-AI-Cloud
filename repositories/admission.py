@@ -535,9 +535,14 @@ class AdmissionRepository:
         kinds: Sequence[AcceleratorKind],
         minimum_memory_mb: int = 0,
         runtime_type: RuntimeType | None = None,
-        for_update: bool = False,
         include_unavailable: bool = False,
     ) -> list[InventoryDeviceSnapshot]:
+        """Return a non-locking inventory snapshot for admission decisions.
+
+        This API intentionally cannot acquire row locks. Authoritative
+        Worker/GPU fencing must use :meth:`lock_inventory_canonical`, which
+        physically issues the Worker and GPUDevice locks in that order.
+        """
         if minimum_memory_mb < 0:
             raise ValueError("minimum_memory_mb must not be negative")
         accepted_health = (
@@ -564,11 +569,14 @@ class AdmissionRepository:
                 GPUDevice.device_uuid,
                 GPUDevice.id,
             )
+            # Admission snapshots can run in a long-lived AsyncSession before
+            # the authoritative fence. Refresh cached entities so Python-side
+            # runtime and Kubernetes-node validation uses this query's current
+            # database snapshot rather than stale identity-map attributes.
+            .execution_options(populate_existing=True)
         )
         if not include_unavailable:
             query = query.where(GPUDevice.health.in_(accepted_health))
-        if for_update:
-            query = query.with_for_update()
         rows = list((await session.execute(query)).all())
         result: list[InventoryDeviceSnapshot] = []
         for device, worker in rows:
@@ -585,6 +593,122 @@ class AdmissionRepository:
                     continue
             else:
                 node_name = worker.node_name or worker.id
+            result.append(
+                InventoryDeviceSnapshot(
+                    device_id=device.id,
+                    worker_id=worker.id,
+                    node_name=node_name,
+                    worker_session_id=worker.worker_session_id,
+                    worker_status=worker.status,
+                    worker_runtime_types=runtime_types,
+                    device_uuid=device.device_uuid,
+                    health=device.health,
+                    vendor=AcceleratorVendor(device.vendor),
+                    kind=AcceleratorKind(device.accelerator_kind),
+                    model=device.model,
+                    memory_total_mb=device.memory_total_mb,
+                    memory_free_mb=device.memory_free_mb,
+                    runtime_profile_ids=tuple(sorted(set(device.runtime_profile_ids or []))),
+                    capabilities=frozenset(device.capabilities_json or []),
+                    kubernetes_resource_name=device.kubernetes_resource_name,
+                    inventory_generation=device.inventory_generation,
+                    last_seen_at=device.last_seen_at,
+                )
+            )
+        return result
+
+    @staticmethod
+    async def lock_inventory_canonical(
+        session: AsyncSession,
+        *,
+        vendors: Sequence[AcceleratorVendor],
+        kinds: Sequence[AcceleratorKind],
+        runtime_type: RuntimeType,
+        minimum_memory_mb: int = 0,
+        include_unavailable: bool = False,
+    ) -> list[InventoryDeviceSnapshot]:
+        """Fence inventory as Worker rows, then GPUDevice rows, in stable order.
+
+        The broad discovery phase is deliberately non-locking. It only bounds
+        the Worker set; the authoritative phases revalidate every Worker and
+        device predicate after acquiring ``Worker.id`` then
+        ``(GPUDevice.worker_id, GPUDevice.device_uuid)`` row locks. No joined
+        Worker/GPUDevice ``SELECT ... FOR UPDATE`` is permitted here.
+        """
+        if minimum_memory_mb < 0:
+            raise ValueError("minimum_memory_mb must not be negative")
+        if not vendors or not kinds:
+            return []
+
+        discovery = await AdmissionRepository.list_healthy_inventory_devices(
+            session,
+            vendors=vendors,
+            kinds=kinds,
+            minimum_memory_mb=minimum_memory_mb,
+            runtime_type=runtime_type,
+            include_unavailable=include_unavailable,
+        )
+        candidate_worker_ids = tuple(sorted({device.worker_id for device in discovery}))
+        if not candidate_worker_ids:
+            return []
+
+        workers = list(
+            await session.scalars(
+                select(Worker)
+                .where(Worker.id.in_(candidate_worker_ids))
+                .order_by(Worker.id)
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            )
+        )
+        if not workers:
+            return []
+
+        accepted_health = (
+            ("healthy", "inventory-only")
+            if runtime_type == RuntimeType.KUBERNETES
+            else ("healthy",)
+        )
+        vendor_values = tuple(vendor.value for vendor in vendors)
+        kind_values = tuple(kind.value for kind in kinds)
+        worker_by_id = {worker.id: worker for worker in workers}
+        devices = list(
+            await session.scalars(
+                select(GPUDevice)
+                .where(
+                    GPUDevice.worker_id.in_(tuple(worker_by_id)),
+                    GPUDevice.memory_free_mb >= minimum_memory_mb,
+                    GPUDevice.vendor.in_(vendor_values),
+                    GPUDevice.accelerator_kind.in_(kind_values),
+                )
+                .order_by(GPUDevice.worker_id, GPUDevice.device_uuid, GPUDevice.id)
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            )
+        )
+
+        result: list[InventoryDeviceSnapshot] = []
+        for device in devices:
+            worker = worker_by_id[device.worker_id]
+            runtime_types = tuple(sorted(set(worker.runtime_types or [])))
+            if (
+                worker.status != WorkerStatus.ONLINE
+                or worker.overcommitted
+                or device.inventory_generation != worker.inventory_generation
+                or runtime_type.value not in runtime_types
+                or (not include_unavailable and device.health not in accepted_health)
+            ):
+                continue
+            node_value = device.kubernetes_node_name or worker.node_name
+            if node_value is None:
+                continue
+            try:
+                node_name = validate_kubernetes_dns_subdomain(
+                    node_value,
+                    field_name="accelerator node_name",
+                )
+            except (TypeError, ValueError):
+                continue
             result.append(
                 InventoryDeviceSnapshot(
                     device_id=device.id,
@@ -682,13 +806,18 @@ class AdmissionRepository:
         ):
             return 0
         profile_capabilities = _runtime_profile_capabilities(profile)
+        # ``SchedulingRepository.place`` has already locked the selected
+        # Worker and its candidate pool rows before this planner runs. The
+        # remaining cluster-wide inventory is only an accounting snapshot for
+        # service and deferred usage. Locking it here would expand a local
+        # placement into unrelated Worker locks after the selected Worker is
+        # held, allowing two placements to form a Worker -> Worker cycle.
         inventory = await AdmissionRepository.list_healthy_inventory_devices(
             session,
             vendors=(vendor,),
             kinds=(kind,),
             minimum_memory_mb=0,
             runtime_type=RuntimeType.KUBERNETES,
-            for_update=True,
             include_unavailable=True,
         )
         service_usage = await _active_service_accelerators(session)
@@ -793,17 +922,16 @@ class AdmissionRepository:
 
         if task.runtime_type != RuntimeType.KUBERNETES:
             raise ValueError("vendor-aware batch admission requires runtime_type='kubernetes'")
-        try:
-            quota = await QuotaRepository.get_locked(session, project_id=task.project_id)
-        except QuotaNotFoundError:
-            quota = await QuotaRepository.initialize(session, project_id=task.project_id)
+        quota = await QuotaRepository.get_snapshot(session, project_id=task.project_id)
         inventory = await AdmissionRepository.list_healthy_inventory_devices(
             session,
             vendors=tuple(sorted(request.allowed_vendors, key=lambda item: item.value)),
             kinds=tuple(sorted(request.allowed_kinds, key=lambda item: item.value)),
             minimum_memory_mb=0,
             runtime_type=RuntimeType.KUBERNETES,
-            for_update=True,
+            # This is a decision snapshot, not a reservation. ``place``
+            # reacquires and revalidates the selected worker and inventory
+            # under its canonical mutation lock order.
             include_unavailable=True,
         )
         candidate_inventory = [
@@ -1035,13 +1163,12 @@ class AdmissionRepository:
             allowed_kinds=tuple(sorted(request.allowed_kinds, key=lambda item: item.value)),
             runtime_profile_id=request.runtime_profile_id,
         )
-        inventory = await AdmissionRepository.list_healthy_inventory_devices(
+        inventory = await AdmissionRepository.lock_inventory_canonical(
             session,
             vendors=tuple(sorted(request.allowed_vendors, key=lambda item: item.value)),
             kinds=tuple(sorted(request.allowed_kinds, key=lambda item: item.value)),
             minimum_memory_mb=0,
             runtime_type=RuntimeType.KUBERNETES,
-            for_update=True,
             include_unavailable=True,
         )
         service_usage = await _active_service_accelerators(session)
@@ -1279,13 +1406,12 @@ class AdmissionRepository:
             quota = await QuotaRepository.get_locked(session, project_id=service.project_id)
         except QuotaNotFoundError:
             quota = await QuotaRepository.initialize(session, project_id=service.project_id)
-        inventory = await AdmissionRepository.list_healthy_inventory_devices(
+        inventory = await AdmissionRepository.lock_inventory_canonical(
             session,
             vendors=(vendor,),
             kinds=(kind,),
             minimum_memory_mb=0,
             runtime_type=RuntimeType.KUBERNETES,
-            for_update=True,
             include_unavailable=True,
         )
         service_usage = await _active_service_accelerators(

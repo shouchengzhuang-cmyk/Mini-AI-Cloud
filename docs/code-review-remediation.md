@@ -10,6 +10,27 @@ Keep candidate discovery cheap and non-owning, keep placement as the single Post
 
 ### P0 — Remove long-lived candidate row locks
 
+**Status: CLOSED (2026-09-07).** Candidate discovery remains non-owning and
+placement is the sole mutation authority. Authoritative placement follows
+`Task -> project quota -> Worker/GPU inventory` for both GlobalScheduler
+placement and worker-pull claims; active reservation release and multi-item
+lease recovery acquire project quota fences before Worker/GPU capacity, and
+service admission holds quota before inventory. Kubernetes batch placement locks
+only its selected Worker/node GPU pool; broader inventory used for
+service/deferred accounting is a non-locking snapshot, so a local placement
+cannot acquire unrelated Worker locks after it holds its selected Worker. The
+authoritative accelerator invariant is `project quota -> Worker rows ordered by
+Worker.id -> GPUDevice rows ordered by (worker_id, device_uuid)`. No joined
+Worker/GPUDevice `SELECT ... FOR UPDATE` is permitted: snapshot inventory APIs
+cannot lock, and service admission uses the canonical two-statement fence. The
+closure regressions run two
+`GlobalScheduler` instances with `batch_size=2`, a worker-pull claim, and a
+real PostgreSQL service-equivalent quota-to-inventory transaction, then
+assert all placements and quota counters converge. A separate real PostgreSQL
+two-project/two-Worker Kubernetes regression fences each placement at its local
+pool before global accounting, then asserts both placements, quotas, and
+device-plugin reservations converge without a cross-Worker lock cycle.
+
 Candidate ranking is a snapshot operation. It must not reserve a large candidate lane for the lifetime of a scheduler batch transaction.
 
 - Remove `FOR UPDATE SKIP LOCKED` from effective-priority, raw-priority, and project-fair candidate queries.
@@ -21,7 +42,8 @@ Candidate ranking is a snapshot operation. It must not reserve a large candidate
 Acceptance criteria:
 
 - Candidate query SQL contains no `FOR UPDATE` clause.
-- `place` still locks Task, Worker, and concrete accelerator state before mutation.
+- `place` and active reservation release lock the project quota before Worker
+  and concrete accelerator state before mutation.
 - Two concurrent candidate scans return the same top-ranked tasks rather than hiding them behind `SKIP LOCKED`.
 - Unit, integration, Ruff, and mypy CI remain green.
 
@@ -65,4 +87,7 @@ Acceptance criteria:
 
 ## Scope boundary
 
-P0 is the only code change in the current scheduler-lock PR. P1 and P2 are deliberately separate follow-ups because they change accelerator/preemption semantics and persistent accounting respectively. Do not combine them into the release-fix PR merely to reduce PR count.
+P0 is closed in the dedicated scheduler-lock PR. P1 and P2 remain deliberately
+separate follow-ups because they change accelerator/preemption semantics and
+persistent accounting respectively. Do not combine them merely to reduce PR
+count.
