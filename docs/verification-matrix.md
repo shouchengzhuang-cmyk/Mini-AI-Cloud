@@ -2,7 +2,7 @@
 
 ## 2026-09-04 v0.6.0 发布收口
 
-发布基线：`v0.6.0` @ `ca0254230c988aef8327a3b078bc2fc86d95537e`。该 annotated tag 已解析到这一 exact commit；后续仅治理/文档收口的 `main` 提交不改变已发布基线。
+发布基线：`v0.6.0` @ `ca0254230c988aef8327a3b078bc2fc86d95537e`。该 annotated tag 已解析到这一 exact commit；后续 `main` 上的治理、正确性与安全加固不改变已发布基线，也不得归因给该 tag。
 
 | 验收项 | 最终证据 | 状态 |
 | --- | --- | --- |
@@ -19,11 +19,11 @@
 | Real Huawei Ascend / CANN / vLLM-Ascend | 未执行物理 Ascend 硬件验收 | `REAL_HW_NOT_RUN` |
 | Production deployment / HA / SLA | 未部署，未做生产 HA/SLA 认证 | `NOT_DEPLOYED` / NOT RUN |
 | Scheduler canonical evidence refresh | Scheduler `v0.4.1` @ `fdd3afa0fca9cbfba3089292374c3baf5d64aaef` re-ran the 180-run `SIMULATED` canonical study and closed with `study verify` plus published-asset checksum verification; `p95_waiting_time` is queue delay from arrival/submission to first start, and old p95 is historical only | PASS (not real GPU/Kubernetes evidence) |
-| Cross-repo Scheduler v2 producer→consumer smoke | Scheduler `v0.4.1` has v2 schema/golden fixture/consumer tests; Mini v0.6.0 release baseline has no matching v2 producer | `NOT_COMPLETE`; next-stage real-hardware-plan G0 only, not a blocker of pre-real-hardware software/evidence mission closure |
+| Cross-repo Scheduler v2 producer→consumer smoke | Scheduler `v0.4.1` has v2 schema/golden fixture/consumer tests; Mini v0.6.0 release baseline has no matching v2 producer | `X0_NOT_COMPLETE` (`BLOCKED_ON_MINI_V2_PRODUCER`); next-stage X0 handoff prerequisite only, not a blocker of pre-real-hardware software/evidence mission closure; X0 precedes provider-neutral G0a/G0b/G0c |
 
 安全工具边界：发布 workflow 中 Trivy 的 Helm 子扫描器曾输出其内部默认 Kubernetes `v1.20.0` 与 Chart `kubeVersion >=1.27.0-0` 不兼容的 render error；该 Trivy action 最终仍为 success，且 release workflow 另有实际 Kind/Kubernetes adaptation、Helm/release gate 与 exact-SHA security gate。这里记录真实工具行为，不把这条子扫描器 render error 擦掉，也不将其误写成独立 Helm security scan PASS。
 
-跨仓库最终软件基线、Scheduler v1/v2 契约和真实硬件前 G0 prerequisite 见 [`pre-real-hardware-baseline.md`](pre-real-hardware-baseline.md)。
+跨仓库最终软件基线、Scheduler v1/v2 契约和真实硬件前 X0 prerequisite 见 [`pre-real-hardware-baseline.md`](pre-real-hardware-baseline.md)。
 
 ---
 
