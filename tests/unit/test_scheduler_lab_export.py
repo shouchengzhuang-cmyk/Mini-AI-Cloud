@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from typing import cast
 
 import pytest
 
@@ -121,7 +122,8 @@ def test_build_v2_export_is_typed_and_deterministic() -> None:
             ],
         }
     ]
-    task = payload["tasks"][0]
+    tasks = cast(list[dict[str, object]], payload["tasks"])
+    task = tasks[0]
     assert task["allowed_vendors"] == ["nvidia"]
     assert task["allowed_kinds"] == ["gpu"]
     assert task["selection_policy"] == "any"
