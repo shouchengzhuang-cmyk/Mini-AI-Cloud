@@ -23,7 +23,10 @@ ENV PYTHONUNBUFFERED=1 \
     VIRTUAL_ENV=/opt/venv \
     PATH="/opt/venv/bin:$PATH"
 
-RUN python -m pip uninstall --yes pip \
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends --only-upgrade libpcre2-8-0 \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m pip uninstall --yes pip \
     && groupadd --system --gid 10001 app \
     && useradd --system --uid 10001 --gid app --create-home \
         --home-dir /home/app --shell /usr/sbin/nologin app
