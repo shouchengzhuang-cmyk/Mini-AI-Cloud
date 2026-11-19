@@ -14,6 +14,7 @@ import typer
 
 from cli.evidence import DeploymentStatus, EvidenceCollectionError, collect_evidence
 from cli.hero_demo import HeroDemoError, ScenarioName, run_hero_scenarios
+from cli.scheduler_lab_export import export_scheduler_lab_v2
 
 _DEFAULT_BASE_URL = "http://localhost:8000"
 _API_KEY = re.compile(r"^mkc_[a-f0-9]{16}_[A-Za-z0-9_-]{43}$")
@@ -36,6 +37,9 @@ admin_app = typer.Typer(no_args_is_help=True, help="Run admin diagnostics and sa
 worker_app = typer.Typer(no_args_is_help=True, help="Inspect and manage compute workers.")
 demo_app = typer.Typer(no_args_is_help=True, help="Run evidence-producing hero scenarios.")
 evidence_app = typer.Typer(no_args_is_help=True, help="Collect commit-bound evidence bundles.")
+export_app = typer.Typer(
+    no_args_is_help=True, help="Create offline, versioned interoperability exports."
+)
 app.add_typer(auth_app, name="auth")
 app.add_typer(project_app, name="project")
 app.add_typer(task_app, name="task")
@@ -44,6 +48,8 @@ app.add_typer(admin_app, name="admin")
 app.add_typer(worker_app, name="worker")
 app.add_typer(demo_app, name="demo")
 app.add_typer(evidence_app, name="evidence")
+app.add_typer(export_app, name="export")
+export_app.command("scheduler-lab-v2")(export_scheduler_lab_v2)
 
 
 class CLIConfigError(RuntimeError):

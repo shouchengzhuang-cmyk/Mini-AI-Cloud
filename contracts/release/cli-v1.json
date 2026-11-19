@@ -203,6 +203,50 @@
         "name": "evidence",
         "parameters": []
       },
+      "export": {
+        "commands": {
+          "scheduler-lab-v2": {
+            "commands": {},
+            "deprecated": false,
+            "name": "scheduler-lab-v2",
+            "parameters": [
+              {
+                "kind": "TyperOption",
+                "name": "database_url",
+                "nargs": 1,
+                "options": [
+                  "--database-url"
+                ],
+                "required": true,
+                "type": "str"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "output",
+                "nargs": 1,
+                "options": [
+                  "--output"
+                ],
+                "required": true,
+                "type": "file"
+              },
+              {
+                "kind": "TyperOption",
+                "name": "producer",
+                "nargs": 1,
+                "options": [
+                  "--producer"
+                ],
+                "required": true,
+                "type": "str"
+              }
+            ]
+          }
+        },
+        "deprecated": false,
+        "name": "export",
+        "parameters": []
+      },
       "logs": {
         "commands": {},
         "deprecated": false,
