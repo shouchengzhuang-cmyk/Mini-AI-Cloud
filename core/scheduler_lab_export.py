@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.schemas.accelerators import AcceleratorRequest
@@ -198,6 +198,18 @@ def build_v2_export(
 async def export_v2_from_session(session: AsyncSession, *, producer: str) -> dict[str, object]:
     """Read a repeatable, read-only view of Mini state and render the v2 payload."""
 
+    if session.get_bind().dialect.name == "postgresql":
+        if session.in_transaction():
+            raise SchedulerLabExportError("PostgreSQL export requires a fresh session transaction")
+        async with session.begin():
+            await session.execute(
+                text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            )
+            return await _read_v2_snapshot(session, producer=producer)
+    return await _read_v2_snapshot(session, producer=producer)
+
+
+async def _read_v2_snapshot(session: AsyncSession, *, producer: str) -> dict[str, object]:
     workers = list((await session.scalars(select(Worker).order_by(Worker.id))).all())
     devices = list(
         (
