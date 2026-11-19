@@ -150,10 +150,7 @@ def test_build_v2_export_preserves_zero_accelerator_tasks(typed: bool) -> None:
 
     exported_task = cast(list[dict[str, object]], payload["tasks"])[0]
     assert exported_task["gpu_count"] == 0
-    if typed:
-        assert exported_task["gpu_memory_mb"] == 0
-    else:
-        assert "gpu_memory_mb" not in exported_task
+    assert "gpu_memory_mb" not in exported_task
 
 
 def test_build_v2_export_rejects_persisted_memory_mismatch() -> None:

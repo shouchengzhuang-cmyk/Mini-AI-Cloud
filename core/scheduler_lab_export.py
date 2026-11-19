@@ -127,7 +127,7 @@ def _task_payload(task: Task) -> dict[str, object]:
         "workload_type": task.workload_type.value,
         "labels": _text_mapping(task.labels, field=f"task {task.id}.labels"),
     }
-    if request is None:
+    if request is None or request.count == 0:
         return common | {
             "gpu_count": 0,
             "allowed_vendors": [],
