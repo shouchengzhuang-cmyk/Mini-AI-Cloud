@@ -62,7 +62,7 @@ def _device_payload(device: GPUDevice) -> dict[str, object]:
             f"gpu device {device.device_uuid!r}.memory_total_mb must be positive"
         )
     return {
-        "device_uuid": _text(device.device_uuid, field="gpu device.device_uuid"),
+        "device_uuid": device.device_uuid,
         "vendor": vendor,
         "kind": kind,
         "model": _text(device.model, field=f"gpu device {device.device_uuid!r}.model"),
@@ -100,6 +100,11 @@ def _task_accelerator(task: Task) -> AcceleratorRequest | None:
     if request.memory_mb_per_device != task.gpu_memory_mb:
         raise SchedulerLabExportError(
             f"task {task.id} accelerator memory does not match persisted gpu_memory_mb"
+        )
+    if request.count > 0 and request.memory_mb_per_device <= 0:
+        raise SchedulerLabExportError(
+            f"task {task.id} has memory_mb_per_device={request.memory_mb_per_device}; "
+            "Scheduler v2 requires positive memory per device for accelerator tasks"
         )
     if request.selection_policy is not AcceleratorSelectionPolicy.ANY:
         raise SchedulerLabExportError(
@@ -155,7 +160,24 @@ def build_v2_export(
 
     worker_rows = list(workers)
     grouped_devices: dict[str, list[GPUDevice]] = {}
-    for device in devices:
+    device_workers: dict[str, str] = {}
+    for device in sorted(
+        devices,
+        key=lambda item: (
+            item.worker_id,
+            item.vendor,
+            item.device_index,
+            _text(item.device_uuid, field="gpu device.device_uuid"),
+            str(item.id),
+        ),
+    ):
+        device_uuid = device.device_uuid
+        if device_uuid in device_workers:
+            raise SchedulerLabExportError(
+                f"duplicate gpu device UUID {device_uuid!r} for workers "
+                f"{device_workers[device_uuid]!r} and {device.worker_id!r}"
+            )
+        device_workers[device_uuid] = device.worker_id
         grouped_devices.setdefault(device.worker_id, []).append(device)
     worker_payloads: list[dict[str, object]] = []
     for worker in sorted(worker_rows, key=lambda item: item.id):
@@ -165,16 +187,7 @@ def build_v2_export(
                 "schedulable": worker.status is WorkerStatus.ONLINE and not worker.overcommitted,
                 "labels": _text_mapping(worker.labels, field=f"worker {worker.id}.labels"),
                 "gpu_devices": [
-                    _device_payload(device)
-                    for device in sorted(
-                        grouped_devices.get(worker.id, []),
-                        key=lambda item: (
-                            item.vendor,
-                            item.device_index,
-                            item.device_uuid,
-                            str(item.id),
-                        ),
-                    )
+                    _device_payload(device) for device in grouped_devices.get(worker.id, [])
                 ],
             }
         )

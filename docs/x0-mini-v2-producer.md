@@ -8,8 +8,10 @@ The command refuses an export when persisted data is ambiguous or cannot meet th
 
 - a GPU task has no typed `accelerator_request_json`;
 - count or memory differs from the normalized typed request;
+- a task requests one or more accelerators with non-positive memory per device;
 - the selection policy is not `any`, which the Scheduler v2 consumer does not accept;
 - an inventory device is fake, has an unknown vendor/kind pair, or invalid text metadata;
+- a device UUID appears more than once anywhere in the snapshot;
 - inventory has a device whose worker is absent from the same snapshot.
 
 PostgreSQL reads workers, devices and tasks in one read-only `REPEATABLE READ` transaction.
